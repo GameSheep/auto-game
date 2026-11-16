@@ -1,0 +1,41 @@
+{
+ "ts": "2026-11-16T11:24:30",
+ "host": "win32",
+ "capture_backend": "MsseCapture",
+ "frame_size": [
+  2560,
+  1440
+ ],
+ "grab_ms": 55.1,
+ "detect_ms_median": 37.0,
+ "detect_ms_p95": 42.1,
+ "frames_received": 26,
+ "fps_effective": 2.6,
+ "scene": {
+  "in_game": false,
+  "loading": false,
+  "pillars": 0,
+  "aframe": false,
+  "rechallenge": false,
+  "frame_delta": 0.0
+ },
+ "stats": {
+  "picks": 0,
+  "a_taps": 0,
+  "abandons": 0,
+  "approach_starts": 0,
+  "rechallenges": 0,
+  "blind_tap_violations": 0
+ },
+ "executor": {
+  "backend": "dryrun",
+  "sent": 0,
+  "dropped": 0
+ },
+ "verdict": {
+  "frames_flowed": true,
+  "detection_under_100ms": true,
+  "no_blind_tap": true,
+  "non_game_screen_blocked": true
+ }
+}

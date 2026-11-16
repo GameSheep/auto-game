@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# 敏感信息
+.token
+
+# 运行产物
+*.log
+*.jsonl
+logs/
+debug_*.png
+# 注意：/templates/*.png **不能**忽略 —— A框/再挑战/技能栏模板是标定资产，
+# 缺失会导致检测精度骤降（历史上就踩过：模板没入库 → 现场只有形状启发式）。
+# 若模板含敏感画面，可改为加密或单独分发，但不要静默忽略。
+
+# 大体积回放/中间产物（可再生成，不入库）
+# 说明：入库的测试素材只有 tests/fixtures/frames（9 帧 12MB）与 assets/samples（8 帧 8MB）；
+# 其余原始视频/抽帧/批量帧体积达 1GB+，由 tools/ 下的脚本从视频重新生成。
+assets/videos/
+assets/frames/
+assets/frames_replay/
+assets/batch/
+assets/batch_flagged/
+assets/uf/
+assets/soak/
+assets/*_sheet.png
+assets/*.mp4
+assets/batch_report.json
+assets/batch_list.*
+assets/replay_*.json
+assets/replay_*.csv
+assets/hit_check*.png
+assets/aframe_candidates.png
+assets/aframe_tli_grid.png
+assets/a_prompt_grid.png
+assets/aframe_template_check.png
+
+# IDE
+.idea/
+.vscode/

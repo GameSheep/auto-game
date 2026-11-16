@@ -1,0 +1,69 @@
+# autogame 主配置
+# 完整默认值见 autogame/config.py —— 此文件只覆盖需要调整的项。
+
+server:
+  host: 0.0.0.0        # 局域网小主机监听；所有访问需 token
+  port: 8765
+  # token: 留空则自动生成到 .token 文件；或用环境变量 AUTOGAME_TOKEN 覆盖
+
+capture:
+  fps: 2.0             # 采集帧率（决策 1Hz 足够，见对话定稿）
+  jpeg_quality: 80
+  backend: auto        # auto / dxcam / mss（Windows 推荐 dxcam）
+  # region: [0, 0, 1920, 1080]   # 只采集游戏窗口区域可省带宽
+
+vision:
+  max_detect_width: 1280
+  # 光柱 HSV（OpenCV H:0-179 / S,V:0-255），按现场画面标定
+  hsv:
+    gold: [[18, 120, 180], [35, 255, 255]]     # 金色光柱
+    pink: [[140, 90, 160], [172, 255, 255]]    # 粉色光柱
+  pillar_min_area: 40
+  pillar_min_aspect: 1.1
+  # A框检测
+  aframe:
+    template: templates/aframe.png   # 真实帧裁出的暗底白字 A 提示框（tools/auto_template.py 可重新生成）
+    template_threshold: 0.72
+    verify_dark_core: true           # 框内必须暗底+亮字形（拒绝伤害数字/技能图标）
+    glyph_white_only: true           # 字形必须是白色（再排除红色 Buff 图标类误报）
+    color_lo: [15, 100, 200]
+    color_hi: [45, 255, 255]
+  # OCR 白名单（默认关闭 —— 纯颜色模式即可工作）
+  ocr: null             # null / tesseract / paddle
+  whitelist: []         # 物品名白名单，如 ["破城斧"]；空=不过滤（需 ocr 启用）
+  # 稀有度白名单（不需要 OCR）：只捡这些颜色的光柱。空=全部颜色都捡。
+  # 只捡金色 → ["gold"]；金+粉 → ["gold", "pink"]。这是 C3 铁律的默认实现方式。
+  whitelist_colors: []
+
+decision:
+  tick_hz: 1.0          # 1秒1次决策（对话定稿）
+  pickup_key: a
+  approach_mode: mouse_click   # mouse_click=点地面寻路(推荐) / keys=方向键走位
+  ground_click_offset_px: 28   # 光柱悬空 → 点击其下方地面
+  far_distance_px: 420
+  approach_timeout_s: 8.0      # 走位超时 → 放弃 + 拉黑
+  stuck_delta_thresh: 1.5      # 帧变化像素占比%低于该值视为撞墙
+  stuck_frames: 3
+  abandon_blacklist_s: 30.0
+  key_step_ms: 450
+  jitter_ratio: 0.15
+
+executor:
+  backend: dryrun       # dryrun(测试) / rp2040(串口固件) / rpi5_hidg(gadget)
+  # rp2040:
+  #   serial_port: COM5
+  #   serial_baud: 115200
+  # rpi5_hidg:
+  #   hidg_keyboard: /dev/hidg0
+  #   hidg_mouse: /dev/hidg1
+  #   screen_w: 1920
+  #   screen_h: 1080
+  min_action_interval_ms: 25
+  max_actions_per_sec: 20
+
+sim:
+  width: 1280
+  height: 720
+  walk_speed_px_s: 260.0
+  pickup_radius_px: 130.0
+  pillar_spawn_interval_s: 2.2

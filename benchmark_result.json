@@ -1,0 +1,78 @@
+{
+  "detector_1280x720": {
+    "runs": 30,
+    "mean_ms": 20.153,
+    "p95_ms": 21.154,
+    "min_ms": 18.614,
+    "max_ms": 22.039,
+    "fps_eq": 49.6
+  },
+  "detector_1920x1080": {
+    "runs": 30,
+    "mean_ms": 22.534,
+    "p95_ms": 23.736,
+    "min_ms": 20.803,
+    "max_ms": 25.061,
+    "fps_eq": 44.4
+  },
+  "detector_2560x1440": {
+    "runs": 30,
+    "mean_ms": 20.522,
+    "p95_ms": 22.149,
+    "min_ms": 19.08,
+    "max_ms": 22.824,
+    "fps_eq": 48.7
+  },
+  "detector_3840x2160": {
+    "runs": 30,
+    "mean_ms": 26.137,
+    "p95_ms": 27.968,
+    "min_ms": 24.488,
+    "max_ms": 28.823,
+    "fps_eq": 38.3
+  },
+  "jpeg_encode_q60_1440p": {
+    "runs": 30,
+    "mean_ms": 9.916,
+    "p95_ms": 11.045,
+    "min_ms": 8.834,
+    "max_ms": 11.441,
+    "fps_eq": 100.9
+  },
+  "jpeg_encode_q80_1440p": {
+    "runs": 30,
+    "mean_ms": 10.37,
+    "p95_ms": 11.161,
+    "min_ms": 9.191,
+    "max_ms": 11.609,
+    "fps_eq": 96.4
+  },
+  "jpeg_encode_q90_1440p": {
+    "runs": 30,
+    "mean_ms": 10.406,
+    "p95_ms": 11.093,
+    "min_ms": 9.355,
+    "max_ms": 11.902,
+    "fps_eq": 96.1
+  },
+  "jpeg_decode_1440p": {
+    "runs": 30,
+    "mean_ms": 12.512,
+    "p95_ms": 13.679,
+    "min_ms": 10.498,
+    "max_ms": 13.969,
+    "fps_eq": 79.9
+  },
+  "e2e_decode_detect_1440p": {
+    "runs": 30,
+    "mean_ms": 35.338,
+    "p95_ms": 36.668,
+    "min_ms": 31.967,
+    "max_ms": 38.007,
+    "fps_eq": 28.3
+  },
+  "memory_100frames_1080p": {
+    "current_mb": 6.71,
+    "peak_mb": 15.56
+  }
+}

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autogame 图片审查 —— 操作步骤</title>
+<style>
+  :root { --bg:#0f1216; --panel:#171c23; --fg:#d8dde3; --accent:#4fc3f7; --warn:#ffb74d; --ok:#66bb6a; --bad:#ef5350; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font: 14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif; }
+  header { position:sticky; top:0; z-index:5; background:var(--panel); border-bottom:1px solid #2a313b;
+           padding:10px 16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  input[type=password], select { padding:6px 10px; border:1px solid #3a4350; border-radius:8px;
+           background:#0d1117; color:var(--fg); }
+  button { padding:6px 14px; border:1px solid #3a4350; border-radius:8px; background:#222a33; color:var(--fg); cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .stats { color:#8a939f; font-size:13px; }
+  .stats b { color:var(--accent); }
+  main { max-width:1100px; margin:0 auto; padding:16px; }
+  .card { background:var(--panel); border:1px solid #2a313b; border-radius:10px; padding:12px; margin-bottom:18px; }
+  .card img { width:100%; border-radius:8px; display:block; background:#000; }
+  .card .meta { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; align-items:center; }
+  .chip { padding:2px 10px; border-radius:10px; font-size:12px; background:#1d242d; border:1px solid #2a313b; }
+  .chip.gate-y { color:var(--ok); } .chip.gate-n { color:#8a939f; }
+  .chip.verdict-PASS { color:var(--ok); } .chip.verdict-WARN { color:var(--warn); } .chip.verdict-FAIL { color:var(--bad); }
+  .steps { margin-top:8px; }
+  .steps h3 { margin:4px 0 6px; font-size:14px; color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font:13px/1.6 Consolas,monospace; }
+  th,td { text-align:left; padding:4px 10px; border-bottom:1px solid #232a33; }
+  td.cmd { color:#ffe082; }
+  .none { color:#8a939f; font-style:italic; }
+  .toolbar { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🖼 图片审查 · 操作步骤</h1>
+  <input id="token" type="password" placeholder="token">
+  <select id="src">
+    <option value="batch">批量自检帧 (100)</option>
+    <option value="replay">视频回放帧</option>
+  </select>
+  <select id="replayName" style="display:none"></select>
+  <select id="filter">
+    <option value="all">全部</option>
+    <option value="cmds">仅看有命令</option>
+    <option value="warn">仅看异常</option>
+  </select>
+  <button onclick="load()">加载</button>
+  <span class="stats" id="stats"></span>
+</header>
+<main id="list"></main>
+
+<script>
+const $ = id => document.getElementById(id);
+$("token").value = localStorage.getItem("ag_token") || "";
+$("token").addEventListener("change", () => localStorage.setItem("ag_token", $("token").value));
+
+function tok() { return encodeURIComponent($("token").value.trim()); }
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+async function loadSources() {
+  const r = await fetch(`/api/review/sources?token=${tok()}`);
+  if (r.status === 401) { alert("token 无效"); return; }
+  const d = await r.json();
+  const sel = $("replayName");
+  sel.innerHTML = "";
+  (d.replays || []).forEach(name => {
+    const o = document.createElement("option");
+    o.value = name; o.textContent = "回放: " + name;
+    sel.appendChild(o);
+  });
+  sel.style.display = $("src").value === "replay" ? "" : "none";
+}
+
+async function load() {
+  if (!$("token").value.trim()) { alert("请先填 token"); return; }
+  const src = $("src").value;
+  const list = $("list");
+  list.innerHTML = "<p>加载中…</p>";
+  let url = `/api/review/manifest?src=${src}&token=${tok()}`;
+  if (src === "replay" && $("replayName").value) {
+    url += `&name=${encodeURIComponent($("replayName").value)}`;
+  }
+  const r = await fetch(url);
+  if (r.status !== 200) { list.innerHTML = `<p>加载失败 ${r.status}</p>`; return; }
+  const d = await r.json();
+  const flt = $("filter").value;
+  let items = d.items;
+  if (flt === "cmds") items = items.filter(it => it.steps.length);
+  if (flt === "warn") items = items.filter(it => it.verdict && it.verdict !== "PASS");
+
+  $("stats").innerHTML =
+    `共 <b>${d.total}</b> 张 · 有命令 <b>${d.with_commands}</b> 张 · 命令 <b>${d.commands}</b> 条 · 按A <b>${d.a_press}</b> 次`;
+
+  list.innerHTML = "";
+  let idx = 0;
+  for (const it of items) {
+    idx++;
+    const card = document.createElement("div");
+    card.className = "card";
+    const chips = [
+      `<span class="chip gate-${it.gate === "战斗" ? "y" : "n"}">${esc(it.gate)}</span>`,
+      it.verdict ? `<span class="chip verdict-${it.verdict}">${it.verdict}</span>` : "",
+      it.pillars.length ? `<span class="chip">光柱x${it.pillars.length}</span>` : "",
+      it.aframe ? `<span class="chip">A框</span>` : "",
+    ].join("");
+    const steps = it.steps.length
+      ? `<div class="steps"><h3>操作步骤</h3><table><tr><th>时机</th><th>意图</th><th>命令</th></tr>` +
+        it.steps.map(s => `<tr><td>${esc(s.tick)}</td>` +
+          `<td>${s.intent ? esc(s.intent) : "-"}</td>` +
+          `<td class="cmd">${esc((s.cmds || []).join(" → "))}</td></tr>`).join("") +
+        `</table></div>`
+      : (it.intents && it.intents.some(x => x)
+        ? `<div class="steps"><h3>操作意图</h3>` +
+          it.intents.filter(x => x).map(x => `<div class="none">· ${esc(x)}</div>`).join("") +
+          `</div>`
+        : `<div class="steps none">无操作步骤（${it.gate === "UI拦截" ? "非战斗界面，场景门拦截" : "无可拾取目标 / 观察"}）</div>`);
+    card.innerHTML = `
+      <div class="meta">
+        <span class="chip">#${idx}</span>
+        <span class="chip">${esc(it.name)}</span>
+        <span class="chip">${it.size ? it.size[0] + "x" + it.size[1] : ""}</span>
+        ${chips}
+      </div>
+      <img loading="lazy" src="${it.image}&token=${tok()}">
+      ${steps}`;
+    list.appendChild(card);
+  }
+  if (!items.length) list.innerHTML = "<p>无匹配项</p>";
+}
+
+$("src").addEventListener("change", () => { loadSources(); });
+loadSources();
+</script>
+</body>
+</html>
