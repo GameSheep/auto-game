@@ -40,6 +40,31 @@ def _load_dashboard() -> str:
     return (ROOT / "web" / "dashboard.html").read_text(encoding="utf-8")
 
 
+def _ensure_port_free(host: str, port: int) -> None:
+    """启动前探测端口；被占用时给出可执行的排查命令并退出。
+
+    注意：只探测不绑定 —— 探测用 SO_REUSEADDR 关闭状态，绑定交给 uvicorn。
+    """
+    import socket
+
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        if s.connect_ex((probe_host, port)) == 0:
+            print("=" * 62, file=sys.stderr)
+            print(f" 启动失败：端口 {port} 已被占用（{probe_host}）", file=sys.stderr)
+            print(" 排查：", file=sys.stderr)
+            if sys.platform == "win32":
+                print(f'   netstat -ano | findstr :{port}      # 找 PID', file=sys.stderr)
+                print('   taskkill /PID <PID> /F               # 结束旧进程', file=sys.stderr)
+            else:
+                print(f"   ss -lptn 'sport = :{port}'", file=sys.stderr)
+                print("   systemctl stop autogame              # 若由 systemd 托管", file=sys.stderr)
+            print(f" 或换端口：python run_server.py --port {port + 1}", file=sys.stderr)
+            print("=" * 62, file=sys.stderr)
+            raise SystemExit(2)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="autogame 服务端")
     parser.add_argument("--config", default=str(ROOT / "config.yaml"))
@@ -66,6 +91,10 @@ def main() -> None:
     hub = Hub(cfg, executor, pipeline)
 
     app = create_app(cfg, hub, _load_dashboard())
+
+    # 端口占用检查：先自己探测再启动，否则 uvicorn 在后台报错、前台仍打印
+    # "服务端已启动"，用户会以为启动成功（真实踩过的坑：旧进程占着 8765）。
+    _ensure_port_free(cfg.server.host, cfg.server.port)
 
     config = uvicorn.Config(
         app, host=cfg.server.host, port=cfg.server.port,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 from autogame.config import load_config
@@ -18,7 +19,32 @@ from autogame.agent.client import AgentClient
 ROOT = Path(__file__).resolve().parent
 
 
+def _fix_windows_console_encoding() -> None:
+    """Windows 控制台中文乱码修复（PyInstaller 打包后尤其明显）。
+
+    PyInstaller 默认以 UTF-8 写 stdout，而 cmd/PowerShell 控制台按活动代码页
+    （简体中文为 cp936）解码 → 帮助信息与日志全是"锟斤拷"。
+    这里按**控制台实际代码页**重设输出编码；代码页 65001 时用 utf-8。
+    """
+    if sys.platform != "win32":
+        return
+    code_page = "936"
+    try:
+        import ctypes
+
+        code_page = str(ctypes.windll.kernel32.GetConsoleOutputCP() or 936)
+    except Exception:  # noqa: BLE001
+        pass
+    enc = "utf-8" if code_page == "65001" else f"cp{code_page}"
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding=enc, errors="replace")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> None:
+    _fix_windows_console_encoding()
     parser = argparse.ArgumentParser(description="autogame 采集代理")
     parser.add_argument("--config", default=str(ROOT / "config.yaml"))
     parser.add_argument("--server", required=True, help="服务端 URL，如 http://192.168.1.20:8765")

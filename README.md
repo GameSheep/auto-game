@@ -27,26 +27,42 @@
 
 ## 实测性能（16核 x86 开发机，J4125 量级更充裕）
 
+> 数字由 `scripts/benchmark.py` 自动生成，且**用 `config.yaml` 的部署配置测**
+> （含 A框模板匹配 / 场景门 / 加载判定），不是"关掉模板的默认值"。
+
 | 测项 | 数值 |
 |---|---|
-| 检测器单帧 @720p / 1080p / 1440p / 2160p（含场景门+新检测项） | 12-16 ms（≥60 fps 等效） |
+| 检测器单帧 @720p / 1080p / 1440p / 2160p | 32.6 / 41.6 / 41.8 / 43.3 ms |
 | JPEG 编码 @1440p（代理侧） | ~10 ms |
 | JPEG 解码 @1440p（服务端侧） | ~12 ms |
-| **端到端单帧预算（解码+检测）** | **37 ms → 1Hz 决策 ≈ 3.7% 单核**（含场景门/加载判定/列表检测） |
-| 内存（100帧处理驻留/峰值） | 6.8 / 14.8 MB |
-| 带宽 @1440p q80, 2fps | ~207 KB/s |
+| **端到端单帧预算（解码+检测）** | **53 ms → 1Hz 决策 ≈ 5.3% 单核** |
+| 内存（100帧处理驻留/峰值） | 6.7 / 16.6 MB |
+| 带宽 @1440p q80, 2fps | ~234 KB/s |
+| 真实屏幕实测（2560x1440, mss） | 检测中位 **37 ms** / p95 42 ms（`tools/e2e_real_screen.py`） |
+
+**为什么比早期版本慢**：新增的 A框模板匹配是真实成本（早期只有形状启发式，
+而它在真实帧上 11/11 全是误报）。模板匹配已做粗到精两级搜索：17×17 模板直接
+全彩匹配要 75ms/尺度，改成灰度 1/2 分辨率粗搜（7ms/尺度）+ 全分辨率局部精修，
+精度不变、耗时降一个数量级。1Hz 决策下 5.3% 单核，J4125 完全够用。
 
 复现：`.venv/Scripts/python scripts/benchmark.py`（结果写 `benchmark_result.json`）。
 
 ## 核心铁律（代码层面强制，测试断言）
 
 1. **绝不盲按拾取键**：只有检测到目标物品的 **A框**（近距交互提示）且 A框邻近当前目标时才按 A。
-   - 镂空率过滤（空心框线 vs 实心光柱）、邻近目标约束、150ms 防闪烁确认。
+   - **A框结构校验**：真实 A 提示是"暗底 + 白色字形"。只按形状（亮+镂空）判定时，
+     真实帧上 11 个候选 **全部是伤害数字/技能图标/Boss 特效**误报；加入
+     "框内暗底 + 白色字形占比" 双判据后，100 张真实帧只剩 1 个命中，且经人工核验是真 A 提示。
+   - 镂空率过滤、邻近目标约束、150ms 防闪烁确认。
    - A框闪现即消失且从未按过键 → 记为误检闪烁，**绝不算拾取成功**（`picks ≤ a_taps` 不变量）。
-2. **绝不原地卡死**：走位超时（默认 8s）放弃并拉黑区域 30s；帧差过低判定撞墙 →
+2. **只捡指定目标**：`vision.whitelist_colors: ["gold"]` 按稀有度过滤（不需要 OCR），
+   `vision.whitelist: ["物品名"]` + `vision.ocr` 按名称过滤。两者都空时启动会**明确告警**
+   —— 因为此时所有颜色的光柱都会被当成目标（C3 铁律实际上是关着的）。
+3. **绝不原地卡死**：走位超时（默认 8s）放弃并拉黑区域 30s；帧差过低判定撞墙 →
    侧向脱困一次 → 仍卡则放弃。
-3. **一键急停**：`POST /api/control/panic` 或仪表盘 ⛔ → 执行器立即停止一切输出。
-4. **执行器限速**：最小动作间隔（自适应等待不丢命令）+ 每秒上限，所有后端统一生效。
+4. **一键急停**：`POST /api/control/panic` 或仪表盘 ⛔ → 执行器立即停止一切输出。
+5. **执行器限速**：最小动作间隔（自适应等待不丢命令）+ 每秒上限，所有后端统一生效。
+
 
 ## 完整刷图主循环（对话定稿的产品闭环）
 
@@ -80,15 +96,44 @@
 - 暗图真实疑似光柱 → 仅输出 `MOUSE_CLICK left (x,y)` 走位命令，无 A框 绝不按 A
 - 视频回放支持 `--csv` 导出逐 tick 判定时间线；100 图批量自检同步导出 `assets/batch_list.csv`
 
-**100 张真实帧批量自检**（`tools/batch_validate.py`，10 条自动判定规则 R1-R10）：
-PASS 97 / WARN 3 / FAIL 0，全程零盲按、UI 帧零命令、确定性验证通过、平均 100ms/图。
-过程中借真实数据修复：A框色相无关检测（粉/紫稀有度框漏检 bug）、Boss 血条区误检、场景门半分辨率性能。
+**100 张真实帧批量自检**（`tools/batch_validate.py`，10 条自动判定规则 R1-R10，
+用 `config.yaml` 的部署配置跑）：
+**PASS 100 / WARN 0 / FAIL 0**，零盲按、确定性验证通过、平均 120ms/图。
+过程中借真实数据修复：A框色相无关检测（粉/紫稀有度框漏检）、Boss 血条区误检、
+场景门半分辨率性能、**A框在真实帧上 11/11 全误报**（伤害数字/技能图标被当成拾取提示）。
+
+## 真实屏幕端到端验证（真机链路，非模拟画面）
+
+模拟器和单元测试都在"合成画面"上跑，真实屏幕引入的变量（多显示器、DPI 缩放、
+窗口失焦、真实 UI 密度）完全没覆盖。这个工具把生产代码路径搬进真机链路：
+
+```bash
+.venv/Scripts/python tools/e2e_real_screen.py --seconds 12
+```
+
+```
+服务端已启动 http://127.0.0.1:5523（dryrun 执行器，零真实输入）
+采集后端: MsseCapture
+真实帧: 2560x1440  抓取 55.1ms
+检测耗时: 中位 37.0ms  p95 42.1ms
+真实屏幕链路: 26 帧 / 10s  (有效 2.6 fps)
+场景门: in_game=False → 命令 0 条 (非游戏画面应为 0)
+铁律: blind_tap_violations=0
+结论: PASS（真实屏幕链路可用）
+```
+
+证据落盘 `assets/real_screen_e2e.json`。链路是：真实屏幕 → JPEG → WebSocket → 服务端
+→ 检测 → FSM 决策 → dryrun 执行器。**已验证到"真实采集+真实检测+真实决策"，
+未验证的是"真实游戏画面 + 真实硬件执行器"**（见 `docs/完成度审查.md` 的剩余缺口）。
 
 ## 快速开始（本机模拟闭环，无需游戏）
 
 ```bash
 python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # Windows
 # Linux: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# 0) 部署前自检（不发任何游戏按键）：依赖/采集/模板/执行器/服务端逐项检查
+.venv/Scripts/python tools/preflight.py
 
 # 终端1: 服务端 + 内置模拟器（完整刷图循环自动运行）
 .venv/Scripts/python run_server.py --sim
@@ -97,11 +142,15 @@ python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # Window
 # 点 ▶ 启动 → 看拾取/刷图/导航统计与事件流
 ```
 
-运行测试（143 个用例，含端到端闭环/真实截图回归/UI 场景任务/审查页/硬件协议/fuzz 加固/性能守卫）：
+运行测试（**169 个用例，覆盖率门槛 78%（实测 82%）**，含端到端闭环/真实帧回归/
+A框精度回归/固件协议一致性/UI 场景任务/审查页/fuzz 加固/性能守卫）：
 
 ```bash
-.venv/Scripts/python -m pytest tests/ -q
+.venv/Scripts/python -m pytest tests/ -q     # 覆盖率低于 78% 直接失败
 ```
+
+CI：`.github/workflows/ci.yml`（py3.11/3.13 跑测试 + preflight），依赖锁 `requirements.lock`。
+
 
 ## 真实部署
 
@@ -135,15 +184,19 @@ cat /opt/auto-game/.token
 # ② 对光柱矩形采样 → 输出 HSV 范围（粘进 config.yaml）
 .venv/Scripts/python tools/calibrate_hsv.py --image shot.png --rect 600,300,80,160 --name gold
 
-# ③ 裁 A框 小图存 templates/aframe.png → 启用多尺度模板匹配（精度最高）
-#    同理裁『再次挑战』按钮存 templates/rechallenge.png
+# ③ A框模板：从实机截图自动/手动裁出（仓库已带一份，换版本要重裁）
+.venv/Scripts/python tools/auto_template.py --image shot.png --kind aframe \
+    --rect 845,447,20,20        # 不给 --rect 会尝试自动定位
 ```
+
+> `templates/aframe.png` 是**标定资产，必须入库**（历史踩坑：模板没入库 →
+> 现场只剩形状启发式 → 真实帧 11/11 误报）。同理 `skillbar*.png` 场景门锚点。
 
 ### 3.5 采集代理打包成 EXE（产品化交付）
 
 ```bash
-scriptsuild_agent_exe.bat        # 或: .venv/Scripts/python -m PyInstaller packaging/agent.spec
-distutogame-agent.exe --server http://<小主机IP>:8765 --token <token>
+scripts\build_agent_exe.bat        # 或: .venv/Scripts/python -m PyInstaller packaging/agent.spec
+dist\autogame-agent.exe --server http://<小主机IP>:8765 --token <token>
 ```
 单文件、零安装、已排除 pynput/pyautogui/keyboard 等按键模拟库（安全验证在 spec excludes）。
 
@@ -170,6 +223,10 @@ distutogame-agent.exe --server http://<小主机IP>:8765 --token <token>
 - `vision.beam_stable_frames: 3`：光柱稳定分级（连续 3 帧标记 stable，FSM 优先以稳定掉落光柱为目标，压低技能特效误走位）
 - `server.event_log`：JSONL 审计日志（默认 `logs/events.jsonl`，5MB 滚动）
 - OCR 白名单（可选）：`vision.ocr: tesseract` + `vision.whitelist: ["物品名"]`
+- **稀有度白名单（不需要 OCR）**：`vision.whitelist_colors: ["gold"]` —— 只捡指定颜色；
+  空=全部颜色都捡（启动会告警提示"白名单未配置"）
+- `vision.aframe.template`：A框模板（已随仓库分发）+ `verify_dark_core` / `glyph_white_only`
+  结构校验（拒绝伤害数字与彩色图标误报）
 
 ## 仪表盘
 
@@ -188,10 +245,21 @@ distutogame-agent.exe --server http://<小主机IP>:8765 --token <token>
 - 预置配方：`trade_buy`（交易行购买）/ `equip_best`（装备最优）/ `talent_alloc`（天赋连点）/ `skill_swap`（学技能换技能）
 
 ```bash
-# 启动 UI 任务（先在 templates/ui/ 放面板锚点与按钮模板，从自己截图裁剪）
+# ① 看配方需要哪些模板
+.venv/Scripts/python tools/crop_template.py --list all
+
+# ② 从自己的截图裁剪（坐标=截图像素），带 4 倍预览图人工确认
+.venv/Scripts/python tools/crop_template.py --image shot.png --rect 950,110,120,40 \
+    --out templates/ui/sort.png --preview assets/tpl_preview.png
+
+# ③ 启动任务（缺模板会 409 拒绝启动，不会静默空转）
 curl -X POST http://<小主机>:8765/api/task -H "X-Token: xxx" -d '{"recipe": "trade_buy"}'
 curl http://<小主机>:8765/api/task/status -H "X-Token: xxx"   # 进度/失败原因
 ```
+
+> **缺模板 = 409 快速失败**：历史上 `templates/ui/` 不存在时，`trade_buy` 5 步全部
+> `skip_panel_check`/`skip_button`，接口返回 `ok:true`、任务"跑完"却一条命令没发。
+> 现在启动前预检，缺哪个文件、怎么裁都写在响应里。
 
 ## 图片审查页（图上步骤下）
 
@@ -210,9 +278,14 @@ curl http://<小主机>:8765/api/task/status -H "X-Token: xxx"   # 进度/失败
 ## 对话需求追溯
 
 DeepSeek 对话逐条提取的 **60 项需求**全部实现（58 直接 + 2 架构演进等价），逐条实现证据见
-[docs/需求清单.md 需求追溯
-需求清单.md](docs/需求清单.md)。补齐项：PaddleOCR 插件、POST /api/locate 位置查询、
+[docs/需求清单.md](docs/需求清单.md)。补齐项：PaddleOCR 插件、POST /api/locate 位置查询、
 右侧 UI 列表掉落方案、PCA9685 舵机机械执行器、PyInstaller 采集代理打包、加载/过场画面保持。
+
+需求之外的验证驱动迭代（H1-H22，含本轮修复）同样逐条记录在该文件末尾。
+
+**完成度审查与剩余缺口**见 [docs/完成度审查.md](docs/完成度审查.md)：
+已补标定资产、A框精度、稀有度白名单、UI 预检、硬件自检、真实屏幕链路、git/CI/覆盖率门槛；
+**仍未验证的只有"真实游戏画面 + 真实硬件执行器"这一段**（需要实机与硬件）。
 
 ## 项目结构
 
@@ -222,22 +295,28 @@ autogame/
 ├── protocol.py          # WS 协议（二进制 JPEG 帧 + JSON 控制）
 ├── security.py          # token 常数时间比较 + 执行器限速
 ├── vision/
-│   ├── detector.py      # 光柱 + A框(多尺度模板/镂空) + 再次挑战按钮 + 小地图 + 帧差
-│   ├── ocr.py           # 可插拔 OCR（null / tesseract + 白名单模糊匹配）
-│   └── pipeline.py      # 检测 → 白名单过滤 → SceneState
+│   ├── detector.py      # 光柱 + A框(模板粗到精 + 暗底白字校验) + 再挑战 + 小地图 + 帧差
+│   ├── ocr.py           # 可插拔 OCR（null / tesseract / paddle + 白名单模糊匹配）
+│   ├── pipeline.py      # 检测 → 稀有度白名单 → OCR 白名单 → SceneState
+│   ├── ui_panels.py     # UI 网格/高亮/文本行/按钮检测
+│   └── scene_classifier.py  # 关卡内/菜单分类
 ├── decision/
 │   ├── fsm.py           # FSM：拾取闭环 + 刷图循环 + 导航（帧时间驱动，确定性可测）
+│   ├── recipe.py        # UI 配方引擎 + 启动前模板预检
 │   └── llm_advisor.py   # Ollama 决策顾问（可选，白名单动作）
-├── executor/            # dryrun / rp2040 串口 / rpi5_hidg（报文纯函数字节级可测）
+├── executor/            # dryrun / rp2040 / rpi5_hidg / pca9685（报文纯函数字节级可测）
 ├── server/              # FastAPI (WS 上行 + REST 控制 + MJPEG 仪表盘 + JSONL 审计)
 ├── agent/               # dxcam/mss 采集 + WS 客户端
 └── sim/scene.py         # 合成 ARPG 世界（拾取/刷图/小地图全闭环联调）
-tools/                   # grab_frame 截图 / calibrate_hsv 标定
-firmware/rp2040/         # RP2040 组合 HID 固件 (.ino + platformio.ini)
-scripts/                 # J4125 部署 / RPi5 gadget / benchmark
-web/dashboard.html       # 监控仪表盘
-tests/                   # 143 用例
+tools/                   # preflight 自检 / e2e_real_screen / auto_template / crop_template
+                         # / grab_frame / calibrate_hsv / batch_validate / video_replay / soak
+firmware/rp2040/         # RP2040 组合 HID 固件 (.ino + platformio.ini + README)
+scripts/                 # J4125 部署 / RPi5 gadget / benchmark / 打包 EXE
+web/                     # 监控仪表盘 + 图片审查页
+tests/                   # 169 用例（fixtures 内含 9 张真实帧，12MB）
+templates/               # 标定资产：aframe.png / skillbar*.png / ui/（必须入库）
 assets/samples/          # 真实游戏截图素材（B站/17173 实机帧）
+.github/workflows/ci.yml # CI：pytest（覆盖率门槛 78%）+ preflight
 ```
 
 ## 安全设计

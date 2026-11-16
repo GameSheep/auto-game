@@ -70,7 +70,17 @@ def main() -> None:
     args = parser.parse_args()
     runs = args.runs
 
-    cfg = VisionConfig()
+    # 用**部署配置**（含 A框模板/场景门）测，否则数字比现场好看：
+    # 模板匹配是新增的真实成本，不能只测"没有模板的默认值"。
+    try:
+        from autogame.config import load_config
+        from pathlib import Path
+
+        cfg = load_config(str(Path(__file__).resolve().parent.parent / "config.yaml")).vision
+        print(" 配置: config.yaml（含 A框模板/场景门）")
+    except Exception as e:  # noqa: BLE001
+        print(f" 配置: 默认值（config.yaml 加载失败: {e}）")
+        cfg = VisionConfig()
     results: dict[str, dict] = {}
 
     print("=" * 70)
