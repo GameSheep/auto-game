@@ -277,8 +277,11 @@ class SimWorld:
                 cv2.rectangle(frame, (ax - 16, ay - 16), (ax + 16, ay + 16), color_bgr, 2)
                 cv2.rectangle(frame, (ax - 14, ay - 14), (ax + 14, ay + 14), (0, 0, 0), -1)
                 cv2.rectangle(frame, (ax - 16, ay - 16), (ax + 16, ay + 16), color_bgr, 2)
+                # 字形用**白色**：真实游戏的 A 提示就是暗底白字。
+                # 若这里画成彩色，`aframe.glyph_white_only: true`（真实部署配置）
+                # 会把模拟器自己的 A 框判成"彩色图标"拒掉 —— 模拟器必须长得像真机。
                 cv2.putText(frame, "A", (ax - 6, ay + 7),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_bgr, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # 『再次挑战』按钮（地图结算）：黄橙色宽横条，底部居中
         if self.map_cleared:

@@ -34,9 +34,9 @@ jobs:
           python -V
           python -c "import cv2, numpy, fastapi; print('cv2', cv2.__version__)"
 
-      # 覆盖率门槛写在 pytest.ini（--cov-fail-under=78），低于门槛 CI 直接红
+      # 覆盖率门槛只在 CI 生效：低于 78% 直接红（本地跑单个文件不会被误判）
       - name: Run tests (with coverage gate)
-        run: python -m pytest -q
+        run: python -m pytest -q --cov-fail-under=78
 
   preflight:
     name: 部署自检（dryrun，无显示环境）

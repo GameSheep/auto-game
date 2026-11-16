@@ -142,11 +142,12 @@ python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # Window
 # 点 ▶ 启动 → 看拾取/刷图/导航统计与事件流
 ```
 
-运行测试（**169 个用例，覆盖率门槛 78%（实测 82%）**，含端到端闭环/真实帧回归/
+运行测试（**169 个用例，实测覆盖率 82%，CI 门槛 78%**，含端到端闭环/真实帧回归/
 A框精度回归/固件协议一致性/UI 场景任务/审查页/fuzz 加固/性能守卫）：
 
 ```bash
-.venv/Scripts/python -m pytest tests/ -q     # 覆盖率低于 78% 直接失败
+.venv/Scripts/python -m pytest tests/ -q                  # 本地：跑测试 + 出覆盖率
+.venv/Scripts/python -m pytest tests/ -q --cov-fail-under=78  # 同 CI：低于门槛失败
 ```
 
 CI：`.github/workflows/ci.yml`（py3.11/3.13 跑测试 + preflight），依赖锁 `requirements.lock`。
