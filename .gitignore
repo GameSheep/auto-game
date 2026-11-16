@@ -11,6 +11,8 @@ build/
 .token
 
 # 运行产物
+.coverage
+.coverage.*
 *.log
 *.jsonl
 logs/
