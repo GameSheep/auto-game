@@ -164,6 +164,7 @@ def test_ground_label_detection_on_real_frame():
 def test_ground_label_walk_fsm():
     """FSM：无光柱 → 地面标签连续 400ms 可见 → 点击标签下方走位。"""
     eng_cfg = DecisionConfig(tick_hz=10.0)
+    eng_cfg.autonomy.enabled = False  # 只验证防抖：自主探索会产生无关走位命令
     ex = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000))
     eng = DecisionEngine(eng_cfg, ex)
     eng.start()

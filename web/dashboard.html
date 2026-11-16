@@ -13,6 +13,8 @@
   #state-badge { padding:2px 12px; border-radius:12px; font-weight:600; background:#333; }
   .st-PAUSED{background:#455a64;} .st-SCANNING{background:#1b5e20;} .st-APPROACHING{background:#e65100;}
   .st-COOLDOWN{background:#37474f;} .st-PANIC{background:var(--bad);color:#fff;}
+  .st-RECOVERING{background:#6a1b9a;color:#fff;animation:pulse 1.2s infinite;}
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.55} }
   main { display:grid; grid-template-columns: 1fr 340px; gap:14px; padding:14px; max-width:1400px; margin:0 auto; }
   .panel { background:var(--panel); border:1px solid #2a313b; border-radius:10px; padding:12px; }
   #stream { width:100%; border-radius:8px; background:#000; min-height:420px; }
@@ -78,6 +80,18 @@
       </table>
     </div>
     <div class="panel" style="margin-top:14px">
+      <b>自主恢复</b>
+      <table style="margin-top:6px">
+        <tr><th>卡壳判定</th><td id="au-verdict">-</td></tr>
+        <tr><th>恢复等级</th><td id="au-level">-</td></tr>
+        <tr><th>恢复循环</th><td id="au-cycle">-</td></tr>
+        <tr><th>视觉模型</th><td id="au-vlm">-</td></tr>
+        <tr><th>视觉建议</th><td id="au-vlm-advice">-</td></tr>
+        <tr><th>文本顾问</th><td id="au-llm">-</td></tr>
+        <tr><th>帧间隔</th><td id="au-frame">-</td></tr>
+      </table>
+    </div>
+    <div class="panel" style="margin-top:14px">
       <b>事件流</b>
       <div id="events"></div>
     </div>
@@ -116,6 +130,32 @@ function refresh() {
       $("sc-loading").textContent = sc && sc.loading ? "加载中(保持不动)" : "正常";
       $("sc-gate").textContent = sc ? (sc.in_game ? "战斗(放行)" : "非战斗(拦截)") : "-";
       $("frame-info").textContent = d.frame_seq ? `帧 #${d.frame_seq}` : "等待画面...";
+      // 自主恢复状态
+      const au = d.autonomy || {};
+      const sig = au.signals || {};
+      const rec = au.recovery || {};
+      $("au-verdict").textContent = au.enabled
+        ? `${sig.verdict || "-"}（冻结${sig.frozen_for||0}s / 空闲${sig.idle_for||0}s / 停滞${sig.stall_for||0}s）`
+        : "已关闭";
+      $("au-level").textContent = rec.active
+        ? `L${rec.level} ${rec.step}（${rec.reason}）`
+        : `待机（已执行 ${(au.stats||{}).recoveries||0} 次恢复）`;
+      $("au-cycle").textContent = `${rec.cycle||0} 轮 / 步数 ${rec.steps_done||0}`;
+      const vlm = au.vlm || {};
+      $("au-vlm").textContent = vlm.enabled
+        ? `${vlm.provider}/${vlm.model}${vlm.tripped ? " [熔断中]" : ""} 调用${(vlm.stats||{}).ok||0}/${(vlm.stats||{}).calls||0}`
+        : "未启用（config.yaml: decision.vlm.enabled）";
+      const adv = vlm.last_advice;
+      $("au-vlm-advice").textContent = adv
+        ? `${adv.action}${adv.valid ? "" : "(未采纳)"} ${adv.reason||adv.why||""}`.slice(0, 60)
+        : "-";
+      const llm = au.llm || {};
+      $("au-llm").textContent = llm.enabled
+        ? `${llm.model} 咨询${llm.queries||0}次`
+        : "未启用";
+      $("au-frame").textContent = d.frame_stalled
+        ? `⚠ 中断 ${d.frame_gap_s}s`
+        : (d.frame_gap_s == null ? "-" : `${d.frame_gap_s}s`);
       const ev = $("events");
       ev.innerHTML = (d.events || []).slice().reverse()
         .map(e => `<div><span class="tok">${new Date(e.ts*1000).toLocaleTimeString()}</span> [${e.state}] ${e.event}${e.reason? " ("+e.reason+")":""}</div>`).join("");

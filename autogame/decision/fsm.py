@@ -1,16 +1,19 @@
-"""决策状态机 —— 从对话定稿的拾取闭环。
+"""决策状态机 —— 拾取闭环 + 自主恢复。
 
 状态流：
   PAUSED → SCANNING → APPROACHING → (A框出现) → 拾取确认 → COOLDOWN → SCANNING
                         │
                         ├─ 走位超时 ──→ 放弃+拉黑 → COOLDOWN → SCANNING
                         └─ 撞墙(帧差低) → 试一次侧向 → 仍卡 → 放弃+拉黑
+  任意状态 ──看门狗判定 frozen/stalled──→ RECOVERING（分级恢复阶梯）→ SCANNING
 
 铁律（对话原文要点，代码层面强制）：
   1. 只有当检测到 A框（近距拾取提示）时才按拾取键 —— 绝不盲按。
+     自主恢复里的所有动作同样禁止出现拾取键（RecoveryLadder 二次过滤）。
   2. 单目标走位超时自动放弃并拉黑该区域，绝不原地卡死。
   3. 每目标最多按 N 次拾取键，A框不消失即放弃（防误捡循环）。
   4. panic 立即停止一切输出。
+  5. 绝不"停在那里"：卡住 → 分级恢复；恢复失败 → 换招循环重试（可降速告警）。
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ from typing import Callable
 
 from ..config import DecisionConfig
 from ..decision.llm_advisor import LLMAdvisor
+from ..decision.recovery import ProgressMonitor, RecoveryLadder, StallSignals
+from ..decision.vlm import VisionAdvisor
 from ..executor import BaseExecutor
 from ..protocol import Command, Pillar, SceneState
 
@@ -38,6 +43,7 @@ class State(str, enum.Enum):
     SCANNING = "SCANNING"
     APPROACHING = "APPROACHING"
     COOLDOWN = "COOLDOWN"
+    RECOVERING = "RECOVERING"  # 自主恢复中（卡壳看门狗触发）
     PANIC = "PANIC"
 
 
@@ -46,7 +52,8 @@ class DecisionEngine:
 
     def __init__(self, cfg: DecisionConfig, executor: BaseExecutor,
                  advisor: LLMAdvisor | None = None,
-                 on_event: Callable[[dict], None] | None = None) -> None:
+                 on_event: Callable[[dict], None] | None = None,
+                 vlm: VisionAdvisor | None = None) -> None:
         self.cfg = cfg
         self.exec = executor
         self.advisor = advisor or LLMAdvisor(cfg.llm)
@@ -60,7 +67,36 @@ class DecisionEngine:
             "approach_starts": 0,
             "rechallenges": 0,
             "blind_tap_violations": 0,  # 恒为 0 才正确（防御性断言）
+            "recoveries": 0,            # 进入自主恢复次数
+            "recovery_steps": 0,        # 恢复阶梯执行步数
+            "recovery_cycles": 0,       # 完整恢复循环轮数
+            "recovery_actions": 0,      # 恢复动作发出的命令数
+            "gate_escapes": 0,          # 弹窗/菜单 ESC 次数
+            "stuck_alarms": 0,          # 多轮仍失败告警次数
         }
+        # 自主性：看门狗 + 恢复阶梯 + 视觉顾问
+        self.monitor = ProgressMonitor(cfg.autonomy)
+        self.vlm = vlm or VisionAdvisor(cfg.vlm)
+        self.frame_source: Callable[[], bytes | None] | None = None
+        self.vlm.frame_source = self._current_frame
+        self.recovery = RecoveryLadder(
+            cfg.autonomy, self.vlm, self.advisor,
+            forbidden_keys={cfg.pickup_key},  # 铁律：恢复动作永不按拾取键
+        )
+        self._recovery_reason = ""
+        self._recovery_picks = 0
+        self._recovery_targets0 = 0
+        self._recovery_ok_ticks = 0
+        self._recovery_pause_until = 0.0
+        self._recovery_started = 0.0
+        self._last_recovery_step = ""
+        self._need_monitor_reset = True
+        self._now = 0.0
+        self._ts_offset_ms = 0
+        self._last_ts_ms = 0
+        self._gate_escape_ts = 0.0
+        self._auto_explore_until = 0.0
+        self._last_rechallenge: tuple[int, int] | None = None
         self._rechallenge_first_seen: float | None = None
         self._list_first_seen_ms: int | None = None
         self._label_first_seen_ms: int | None = None
@@ -90,13 +126,17 @@ class DecisionEngine:
             return
         self.exec.reset()
         self.state = State.SCANNING
+        self._need_monitor_reset = True
+        self.recovery.reset()
+        self._recovery_reason = ""
+        self._recovery_pause_until = 0.0
         self._emit_event("started")
         log.info("FSM 启动 → SCANNING")
 
     def stop(self) -> None:
         self.state = State.PAUSED
         self._drop_target("stopped")
-        self.exec.execute(Command(op="stop_all"))
+        self._act(Command(op="stop_all"))
         self._emit_event("stopped")
         log.info("FSM 停止")
 
@@ -123,6 +163,13 @@ class DecisionEngine:
         """
         if self.state in (State.PAUSED, State.PANIC):
             return
+        now = self._frame_time(scene.ts_ms)
+        self._now = now
+        if self._need_monitor_reset:
+            self.monitor.reset(now)
+            self._need_monitor_reset = False
+        signals = self.monitor.update(scene, now, self.stats["picks"])
+
         # 加载/黑屏过场：保持不动（等加载完成），不产生任何命令
         if scene.loading:
             if not self._loading_hold_emitted:
@@ -131,19 +178,30 @@ class DecisionEngine:
             self._drop_target("loading")
             return
         self._loading_hold_emitted = False
+
         if not scene.in_game:
-            if not self._gate_hold_emitted:
-                self._emit_event("scene_gate_hold")
-                self._gate_hold_emitted = True
-            self._drop_target("scene_gate")
-            self.state = State.SCANNING if self.state != State.PAUSED else self.state
+            self._tick_gated(scene, now, signals)
             return
         self._gate_hold_emitted = False
-        now = scene.ts_ms / 1000.0  # 帧时间（秒）
 
         # 拉黑清理
         if self._blacklist:
             self._blacklist = [b for b in self._blacklist if b[2] > now]
+
+        # ---- 卡壳看门狗：卡住就进恢复，恢复中优先恢复 ----
+        if self.cfg.autonomy.enabled:
+            if self.state == State.RECOVERING:
+                if self._recovery_can_exit(scene, signals):
+                    self._exit_recovery(now)
+                else:
+                    self._tick_recovery(scene, now, signals)
+                    return
+            elif signals.verdict in ("frozen", "stalled") \
+                    and self.state != State.APPROACHING:
+                # 走位中不归看门狗管：单目标撞墙/超时由 _tick_approach 自己处理
+                # （否则"站在光柱旁边画面静止"会被误判成卡死，来回抖动）
+                self._enter_recovery(scene, now, signals)
+                return
 
         if self.state == State.COOLDOWN:
             if now >= self._cooldown_until:
@@ -155,6 +213,144 @@ class DecisionEngine:
             self._tick_scan(scene, now)
         elif self.state == State.APPROACHING:
             self._tick_approach(scene, now)
+
+    # ------------- 自主恢复 -------------
+
+    def _frame_time(self, ts_ms: int) -> float:
+        """帧时间戳 → 秒（自动处理代理重启/时钟跳变导致的时间回退）。"""
+        ts_ms = int(ts_ms)
+        if ts_ms < self._last_ts_ms - 1000:
+            # 时间倒流：把偏移重基准，保持内部时间单调，否则所有超时判据失效
+            self._ts_offset_ms = ts_ms - self._last_ts_ms + self._ts_offset_ms
+            self._emit_event("clock_rebase", from_ms=self._last_ts_ms, to_ms=ts_ms)
+        self._last_ts_ms = ts_ms
+        return (ts_ms - self._ts_offset_ms) / 1000.0
+
+    def _current_frame(self) -> bytes | None:
+        try:
+            return self.frame_source() if self.frame_source else None
+        except Exception:  # noqa: BLE001
+            log.debug("取帧失败（VLM 跳过）", exc_info=True)
+            return None
+
+    def _tick_gated(self, scene: SceneState, now: float, signals: StallSignals) -> None:
+        """不在战斗界面：短时间等待；长时间（弹窗/菜单/结算）按 ESC 自救。"""
+        if not self._gate_hold_emitted:
+            self._emit_event("scene_gate_hold")
+            self._gate_hold_emitted = True
+        self._drop_target("scene_gate")
+        if self.state == State.RECOVERING:
+            # 恢复中被弹窗挡住：继续按阶梯走（ESC 就在阶梯里）
+            self._tick_recovery(scene, now, signals)
+            return
+        auto = self.cfg.autonomy
+        if not auto.enabled or signals.verdict != "gated":
+            return
+        if self.stats["gate_escapes"] >= 6:
+            return
+        if now - self._gate_escape_ts < 4.0:
+            return
+        self._gate_escape_ts = now
+        self.stats["gate_escapes"] += 1
+        self._act(Command(op="key_tap", key=auto.escape_key, hold_ms=60))
+        self._intent("长时间不在战斗界面，按 ESC 关闭弹窗/菜单自救")
+        self._emit_event("gate_escape", attempt=self.stats["gate_escapes"],
+                         gate_for=round(signals.gate_for, 1))
+
+    def _enter_recovery(self, scene: SceneState, now: float, signals: StallSignals) -> None:
+        self.state = State.RECOVERING
+        self._recovery_reason = signals.verdict
+        self._recovery_picks = self.stats["picks"]
+        self._recovery_targets0 = signals.targets
+        self._recovery_ok_ticks = 0
+        self._recovery_pause_until = 0.0
+        self._recovery_started = now
+        self.recovery.begin(now)
+        self._drop_target("recovery")
+        self.stats["recoveries"] += 1
+        self._emit_event("recovery_start", reason=signals.verdict, signals=signals.as_dict())
+        self._intent(f"自主恢复启动（{signals.verdict}）")
+        self._tick_recovery(scene, now, signals)
+
+    def _recovery_can_exit(self, scene: SceneState, signals: StallSignals) -> bool:
+        """恢复成功判据（任一即可）：
+
+          1. 拿到新拾取（最硬的证据）；
+          2. 出现 A框 —— 说明"现在就能交互"，立刻回到正常拾取流程；
+          3. **新增**了可交互目标（卡壳前没有的东西）。
+
+        注意不能只看"有目标"：贴着墙角卡在光柱旁边时目标一直存在，
+        若按"有目标=恢复成功"就会在恢复与正常之间来回抖动。
+        """
+        if self.stats["picks"] > self._recovery_picks:
+            return True
+        if scene.aframe is not None:
+            return True
+        if signals.targets > self._recovery_targets0:
+            self._recovery_ok_ticks += 1
+            return self._recovery_ok_ticks >= 2
+        self._recovery_ok_ticks = 0
+        return False
+
+    def _exit_recovery(self, now: float) -> None:
+        self.state = State.SCANNING
+        # 重新计时：刚恢复成功应给一个完整观察窗口，否则会立刻被"停滞"判据再抓回去
+        self.monitor.note_progress(now, "recovery_done")
+        self._recovery_ok_ticks = 0
+        self._last_recovery_step = ""
+        self._emit_event("recovery_done", reason=self._recovery_reason,
+                         level=self.recovery.level, cycle=self.recovery.cycle,
+                         steps=self.recovery.steps_done)
+        self._intent("自主恢复成功，回到扫描")
+        self.recovery.reset()
+
+    def _tick_recovery(self, scene: SceneState, now: float, signals: StallSignals) -> None:
+        if now < self._recovery_pause_until:
+            return  # 循环间的降速等待（避免"卡住→疯狂乱按"）
+        ctx = {
+            "character": scene.character,
+            "approach_mode": self.cfg.approach_mode,
+            "state": self.state.value,
+            "signals": signals.as_dict(),
+            "stats": dict(self.stats),
+            "recent_events": [e.get("event") for e in self.events[-8:]],
+            "on_llm_advice": self._on_llm_advice,
+        }
+        res = self.recovery.step(now, scene, ctx)
+
+        if res.step == "retarget" and res.commands == []:
+            # 内部重定位：清空拉黑与探索序列，下一轮从零开始找目标
+            self._blacklist.clear()
+            self._explore_i = 0
+            self._last_explore_ms = 0
+
+        for cmd in res.commands:
+            if self._act(cmd):
+                self.stats["recovery_actions"] += 1
+        if res.commands:
+            self.stats["recovery_steps"] += 1
+
+        # 事件：有动作 / 升级 / 换了手段 都记录（纯内部重定位也要可见）
+        if res.commands or res.new_level or res.step != self._last_recovery_step:
+            self._emit_event("recovery_step", level=res.level, cycle=res.cycle,
+                             step=res.step, note=res.note, commands=len(res.commands))
+            self._last_recovery_step = res.step
+        if res.note:
+            self._intent(f"自主恢复 L{res.level}/{res.step}: {res.note}")
+
+        if res.cycle_done:
+            self.stats["recovery_cycles"] += 1
+            self._emit_event("recovery_cycle", cycle=res.cycle, reason=self._recovery_reason)
+            # 每轮失败后降速：轮数越多等越久（上限 60s），但不停止尝试
+            backoff = min(60.0, self.cfg.autonomy.cycle_backoff_s * (1 + res.cycle))
+            self._recovery_pause_until = now + backoff
+            if res.cycle >= 2:
+                self.stats["stuck_alarms"] += 1
+                self._emit_event("stuck_alarm", cycle=res.cycle, reason=self._recovery_reason)
+                limit = self.cfg.autonomy.pause_after_cycles
+                if limit and res.cycle >= limit:
+                    log.error("连续 %d 轮自主恢复失败，按配置暂停并等待人工介入", res.cycle)
+                    self.stop()
 
     # ------------- SCANNING -------------
 
@@ -214,6 +410,7 @@ class DecisionEngine:
         if btn is None:
             self._rechallenge_first_seen = None
             return
+        self._last_rechallenge = (btn.x, btn.y)
         if self._rechallenge_first_seen is None:
             self._rechallenge_first_seen = scene.ts_ms
             return
@@ -222,7 +419,7 @@ class DecisionEngine:
         self._rechallenge_first_seen = None
         self._intent("点击『再次挑战』进入下一层（通关循环）")
         self.stats["rechallenges"] += 1
-        self.exec.execute(Command(op="mouse_click", button="left", x=btn.x, y=btn.y))
+        self._act(Command(op="mouse_click", button="left", x=btn.x, y=btn.y))
         self._emit_event("rechallenge_click", x=btn.x, y=btn.y)
         self._cooldown_until = now + max(self.cfg.rechallenge_cooldown_s,
                                          random.uniform(2.5, 3.5))
@@ -249,7 +446,7 @@ class DecisionEngine:
         e = entries[0]
         self._intent("点击右侧掉落列表条目（走过去拾取）")
         self.stats["list_clicks"] = self.stats.get("list_clicks", 0) + 1
-        self.exec.execute(Command(op="mouse_click", button="left", x=e.x, y=e.y))
+        self._act(Command(op="mouse_click", button="left", x=e.x, y=e.y))
         self._emit_event("list_entry_click", x=e.x, y=e.y, entries=len(entries))
         self._cooldown_until = now + random.uniform(1.0, 1.6)
         self.state = State.COOLDOWN
@@ -258,14 +455,20 @@ class DecisionEngine:
     # ------------- 主动清怪 + 探索（通关目标循环） -------------
 
     def _maybe_attack_monster(self, scene: SceneState, now: float) -> bool:
-        """主动清怪：最近的怪物 → 点击（ARPG：点击=移动+攻击）。"""
-        if not self.cfg.attack_monsters or not scene.monsters:
+        """主动清怪：最近的怪物 → 点击（ARPG：点击=移动+攻击）。
+
+        自主模式（autonomy.auto_attack）下即使 attack_monsters 未显式开启也执行 ——
+        搬砖机器人的目标是通关刷图，站着不打怪等于卡住。
+        """
+        auto_attack = self.cfg.attack_monsters or (
+            self.cfg.autonomy.enabled and self.cfg.autonomy.auto_attack)
+        if not auto_attack or not scene.monsters:
             return False
         ch = scene.character
         m = min(scene.monsters,
                 key=lambda mo: (mo.x - ch[0]) ** 2 + (mo.y - ch[1]) ** 2)
         dx, dy = m.x - ch[0], m.y - ch[1]
-        self.exec.execute(Command(op="mouse_click", button="left", x=m.x, y=m.y))
+        self._act(Command(op="mouse_click", button="left", x=m.x, y=m.y))
         self._intent(f"攻击怪物（点击 {m.x},{m.y}，方向{_dir_text(dx, dy)}）")
         self._emit_event("attack_monster", x=m.x, y=m.y)
         self._cooldown_until = now + random.uniform(0.6, 1.0)
@@ -273,20 +476,34 @@ class DecisionEngine:
         return True
 
     def _maybe_explore(self, scene: SceneState, now: float) -> bool:
-        """探索：无目标时按方向序列移动（通关=走完整个关卡）。"""
-        if not self.cfg.explore_enabled:
+        """探索：无目标时按方向序列移动（通关=走完整个关卡）。
+
+        自主模式（autonomy.auto_explore）默认开启：没有掉落/怪物时自己去找，
+        而不是站在原地等刷新 —— 这是"更高自主性"最直接的体现。
+        """
+        auto = self.cfg.autonomy
+        if not (self.cfg.explore_enabled or (auto.enabled and auto.auto_explore)
+                or now < self._auto_explore_until):
             return False
         nav_interval_ms = int(1000 / max(0.5, self.cfg.tick_hz))
-        if self._last_explore_ms and scene.ts_ms - self._last_explore_ms < nav_interval_ms:
+        now_ms = int(now * 1000)
+        if self._last_explore_ms and now_ms - self._last_explore_ms < nav_interval_ms:
             return False
-        self._last_explore_ms = scene.ts_ms
-        dirs = self.cfg.explore_dirs or ["w", "d", "s", "a"]
+        self._last_explore_ms = now_ms
+        dirs = self.cfg.explore_dirs or auto.explore_dirs or ["w", "d", "s", "a"]
         key = dirs[self._explore_i % len(dirs)]
         self._explore_i += 1
-        hold = _jitter_ms(self.cfg.explore_step_ms, self.cfg.jitter_ratio)
-        self.exec.execute(Command(op="key_tap", key=key, hold_ms=hold))
-        self._intent(f"向{_DIR_CN.get(key, key)}方向探索移动（寻找怪物/掉落）")
-        self._emit_event("explore_move", key=key)
+        step_ms = self.cfg.explore_step_ms if self.cfg.explore_enabled else auto.explore_step_ms
+        hold = _jitter_ms(step_ms, self.cfg.jitter_ratio)
+        if self.cfg.approach_mode == "mouse_click" or key.lower() == self.cfg.pickup_key.lower():
+            # 点地面探索：既能走，又不会把拾取键当移动键（铁律）
+            self._click_direction(scene, key, 220)
+            self._intent(f"向{_DIR_CN.get(key, key)}方向点地面探索（寻找怪物/掉落）")
+            self._emit_event("explore_move", key=key, mode="click")
+        else:
+            self._emit_move_keys([key], hold)
+            self._intent(f"向{_DIR_CN.get(key, key)}方向探索移动（寻找怪物/掉落）")
+            self._emit_event("explore_move", key=key, mode="key")
         return True
 
     # ------------- 地面掉落标签走位（TLI 类） -------------
@@ -309,7 +526,7 @@ class DecisionEngine:
         e = labels[0]
         self._intent("走向地面掉落物标签（点击标签下方地面）")
         self.stats["label_walks"] = self.stats.get("label_walks", 0) + 1
-        self.exec.execute(Command(op="mouse_click", button="left", x=e.x, y=e.y))
+        self._act(Command(op="mouse_click", button="left", x=e.x, y=e.y))
         self._emit_event("label_walk", x=e.x, y=e.y, labels=len(labels))
         self._cooldown_until = now + random.uniform(0.8, 1.3)
         self.state = State.COOLDOWN
@@ -353,18 +570,58 @@ class DecisionEngine:
             return
         # 节流：导航步间隔 = 1 个决策周期（1Hz≈1s / 6Hz≈167ms）
         nav_interval_ms = int(1000 / max(0.5, self.cfg.tick_hz))
-        if self._last_nav_ms and scene.ts_ms - self._last_nav_ms < nav_interval_ms:
+        now_ms = int(now * 1000)
+        if self._last_nav_ms and now_ms - self._last_nav_ms < nav_interval_ms:
             return
         keys = self.keys_for_angle(mm.angle_deg or 0.0)
         if not keys:
             return
-        self._last_nav_ms = scene.ts_ms
+        self._last_nav_ms = now_ms
         self.stats["nav_moves"] = self.stats.get("nav_moves", 0) + 1
-        for k in keys:
-            hold = _jitter_ms(self.cfg.nav_step_ms, self.cfg.jitter_ratio)
-            self.exec.execute(Command(op="key_tap", key=k, hold_ms=hold))
+        hold = _jitter_ms(self.cfg.nav_step_ms, self.cfg.jitter_ratio)
+        sent = self._emit_move_keys(keys, hold)
+        if sent == 0:
+            # 方向键全部被铁律拦下（该方向键=拾取键）→ 改用点地面，绝不按拾取键
+            self._click_direction(scene, "".join(keys), 200)
         self._emit_event("nav_move", angle=mm.angle_deg, keys="".join(keys),
                          distance_ratio=mm.distance_ratio)
+
+    # ------------- 走位安全闸门 -------------
+
+    def _act(self, cmd: Command) -> bool:
+        """执行一条命令并登记"我确实动过"（看门狗据此区分"卡住"与"没事干"）。"""
+        ok = self.exec.execute(cmd)
+        if ok and cmd.op != "stop_all":
+            self.monitor.note_action(self._now)
+        return ok
+
+    def _emit_move_keys(self, keys: list[str], hold_ms: int) -> int:
+        """发出移动按键，**拦截拾取键**（铁律：拾取键只能由 A框裁决触发）。
+
+        现实里很多游戏拾取键与左移同键（本项目默认 pickup_key=a），
+        自主探索/导航一旦直接用方向键就会变成"盲捡"。这里做最后一道闸门，
+        被拦下的次数记入 blind_tap_violations（监控可见，恒应为 0 才健康）。
+        """
+        sent = 0
+        for k in keys:
+            if (k or "").lower() == self.cfg.pickup_key.lower():
+                self.stats["blind_tap_violations"] += 1
+                log.error("拦截：禁止把拾取键 %s 当移动键使用", k)
+                continue
+            if self._act(Command(op="key_tap", key=k, hold_ms=hold_ms)):
+                sent += 1
+        return sent
+
+    def _click_direction(self, scene: SceneState, keys: str, dist: int = 200) -> None:
+        """方向 → 点击角色该方向的地面（不依赖键盘，天然避开拾取键冲突）。"""
+        from ..decision.recovery import direction_vec
+
+        dx, dy = direction_vec(keys)
+        if dx == 0 and dy == 0:
+            return
+        x = max(0, min(scene.w - 1, int(scene.character[0]) + dx * dist))
+        y = max(0, min(scene.h - 1, int(scene.character[1]) + dy * dist))
+        self._act(Command(op="mouse_click", button="left", x=x, y=y))
 
     # ------------- APPROACHING -------------
 
@@ -457,16 +714,16 @@ class DecisionEngine:
             # 只发单条 mouse_click(x,y)：RP2040/RPi5 后端内部先移动后点击。
             gx = int(target.x + random.randint(-8, 8))
             gy = int(target.y + self.cfg.ground_click_offset_px + random.randint(-6, 6))
-            self.exec.execute(Command(op="mouse_click", button="left", x=gx, y=gy))
+            self._act(Command(op="mouse_click", button="left", x=gx, y=gy))
             if first:
                 self._emit_event("move_click", x=gx, y=gy)
         else:
             keys = self._direction_keys(scene, target)
             if not keys:
                 return
-            for k in keys:
-                hold = _jitter_ms(self.cfg.key_step_ms, self.cfg.jitter_ratio)
-                self.exec.execute(Command(op="key_tap", key=k, hold_ms=hold))
+            hold = _jitter_ms(self.cfg.key_step_ms, self.cfg.jitter_ratio)
+            if self._emit_move_keys(keys, hold) == 0:
+                self._click_direction(scene, "".join(keys), 200)
             if first:
                 self._emit_event("move_keys", keys="".join(keys))
 
@@ -499,18 +756,19 @@ class DecisionEngine:
             norm = max(1.0, (px * px + py * py) ** 0.5)
             gx = int(scene.character[0] + px / norm * 160)
             gy = int(scene.character[1] + py / norm * 160)
-            self.exec.execute(Command(op="mouse_click", button="left", x=gx, y=gy))
+            self._act(Command(op="mouse_click", button="left", x=gx, y=gy))
         else:
             dx = target.cx - scene.character[0]
             dy = target.y - scene.character[1]
             k = "w" if dy < 0 else "s"
             hold = _jitter_ms(self.cfg.key_step_ms, self.cfg.jitter_ratio)
-            self.exec.execute(Command(op="key_tap", key=k, hold_ms=hold))
+            if self._emit_move_keys([k], hold) == 0:
+                self._click_direction(scene, k, 160)
 
     def _halt_movement(self) -> None:
         if self.cfg.approach_mode == "keys":
             for k in ("w", "a", "s", "d"):
-                self.exec.execute(Command(op="key_up", key=k))
+                self._act(Command(op="key_up", key=k))
 
     # ------------- 拾取 -------------
 
@@ -523,7 +781,7 @@ class DecisionEngine:
         self.stats["a_taps"] += 1
         self._taps_this_target += 1
         hold = _jitter_ms(70, self.cfg.jitter_ratio)
-        self.exec.execute(Command(op="key_tap", key=self.cfg.pickup_key, hold_ms=hold))
+        self._act(Command(op="key_tap", key=self.cfg.pickup_key, hold_ms=hold))
         self._last_tap_ts = now
         # 复核冷却：给游戏拾取动画+视觉确认留时间，期间不得再按
         self._tap_block_until_ms = now * 1000.0 + self.cfg.tap_recheck_ms
@@ -568,6 +826,7 @@ class DecisionEngine:
         if reason == "picked":
             self.stats["picks"] += 1
             self.advisor.note_success()
+            self.monitor.note_progress(now, "pick")
         elif reason in ("timeout", "stuck_wall", "max_taps", "aframe_stuck"):
             self.advisor.note_abandon()
             self._maybe_consult_llm(reason)
@@ -583,13 +842,8 @@ class DecisionEngine:
         if not advisor.should_consult():
             return
 
-        def _on_advice(payload: dict) -> None:  # 在后台线程回调，仅追加事件（GIL 安全）
-            self._emit_event("llm_advice", trigger=reason, **payload)
-            # 白名单安全动作：wait → 短暂停留（拉长冷却）；其余仅记录
-            action = (payload.get("advice") or {}).get("action")
-            if action == "wait" and payload.get("allowed"):
-                self._cooldown_until = max(self._cooldown_until,
-                                           time.monotonic() + 3.0)
+        def _on_advice(payload: dict) -> None:
+            self._on_llm_advice(payload, trigger=reason)
 
         summary = {
             "state": self.state.value,
@@ -600,11 +854,68 @@ class DecisionEngine:
         }
         advisor.consult(summary, on_advice=_on_advice)
 
+    def _on_llm_advice(self, payload: dict, trigger: str = "recovery") -> None:
+        """LLM 建议落地（后台线程回调，只做简单赋值 + 追加事件）。
+
+        可执行动作（白名单在 cfg.llm.allowed_actions）：
+          wait        → 拉长冷却（观察）
+          explore     → 强制探索 15s（换区域找目标）
+          reset_stage → 有『再次挑战』就点（重开一局）
+          panic       → 急停（模型怀疑异常，交人工）
+        其余仅记录，不影响决策。
+        """
+        self._emit_event("llm_advice", trigger=trigger, **payload)
+        advice = payload.get("advice") or {}
+        action = advice.get("action")
+        if not payload.get("allowed"):
+            return
+        now = time.monotonic()
+        if action == "wait":
+            self._cooldown_until = max(self._cooldown_until, now + 3.0)
+        elif action == "explore":
+            self._auto_explore_until = now + 15.0
+            self._emit_event("llm_policy", policy="explore", seconds=15)
+        elif action == "reset_stage":
+            btn = self._last_rechallenge
+            if btn is not None:
+                self._act(Command(op="mouse_click", button="left",
+                                          x=btn[0], y=btn[1]))
+                self._emit_event("llm_policy", policy="reset_stage")
+        elif action == "panic":
+            self.panic()
+
     def _drop_target(self, reason: str) -> None:
         self._target = None
         self._aframe_first_seen_ms = None
         self._taps_this_target = 0
         self._tap_block_until_ms = 0
+
+    # ------------- 自主性观测（仪表盘/接口） -------------
+
+    def autonomy_snapshot(self) -> dict:
+        """自主恢复与模型调用状态（仪表盘展示 + 排障）。"""
+        return {
+            "enabled": self.cfg.autonomy.enabled,
+            "signals": self.monitor.last.as_dict(),
+            "recovery": {
+                "active": self.state == State.RECOVERING,
+                "reason": self._recovery_reason,
+                "level": self.recovery.level,
+                "step": self.recovery.last_step,
+                "cycle": self.recovery.cycle,
+                "steps_done": self.recovery.steps_done,
+            },
+            "vlm": self.vlm.snapshot(),
+            "llm": {
+                "enabled": self.cfg.llm.enabled,
+                "model": self.cfg.llm.model,
+                "queries": self.advisor.queries,
+                "last_advice": self.advisor.last_advice,
+            },
+            "stats": {k: self.stats.get(k, 0) for k in (
+                "recoveries", "recovery_steps", "recovery_cycles",
+                "recovery_actions", "gate_escapes", "stuck_alarms")},
+        }
 
     # ------------- 事件 -------------
 

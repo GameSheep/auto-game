@@ -42,6 +42,11 @@ class Hub:
         self._lock = threading.Lock()
         self._decide_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        # 视觉模型顾问需要原始帧（卡壳时截图问多模态模型）
+        self.fsm.frame_source = self._latest_jpeg_bytes
+        # 帧流看门狗：代理掉线/游戏卡死时让"卡住"这件事在仪表盘可见
+        self._stall_emitted = False
+        self._stall_gap = 0.0
         # 事件持久化（JSONL 审计日志）：FSM 事件回调直写，无索引、不因内存裁剪丢事件
         self._event_log_path = cfg.server.event_log
         self._event_log_warned = False
@@ -109,6 +114,51 @@ class Hub:
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
+    def _latest_jpeg_bytes(self) -> bytes | None:
+        with self._lock:
+            return self._latest_jpeg
+
+    # ------------- 帧流看门狗 -------------
+
+    def check_frame_stall(self) -> None:
+        """运行中长时间没有新帧 → 记事件（代理掉线/游戏卡死）。
+
+        这里**不产生任何输入**：没有画面就没有决策依据，宁可不动也不盲按。
+        作用是让"卡住"这件事在仪表盘/审计日志里立刻可见，而不是静默假运行。
+        """
+        auto = self.cfg.decision.autonomy
+        if not auto.enabled or self._latest_ts == 0:
+            return
+        if self.fsm.state in (State.PAUSED, State.PANIC):
+            self._stall_emitted = False
+            return
+        gap = time.time() - self._latest_ts
+        if gap >= auto.frame_stall_s and not self._stall_emitted:
+            self._stall_emitted = True
+            self._stall_gap = gap
+            ev = {"ts": time.time(), "state": self.fsm.state.value,
+                  "event": "frame_stall", "gap_s": round(gap, 1)}
+            self.fsm.events.append(ev)
+            if len(self.fsm.events) > 400:
+                del self.fsm.events[:-200]
+            self._emit_event_log(ev)
+            log.warning("帧流中断 %.1fs（代理掉线/游戏卡死？已暂停一切输入）", gap)
+        elif gap < auto.frame_stall_s and self._stall_emitted:
+            self._stall_emitted = False
+            ev = {"ts": time.time(), "state": self.fsm.state.value,
+                  "event": "frame_resumed", "gap_s": round(self._stall_gap, 1)}
+            self.fsm.events.append(ev)
+            self._emit_event_log(ev)
+            log.info("帧流恢复（中断 %.1fs）", self._stall_gap)
+
+    async def watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(2.0)
+            try:
+                self.check_frame_stall()
+            except Exception:  # noqa: BLE001
+                log.exception("帧流看门狗异常（忽略）")
+
     async def decision_loop(self) -> None:
         """决策循环：每个新帧 tick 一次 FSM（默认 1Hz 由代理 fps 决定）。
 
@@ -158,6 +208,9 @@ class Hub:
             "state": self.fsm.state.value,
             "frame_seq": seq,
             "latest_ts": self._latest_ts,
+            "frame_gap_s": (round(time.time() - self._latest_ts, 1)
+                            if self._latest_ts else None),
+            "frame_stalled": self._stall_emitted,
             "executor": {
                 "backend": getattr(self.executor, "backend_name", self.cfg.executor.backend),
                 "sent": self.executor.sent,
@@ -165,6 +218,7 @@ class Hub:
                 "panicked": self.executor.panicked,
             },
             "stats": dict(self.fsm.stats),
+            "autonomy": self.fsm.autonomy_snapshot(),
             "scene": scene.model_dump() if scene else None,
             "events": self.fsm.events[-40:],
             "ui_task_ends": list(self.ui_task_ends),

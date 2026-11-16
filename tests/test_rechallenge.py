@@ -69,6 +69,14 @@ def test_rechallenge_click_restarts_map():
     assert world2.map_clears == 0 and world2.map_cleared
 
 
+def _no_auto():
+    """关闭自主探索：本测试只验证『再次挑战』防抖，不接受额外命令。"""
+    from autogame.config import DecisionConfig
+    cfg = DecisionConfig(tick_hz=10.0)
+    cfg.autonomy.enabled = False
+    return cfg
+
+
 def test_rechallenge_fsm_clicks_button():
     """FSM：无光柱 + 按钮可见（连续2帧）→ 点击按钮中心。"""
     from autogame.config import DecisionConfig, ExecutorConfig
@@ -78,7 +86,7 @@ def test_rechallenge_fsm_clicks_button():
 
     ecfg = ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000)
     ex = DryRunExecutor(ecfg)
-    eng = DecisionEngine(DecisionConfig(tick_hz=10.0), ex)
+    eng = DecisionEngine(_no_auto(), ex)
     eng.start()
 
     def scene(ts, btn=True):
@@ -99,7 +107,7 @@ def test_rechallenge_fsm_clicks_button():
 
     # 按钮闪现一帧不得点击
     ex2 = DryRunExecutor(ecfg)
-    eng2 = DecisionEngine(DecisionConfig(tick_hz=10.0), ex2)
+    eng2 = DecisionEngine(_no_auto(), ex2)
     eng2.start()
     eng2.on_scene(scene(1000))
     eng2.on_scene(scene(1200, btn=False))

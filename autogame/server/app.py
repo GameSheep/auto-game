@@ -48,13 +48,15 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
         loop = asyncio.get_running_loop()
         hub.bind_loop(loop)
         decide_task = asyncio.create_task(hub.decision_loop(), name="decision-loop")
-        log.info("决策循环已启动")
+        watch_task = asyncio.create_task(hub.watchdog_loop(), name="frame-watchdog")
+        log.info("决策循环已启动（含帧流看门狗）")
         try:
             yield
         finally:
-            decide_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await decide_task
+            for t in (decide_task, watch_task):
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
 
     app = FastAPI(title="autogame", docs_url=None, redoc_url=None, lifespan=lifespan)
 
@@ -142,6 +144,18 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
         # 只读状态也要求 token，避免局域网内信息泄露
         _require_token_header(request)
         return JSONResponse(hub.snapshot())
+
+    @app.get("/api/autonomy")
+    async def autonomy(request: Request) -> JSONResponse:
+        """自主恢复 / 模型调用状态（排障用：卡在哪一级、模型说了什么）。"""
+        _require_token_header(request)
+        snap = hub.snapshot()
+        return JSONResponse({
+            "state": snap["state"],
+            "autonomy": snap["autonomy"],
+            "frame_gap_s": snap["frame_gap_s"],
+            "frame_stalled": snap["frame_stalled"],
+        })
 
     @app.get("/api/stream.mjpg")
     async def stream_mjpg(request: Request):

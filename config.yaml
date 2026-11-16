@@ -48,6 +48,45 @@ decision:
   key_step_ms: 450
   jitter_ratio: 0.15
 
+  # ---------------- 自主性（默认开启：搬砖机器人不能卡壳） ----------------
+  autonomy:
+    enabled: true
+    frozen_window_s: 12.0      # 画面完全不动 12s → 判定卡住（撞墙/失焦/假死）
+    idle_window_s: 20.0        # 20s 没有任何可交互目标 → 自己去找
+    stall_window_s: 90.0       # 90s 没有任何有效进展 → 进恢复阶梯
+    gate_window_s: 25.0        # 25s 不在战斗界面（弹窗/菜单）→ 按 ESC 自救
+    level_interval_s: 8.0      # 恢复手段每 8s 升级一档
+    max_cycles: 0              # 0=无限重试（绝不放弃）
+    cycle_backoff_s: 15.0      # 每轮失败后降速，避免"卡住→疯狂乱按"
+    pause_after_cycles: 0      # >0 时连续 N 轮失败暂停并告警（默认不暂停）
+    dodge_key: space           # 脱困键（闪避/位移）；空=不用
+    auto_explore: true         # 空闲自动探索（不再站着等刷新）
+    auto_attack: true          # 空闲自动清怪（点击怪物=移动+攻击）
+    frame_stall_s: 10.0        # 10s 没有新帧 → 告警（代理掉线/游戏卡死）
+
+  # ---------------- 文本策略顾问（Ollama，可选） ----------------
+  llm:
+    enabled: false             # true 后走内网 Ollama，失败静默降级
+    base_url: http://127.0.0.1:11434
+    model: qwen2.5:7b
+    trigger_abandons: 3
+    cooldown_s: 60.0
+
+  # ---------------- 视觉模型顾问（多模态，可选但强烈建议） ----------------
+  # 卡壳时截图问模型"我在哪、该往哪走"。只给白名单动作，坐标钳制，
+  # 每分钟调用上限 + 熔断，绝不阻塞决策循环。
+  vlm:
+    enabled: false
+    provider: ollama           # ollama（本机/内网） / openai（任意兼容 /v1 服务）
+    base_url: http://127.0.0.1:11434
+    model: qwen2.5vl:7b        # 也可 llava:13b / minicpm-v 等
+    timeout_s: 20.0
+    max_calls_per_min: 6       # 预算：一分钟最多问 6 次
+    min_interval_s: 8.0
+    max_width: 960             # 上传前缩图（省带宽/显存）
+    min_confidence: 0.45       # 低置信度建议只记录不执行
+    # provider: openai 时可用 api_key_env 指定环境变量名（默认 AUTOGAME_VLM_KEY）
+
 executor:
   backend: dryrun       # dryrun(测试) / rp2040(串口固件) / rpi5_hidg(gadget)
   # rp2040:

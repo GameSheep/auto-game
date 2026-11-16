@@ -65,6 +65,7 @@ def _scene_with_list(ts=1000):
 
 def test_list_entry_click_flow():
     eng_cfg = DecisionConfig(tick_hz=10.0)
+    eng_cfg.autonomy.enabled = False  # 只验证列表点击：自主探索会额外点一次地面
     ecfg = ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000)
     ex = DryRunExecutor(ecfg)
     eng = DecisionEngine(eng_cfg, ex)
@@ -79,6 +80,7 @@ def test_list_entry_click_flow():
 
 def test_list_entry_flicker_no_click():
     eng_cfg = DecisionConfig(tick_hz=10.0)
+    eng_cfg.autonomy.enabled = False  # 只验证防抖：自主探索会产生无关走位命令
     ex = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000))
     eng = DecisionEngine(eng_cfg, ex)
     eng.start()
@@ -108,6 +110,7 @@ def test_item_list_detection_on_synthetic():
 
 def test_loading_screen_holds_fsm():
     eng_cfg = DecisionConfig(tick_hz=10.0)
+    eng_cfg.autonomy.enabled = False  # 只验证防抖：自主探索会产生无关走位命令
     ex = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000))
     eng = DecisionEngine(eng_cfg, ex)
     eng.start()

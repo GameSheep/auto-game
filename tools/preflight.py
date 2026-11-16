@@ -190,6 +190,67 @@ def check_executor(cfg) -> None:  # noqa: ANN001
     check("执行器后端", False, f"未知后端 {be}", "可选: dryrun/rp2040/rpi5_hidg/pca9685")
 
 
+def check_models(cfg) -> None:  # noqa: ANN001
+    """模型顾问自检（可选能力，缺失只 WARN 不 FAIL）。
+
+    搬砖机器人"不卡壳"靠两层：规则恢复（总是可用）+ 模型顾问（看得懂画面）。
+    模型没配好不会让系统崩，只会退化成纯启发式 —— 所以这里只提示，不阻断部署。
+    """
+    try:
+        import httpx
+    except Exception:  # noqa: BLE001
+        check("模型顾问依赖", False, "httpx 未安装", "pip install httpx", warn_only=True)
+        return
+
+    vlm = cfg.decision.vlm
+    if not vlm.enabled:
+        check("视觉模型顾问(VLM)", True, "未启用（卡壳时用启发式恢复）", warn_only=True)
+    else:
+        base = vlm.base_url.rstrip("/")
+        try:
+            if vlm.provider == "ollama":
+                r = httpx.get(f"{base}/api/tags", timeout=5)
+                r.raise_for_status()
+                names = [m.get("name", "") for m in r.json().get("models", [])]
+                hit = any(n.split(":")[0] == vlm.model.split(":")[0] for n in names)
+                check("视觉模型顾问(VLM)", hit,
+                      f"{vlm.provider}/{vlm.model} 已就绪" if hit
+                      else f"模型未拉取，现有: {', '.join(names[:5]) or '无'}",
+                      f"ollama pull {vlm.model}", warn_only=True)
+            else:
+                r = httpx.get(f"{base}/v1/models", timeout=5,
+                              headers={"Authorization": f"Bearer {vlm.api_key or ''}"})
+                check("视觉模型顾问(VLM)", r.status_code < 500,
+                      f"{vlm.provider} HTTP {r.status_code}", warn_only=True)
+        except Exception as e:  # noqa: BLE001
+            check("视觉模型顾问(VLM)", False, f"不可达: {str(e)[:80]}",
+                  f"确认 {base} 已启动（ollama serve）", warn_only=True)
+
+    llm = cfg.decision.llm
+    if not llm.enabled:
+        check("文本策略顾问(LLM)", True, "未启用（不影响自主恢复）", warn_only=True)
+    else:
+        try:
+            r = httpx.get(f"{llm.base_url.rstrip('/')}/api/tags", timeout=5)
+            r.raise_for_status()
+            names = [m.get("name", "") for m in r.json().get("models", [])]
+            hit = any(n.split(":")[0] == llm.model.split(":")[0] for n in names)
+            check("文本策略顾问(LLM)", hit,
+                  f"ollama/{llm.model} 已就绪" if hit
+                  else f"模型未拉取，现有: {', '.join(names[:5]) or '无'}",
+                  f"ollama pull {llm.model}", warn_only=True)
+        except Exception as e:  # noqa: BLE001
+            check("文本策略顾问(LLM)", False, f"不可达: {str(e)[:80]}",
+                  "确认 ollama 已启动", warn_only=True)
+
+    auto = cfg.decision.autonomy
+    check("自主恢复", auto.enabled,
+          f"启用（冻结{auto.frozen_window_s:.0f}s / 空闲{auto.idle_window_s:.0f}s / "
+          f"停滞{auto.stall_window_s:.0f}s，"
+          f"{'无限重试' if auto.max_cycles == 0 else f'最多{auto.max_cycles}轮'}）",
+          "config.yaml: decision.autonomy.enabled: true")
+
+
 def check_server(url: str | None, token: str | None) -> None:
     if not url:
         return
@@ -232,6 +293,7 @@ def main() -> None:
             check_capture(cfg)
         check_vision_assets(cfg)
         check_executor(cfg)
+        check_models(cfg)
     token = args.token
     if token is None and (ROOT / ".token").exists():
         token = (ROOT / ".token").read_text(encoding="utf-8").strip()

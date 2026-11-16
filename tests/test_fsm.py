@@ -30,7 +30,9 @@ def _pillar(cx=900, cy=400, distance=None, whitelisted=True):
 
 
 def _mk_engine(**cfg_overrides):
+    # 单元测试隔离：自主探索/恢复会引入额外命令，这里默认关（自主性见 test_autonomy.py）
     dcfg = DecisionConfig(tick_hz=10.0, approach_mode="keys")
+    dcfg.autonomy.enabled = False
     for k, v in cfg_overrides.items():
         setattr(dcfg, k, v)
     ecfg = ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000)

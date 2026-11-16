@@ -19,6 +19,7 @@ def process2(det, frame, ts=1000):
 
 def _nav_cfg(**overrides):
     dcfg = DecisionConfig(tick_hz=10.0, approach_mode="keys", nav_enabled=True)
+    dcfg.autonomy.enabled = False  # 本文件只验证导航数学，自主探索会干扰断言
     for k, v in overrides.items():
         setattr(dcfg, k, v)
     ecfg = ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000)

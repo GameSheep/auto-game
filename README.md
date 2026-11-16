@@ -59,9 +59,68 @@
    `vision.whitelist: ["物品名"]` + `vision.ocr` 按名称过滤。两者都空时启动会**明确告警**
    —— 因为此时所有颜色的光柱都会被当成目标（C3 铁律实际上是关着的）。
 3. **绝不原地卡死**：走位超时（默认 8s）放弃并拉黑区域 30s；帧差过低判定撞墙 →
-   侧向脱困一次 → 仍卡则放弃。
+   侧向脱困一次 → 仍卡则放弃。**长时间无进展则进自主恢复（见下节），绝不"停在那里"**。
 4. **一键急停**：`POST /api/control/panic` 或仪表盘 ⛔ → 执行器立即停止一切输出。
 5. **执行器限速**：最小动作间隔（自适应等待不丢命令）+ 每秒上限，所有后端统一生效。
+6. **恢复动作同样受铁律约束**：自主恢复/模型建议**永远不能按拾取键**（
+   `RecoveryLadder` 二次过滤 + `_emit_move_keys` 闸门），拾取只能由 A框检测裁决。
+
+## 自主性：卡壳自愈 + 模型顾问（默认开启）
+
+搬砖机器人真正的难点是"连续跑 8 小时不卡住"，而不是"能捡一次"。系统有三层防线：
+
+**① 进度看门狗（规则，零依赖，永远可用）**
+
+| 判定 | 含义 | 触发动作 |
+|---|---|---|
+| `frozen` | 画面完全不动（撞墙/失焦/游戏假死） | 进恢复阶梯 |
+| `idle` | 画面在动但没有任何可交互目标（房间走空） | 自己去找（探索/导航/清怪） |
+| `stalled` | 有目标但长时间零进展（走不到/来回绕） | 进恢复阶梯 |
+| `gated` | 长时间不在战斗界面（弹窗/菜单/结算） | 按 ESC 自救（最多 6 次） |
+| `loading` | 加载/黑屏过场 | 保持不动（正常等待） |
+
+**② 分级恢复阶梯（由轻到重，永不放弃）**
+
+```
+重定位(清拉黑/丢目标) → 四向探路点击 → ESC 关弹窗 → 脱困键(空格闪避)
+  → 重新聚焦(点角色) → 八向脱困 → 点『再次挑战』重开 → 视觉模型看画面
+  → 文本模型换策略 → 新一轮（每轮降速，最多等 60s，不停止尝试）
+```
+
+每级默认 8s 升级；动作有最小间隔，避免"卡住→疯狂乱按"这种更糟的失败模式。
+`max_cycles: 0` 表示无限重试；`pause_after_cycles: N` 是可选安全阀（默认不暂停）。
+
+**③ 模型顾问（可选，看懂规则覆盖不到的局面）**
+
+- **VLM（视觉，多模态）**：卡壳时把截图发给 Ollama / OpenAI 兼容服务，问"我在哪个界面、该往哪走"，
+  返回结构化动作（`walk_to / key / esc / explore / reset_stage`）。
+  安全边界：动作白名单 + 坐标钳制到画面内 + 置信度门槛 + 每分钟调用上限 + 连续失败熔断，
+  **后台线程调用，绝不阻塞决策循环**。
+- **LLM（文本，策略）**：看场景摘要判断"该不该换策略"，可下发的动作只有
+  `wait / continue / explore / reset_stage / panic`（不能给坐标、不能按键）。
+
+```yaml
+decision:
+  autonomy:
+    enabled: true            # 看门狗 + 恢复阶梯
+    frozen_window_s: 12      # 画面不动多久算卡住
+    idle_window_s: 20        # 没有目标多久算空闲
+    stall_window_s: 90       # 零进展多久算停滞
+    auto_explore: true       # 空闲自动探索（点地面，不用键盘，避开拾取键冲突）
+    auto_attack: true        # 空闲自动清怪
+    max_cycles: 0            # 0=无限重试
+  vlm:
+    enabled: true
+    provider: ollama         # ollama / openai（任意兼容 /v1 服务）
+    model: qwen2.5vl:7b      # ollama pull qwen2.5vl:7b
+    max_calls_per_min: 6     # 预算：一分钟最多问 6 次
+  llm:
+    enabled: true
+    model: qwen2.5:7b
+```
+
+排障接口：`GET /api/autonomy` 直接看"卡在哪一级、模型说了什么"；仪表盘右侧"自主恢复"面板
+显示判定/等级/循环/模型建议；`tools/preflight.py` 会检查模型是否已拉取。
 
 
 ## 完整刷图主循环（对话定稿的产品闭环）
@@ -140,10 +199,14 @@ python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # Window
 
 # 浏览器 http://127.0.0.1:8765/ ，token 见 .token 文件
 # 点 ▶ 启动 → 看拾取/刷图/导航统计与事件流
+# 右侧「自主恢复」面板：卡壳判定 / 恢复等级 / 循环轮数 / 模型建议
+
+# 1) 卡壳自愈演示（人为制造卡死 → 看它自己脱困 → 恢复拾取）
+.venv/Scripts/python tools/stuck_demo.py
 ```
 
-运行测试（**169 个用例，实测覆盖率 82%，CI 门槛 78%**，含端到端闭环/真实帧回归/
-A框精度回归/固件协议一致性/UI 场景任务/审查页/fuzz 加固/性能守卫）：
+运行测试（**199 个用例，实测覆盖率 83%，CI 门槛 78%**，含端到端闭环/真实帧回归/
+A框精度回归/自主恢复与卡壳自愈/模型顾问预算熔断/固件协议一致性/UI 场景任务/审查页/fuzz 加固）：
 
 ```bash
 .venv/Scripts/python -m pytest tests/ -q                  # 本地：跑测试 + 出覆盖率
@@ -302,19 +365,22 @@ autogame/
 │   ├── ui_panels.py     # UI 网格/高亮/文本行/按钮检测
 │   └── scene_classifier.py  # 关卡内/菜单分类
 ├── decision/
-│   ├── fsm.py           # FSM：拾取闭环 + 刷图循环 + 导航（帧时间驱动，确定性可测）
+│   ├── fsm.py           # FSM：拾取闭环 + 刷图循环 + 导航 + 自主恢复（帧时间驱动）
+│   ├── recovery.py      # 进度看门狗 + 分级恢复阶梯（永不放弃，绝不按拾取键）
+│   ├── vlm.py           # 视觉模型顾问（多模态，白名单/钳制/预算/熔断）
 │   ├── recipe.py        # UI 配方引擎 + 启动前模板预检
-│   └── llm_advisor.py   # Ollama 决策顾问（可选，白名单动作）
+│   └── llm_advisor.py   # 文本策略顾问（Ollama，白名单动作）
 ├── executor/            # dryrun / rp2040 / rpi5_hidg / pca9685（报文纯函数字节级可测）
 ├── server/              # FastAPI (WS 上行 + REST 控制 + MJPEG 仪表盘 + JSONL 审计)
 ├── agent/               # dxcam/mss 采集 + WS 客户端
 └── sim/scene.py         # 合成 ARPG 世界（拾取/刷图/小地图全闭环联调）
-tools/                   # preflight 自检 / e2e_real_screen / auto_template / crop_template
-                         # / grab_frame / calibrate_hsv / batch_validate / video_replay / soak
+tools/                   # preflight 自检 / stuck_demo 卡壳自愈演示 / e2e_real_screen
+                         # / auto_template / crop_template / grab_frame / calibrate_hsv
+                         # / batch_validate / video_replay / soak
 firmware/rp2040/         # RP2040 组合 HID 固件 (.ino + platformio.ini + README)
 scripts/                 # J4125 部署 / RPi5 gadget / benchmark / 打包 EXE
 web/                     # 监控仪表盘 + 图片审查页
-tests/                   # 169 用例（fixtures 内含 9 张真实帧，12MB）
+tests/                   # 199 用例（fixtures 内含 9 张真实帧，12MB）
 templates/               # 标定资产：aframe.png / skillbar*.png / ui/（必须入库）
 assets/samples/          # 真实游戏截图素材（B站/17173 实机帧）
 .github/workflows/ci.yml # CI：pytest（覆盖率门槛 78%）+ preflight

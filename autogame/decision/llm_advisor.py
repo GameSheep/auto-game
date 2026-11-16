@@ -20,9 +20,12 @@ from ..config import LLMConfig
 log = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
-    "你是一个游戏自动化决策顾问。根据场景摘要给出下一步建议，"
-    "只输出一行 JSON：{\"action\": \"wait|continue|panic\", \"reason\": \"简短原因\"}。"
-    "wait=暂停观察, continue=继续当前策略, panic=怀疑异常建议人工介入。"
+    "你是一个 ARPG 游戏自动化机器人的策略顾问。根据场景摘要给出下一步建议，"
+    "只输出一行 JSON：{\"action\": \"wait|continue|explore|reset_stage|panic\", "
+    "\"reason\": \"简短原因\"}。\n"
+    "wait=暂停观察, continue=继续当前策略, explore=换区域/换方向找目标, "
+    "reset_stage=重开当前关卡（结算/卡关时）, panic=怀疑异常建议人工介入。\n"
+    "注意：你只能改变策略，不能直接按拾取键；拾取由视觉检测裁决。"
 )
 
 
@@ -46,10 +49,10 @@ class LLMAdvisor:
     def note_success(self) -> None:
         self._consecutive_abandons = 0
 
-    def should_consult(self) -> bool:
+    def should_consult(self, ignore_abandons: bool = False) -> bool:
         if not self.cfg.enabled or self._busy:
             return False
-        if self._consecutive_abandons < self.cfg.trigger_abandons:
+        if not ignore_abandons and self._consecutive_abandons < self.cfg.trigger_abandons:
             return False
         if time.monotonic() - self._last_advice_ts < self.cfg.cooldown_s:
             return False

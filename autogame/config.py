@@ -279,6 +279,87 @@ class AFrameConfig(BaseModel):
     glyph_s_max: int = Field(70, ge=10, le=180, description="字形白色的饱和度上限（S<=该值视为白）")
 
 
+class VLMConfig(BaseModel):
+    """视觉模型（多模态）顾问配置 —— 卡壳时"看一眼画面"。
+
+    与文本 LLM 的分工：
+      - LLM（llm_advisor）：看**摘要**，判断"该不该换策略"，成本低、频率可高；
+      - VLM（本类）：看**截图**，判断"我现在在哪个界面 / 目标在哪"，成本高、必须省着用。
+
+    安全与预算（搬砖机器人会跑几小时，模型调用不能失控）：
+      - 动作白名单 + 坐标边界钳制，模型不能让我们按拾取键或点屏幕外；
+      - 每分钟调用上限 + 最小间隔 + 连续失败熔断（默认 3 次失败停 2 分钟）；
+      - 后台线程执行，绝不阻塞决策循环；超时/失败静默降级为启发式恢复。
+    """
+
+    enabled: bool = False
+    provider: Literal["ollama", "openai"] = Field(
+        "ollama", description="ollama=本机/内网多模态；openai=任意 OpenAI 兼容 /v1/chat/completions"
+    )
+    base_url: str = "http://127.0.0.1:11434"
+    model: str = "qwen2.5vl:7b"
+    api_key: Optional[str] = Field(None, description="openai 兼容服务的 key（留空则读环境变量）")
+    api_key_env: str = "AUTOGAME_VLM_KEY"
+    timeout_s: float = Field(20.0, ge=2.0, le=120.0)
+    max_calls_per_min: int = Field(6, ge=1, le=60, description="每分钟最多调用次数（预算）")
+    min_interval_s: float = Field(8.0, ge=0.5, description="两次调用最小间隔")
+    jpeg_quality: int = Field(70, ge=30, le=95, description="上传前重新编码质量（省带宽/显存）")
+    max_width: int = Field(960, ge=320, le=1920, description="上传前等比缩小到该宽度")
+    min_confidence: float = Field(0.45, ge=0.0, le=1.0, description="低于该置信度的建议只记录不执行")
+    failure_threshold: int = Field(3, ge=1, description="连续失败 N 次触发熔断")
+    cooldown_after_failure_s: float = Field(120.0, ge=5.0, description="熔断后冷却时长")
+    allowed_actions: list[str] = Field(
+        ["walk_to", "key", "esc", "wait", "explore", "reset_stage"],
+        description="允许 VLM 触发的动作（其余仅记录）",
+    )
+    # 允许 VLM 建议的按键（白名单，绝不含拾取键 —— 拾取必须由 A框检测裁决）
+    allowed_keys: list[str] = Field(["w", "a", "s", "d", "space", "esc", "enter", "tab"])
+
+
+class AutonomyConfig(BaseModel):
+    """自主性配置 —— 进度看门狗 + 分级恢复阶梯 + 空闲策略。
+
+    设计目标（用户要求："作为搬砖机器人，要有更高智能，绝对不能卡壳"）：
+      1. 不卡死：任何状态都有上限时长，超时即升级恢复动作；
+      2. 不空转：没有目标时自己去找（探索/导航/清怪），而不是站着等；
+      3. 不瞎按：恢复动作全部在安全白名单内，**永远不按拾取键**（铁律不变）；
+      4. 不断线：恢复失败就换招，循环重试并降速告警，绝不"停在那里"。
+    """
+
+    enabled: bool = True
+
+    # ---- 看门狗窗口（秒，均基于帧时间戳）----
+    motion_delta_thresh: float = Field(2.0, ge=0.1, description="帧变化率(%)低于该值视为画面没动")
+    frozen_window_s: float = Field(12.0, ge=1.0, description="画面完全不动多久算卡住")
+    idle_window_s: float = Field(20.0, ge=1.0, description="没有任何可交互目标多久算空闲")
+    stall_window_s: float = Field(90.0, ge=3.0, description="无任何有效进展多久算停滞")
+    gate_window_s: float = Field(25.0, ge=1.0, description="长时间不在战斗界面(弹窗/菜单)多久后按 ESC")
+
+    # ---- 恢复阶梯 ----
+    level_interval_s: float = Field(8.0, ge=0.2, description="恢复等级升级间隔")
+    step_interval_s: float = Field(1.2, ge=0.05, description="同一步骤内两次动作最小间隔")
+    max_cycles: int = Field(0, ge=0, description="完整恢复循环上限；0=无限重试（绝不放弃）")
+    cycle_backoff_s: float = Field(15.0, ge=0.0, description="每轮循环后的额外等待（降速避免乱按）")
+    pause_after_cycles: int = Field(0, ge=0, description="连续 N 轮仍失败则暂停并告警；0=从不暂停")
+    dodge_key: str = Field("space", description="脱困/位移键（空格=闪避类）；空=不用")
+    dodge_taps: int = Field(2, ge=1, le=5)
+    escape_key: str = Field("esc", description="关闭弹窗/菜单键")
+
+    # ---- 空闲自主策略（提高自主性，不再干等）----
+    auto_explore: bool = Field(True, description="空闲无目标时自动探索（临时启用 explore）")
+    auto_attack: bool = Field(True, description="空闲且检测到怪物时自动清怪")
+    explore_step_ms: int = Field(600, ge=150, le=1500, description="自主探索单步时长")
+    explore_dirs: list[str] = Field(["w", "d", "s", "a"], description="自主探索方向序列")
+    # 探路恢复：点击角色四周这些方向（像素偏移，屏幕坐标系）
+    probe_offsets: list[list[int]] = Field(
+        [[0, -140], [140, 0], [0, 140], [-140, 0]],
+        description="脱困探路点击偏移（相对角色），逐个尝试找出可行方向",
+    )
+
+    # ---- 程序自身看门狗（帧流断了也不能傻等）----
+    frame_stall_s: float = Field(10.0, ge=0.5, description="运行中超过该时长无新帧 → 告警")
+
+
 class DecisionConfig(BaseModel):
     """决策状态机配置。"""
 
@@ -327,6 +408,11 @@ class DecisionConfig(BaseModel):
     # Ollama 决策顾问（可选）：连续放弃 N 次等异常局面时咨询局域网 LLM
     llm: "LLMConfig" = Field(default_factory=lambda: LLMConfig())
 
+    # 自主性：进度看门狗 + 分级恢复阶梯（默认开启 —— 搬砖机器人不能卡壳）
+    autonomy: "AutonomyConfig" = Field(default_factory=lambda: AutonomyConfig())
+    # 视觉模型顾问（可选）：卡壳时截图问多模态模型"我现在在哪、该往哪走"
+    vlm: "VLMConfig" = Field(default_factory=lambda: VLMConfig())
+
 
 class LLMConfig(BaseModel):
     """Ollama 决策顾问配置（对话定稿：pc 上跑 ollama 决策模型）。
@@ -342,7 +428,9 @@ class LLMConfig(BaseModel):
     trigger_abandons: int = Field(3, ge=1, description="连续放弃多少次后咨询")
     cooldown_s: float = Field(60.0, ge=0.5, description="两次咨询最小间隔")
     # 允许 LLM 直接触发的动作白名单（其余仅记录建议）
-    allowed_actions: list[str] = Field(["wait", "continue"])
+    # explore=换区域找目标 / reset_stage=重开一局 / wait=观察 / panic=交人工
+    allowed_actions: list[str] = Field(
+        ["wait", "continue", "explore", "reset_stage"])
 
 
 class ExecutorConfig(BaseModel):
@@ -425,6 +513,8 @@ ItemListConfig.model_rebuild()
 SceneGateConfig.model_rebuild()
 AFrameConfig.model_rebuild()
 LLMConfig.model_rebuild()
+VLMConfig.model_rebuild()
+AutonomyConfig.model_rebuild()
 VisionConfig.model_rebuild()
 AppConfig.model_rebuild()
 
