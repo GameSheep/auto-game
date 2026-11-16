@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 
 from autogame.config import AppConfig
 from autogame.agent.client import AgentClient
@@ -12,7 +13,13 @@ from autogame.sim.scene import SimCapture, SimPillar, SimWorld
 
 
 def test_review_manifest_and_image():
-    """审查 API：batch manifest 结构 + 图片服务 + 鉴权。"""
+    """审查 API：batch manifest 结构 + 图片服务 + 鉴权。
+
+    100 图批量素材（assets/batch）是本地生成物、不入库（体积大且可重跑），
+    所以 CI 上没有它：此时只验证鉴权/页面/目录穿越，内容断言自动跳过。
+    """
+    has_batch = (Path("assets/batch").is_dir()
+                 and Path("assets/batch_report.json").exists())
     srv = ServerFixture()
     srv.start()
 
@@ -28,16 +35,18 @@ def test_review_manifest_and_image():
                              headers={"X-Token": "e2e-test-token"})
             assert r.status_code == 200
             d = r.json()
-            assert d["total"] >= 90, f"batch 至少 90 项，实际 {d['total']}"
-            assert d["a_press"] == 0, "全部图片按 A 必须为 0"
-            first = d["items"][0]
-            assert first["image"].startswith("/review/img?src=batch&name=")
-            # 图片服务
-            img_name = first["name"]
-            r = await hc.get(f"{srv.url}{first['image']}"
-                             f"&token=e2e-test-token")
-            assert r.status_code == 200
-            assert r.headers["content-type"].startswith("image/")
+            if has_batch:
+                assert d["total"] >= 90, f"batch 至少 90 项，实际 {d['total']}"
+                assert d["a_press"] == 0, "全部图片按 A 必须为 0"
+                first = d["items"][0]
+                assert first["image"].startswith("/review/img?src=batch&name=")
+                # 图片服务
+                r = await hc.get(f"{srv.url}{first['image']}"
+                                 f"&token=e2e-test-token")
+                assert r.status_code == 200
+                assert r.headers["content-type"].startswith("image/")
+            else:
+                assert d["total"] == 0, "无素材时应返回空清单而不是报错"
             # 目录穿越防护
             r = await hc.get(f"{srv.url}/review/img?src=batch"
                              f"&name=..%2F..%2Fconfig.yaml&token=e2e-test-token")
