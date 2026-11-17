@@ -37,7 +37,8 @@ _HUB: Hub | None = None
 _CFG: AppConfig | None = None
 
 
-def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
+def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
+               config_path: str = "") -> FastAPI:
     global _HUB, _CFG
     _HUB = hub
     _CFG = cfg
@@ -61,6 +62,13 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
     app = FastAPI(title="autogame", docs_url=None, redoc_url=None, lifespan=lifespan)
 
     def _require_token_header(request: Request) -> None:
+        """本地默认**免鉴权**：局域网自用还要粘 token 只是给自己添堵。
+
+        需要暴露到不可信网络时把 server.require_token 打开，行为与之前一致
+        （常数时间比较、无 token 401/1008）。
+        """
+        if not cfg.server.require_token:
+            return
         provided = request.headers.get("x-token") or request.query_params.get("token")
         if not check_token(provided, token):
             raise HTTPException(status_code=401, detail="unauthorized")
@@ -69,10 +77,11 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
 
     @app.websocket("/ws/agent")
     async def agent_ws(ws: WebSocket) -> None:
-        provided = ws.query_params.get("token")
-        if not check_token(provided, token):
-            await ws.close(code=1008, reason="unauthorized")
-            return
+        if cfg.server.require_token:
+            provided = ws.query_params.get("token")
+            if not check_token(provided, token):
+                await ws.close(code=1008, reason="unauthorized")
+                return
         await ws.accept()
         # 踢除旧代理连接（重连风暴防护：同一时间只允许一路帧源）
         old = getattr(hub, "agent_ws", None)
@@ -248,6 +257,139 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
             "click_point": [p.x, p.y + _CFG.decision.ground_click_offset_px],
         })
 
+    # ---------------- 设置页：配置 / 预设 / 标定 / 告警 ----------------
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_page() -> str:
+        return (_ASSETS.parent / "web" / "settings.html").read_text(encoding="utf-8")
+
+    @app.get("/api/config")
+    async def get_config(request: Request) -> JSONResponse:
+        from .settings import LIVE_FIELDS, public_config
+        from ..presets import DESCRIPTIONS
+
+        _require_token_header(request)
+        return JSONResponse({
+            "config": public_config(cfg),
+            "presets": DESCRIPTIONS,
+            "live_fields": list(LIVE_FIELDS),
+            "config_path": config_path,
+        })
+
+    @app.post("/api/config")
+    async def patch_config(request: Request) -> JSONResponse:
+        """局部更新配置：校验 → 原地生效 → 写入覆盖文件。
+
+        校验失败整批不生效（半套配置比不配置更危险），错误字段回给页面。
+        """
+        from .settings import ConfigError, apply_patch, save_overlay
+
+        _require_token_header(request)
+        body = await request.json()
+        patch = body.get("patch") if isinstance(body, dict) else None
+        if not isinstance(patch, dict):
+            raise HTTPException(status_code=400, detail="body 需要 {\"patch\": {...}}")
+        try:
+            res = apply_patch(cfg, patch)
+        except ConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        saved = ""
+        if config_path:
+            try:
+                saved = save_overlay(config_path, patch)
+            except OSError as e:
+                log.warning("配置已生效但写盘失败: %s", e)
+        if res["changed"]:
+            log.info("配置已更新 %d 项: %s", len(res["changed"]),
+                     ", ".join(res["changed"][:8]))
+        return JSONResponse({"ok": True, "saved": saved, **res})
+
+    @app.post("/api/preset/{name}")
+    async def apply_named_preset(name: str, request: Request) -> JSONResponse:
+        """一键切换拟人度预设（stable / human / custom）。"""
+        from .settings import ConfigError, apply_patch, save_overlay
+        from ..presets import preset_patch
+
+        _require_token_header(request)
+        try:
+            patch = preset_patch(name)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        try:
+            res = apply_patch(cfg, patch) if patch else {"changed": [],
+                                                        "restart_required": []}
+        except ConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        saved = ""
+        if patch and config_path:
+            try:
+                saved = save_overlay(config_path, patch)
+            except OSError as e:
+                log.warning("预设已生效但写盘失败: %s", e)
+        log.info("已应用预设 %s（%d 项生效）", name, len(res["changed"]))
+        return JSONResponse({"ok": True, "preset": name, "saved": saved, **res})
+
+    @app.delete("/api/config/overlay")
+    async def drop_overlay(request: Request) -> JSONResponse:
+        """删除运行时覆盖文件（回滚到 config.yaml 的原值，需重启生效）。"""
+        from .settings import clear_overlay
+
+        _require_token_header(request)
+        if not config_path:
+            raise HTTPException(status_code=400, detail="未配置 config_path")
+        removed = clear_overlay(config_path)
+        return JSONResponse({"ok": True, "removed": removed,
+                             "note": "已删除覆盖文件，重启后回到 config.yaml 的原始值"})
+
+    @app.get("/api/calibrate")
+    async def calibrate(request: Request) -> JSONResponse:
+        """相机标定反馈：亮度/清晰度/场景门/A框模板分数 + 文字建议。"""
+        _require_token_header(request)
+        return JSONResponse(hub.calibration_report())
+
+    @app.post("/api/calibrate/hsv")
+    async def calibrate_hsv(request: Request) -> JSONResponse:
+        """从当前画面自动采样 HSV 范围（立即生效，并写入覆盖文件）。"""
+        from .settings import save_overlay
+
+        _require_token_header(request)
+        res = hub.sample_hsv()
+        if res.get("ok") and config_path:
+            try:
+                save_overlay(config_path, {"vision": {"hsv": res["hsv"]}})
+            except OSError as e:
+                log.warning("HSV 已生效但写盘失败: %s", e)
+        return JSONResponse(res)
+
+    @app.post("/api/test/plan")
+    async def test_plan(request: Request) -> JSONResponse:
+        """试跑：在当前画面上算"接下来几步会做什么"（不产生真实输入）。"""
+        _require_token_header(request)
+        return JSONResponse(hub.test_plan())
+
+    @app.post("/api/test/send")
+    async def test_send(request: Request) -> JSONResponse:
+        """把命令真发给执行器（含 RP2040 串口 / hidg），返回 HID 报文。"""
+        _require_token_header(request)
+        body = await request.json()
+        cmds = body.get("commands") if isinstance(body, dict) else None
+        if not isinstance(cmds, list):
+            raise HTTPException(status_code=400, detail="body 需要 {\"commands\": [...]}")
+        return JSONResponse(hub.test_send(cmds))
+
+    @app.get("/api/alerts")
+    async def alerts(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        return JSONResponse(hub.notifier.snapshot())
+
+    @app.post("/api/alerts/test")
+    async def alert_test(request: Request) -> JSONResponse:
+        """发一条测试告警，验证 webhook / 邮件是否通。"""
+        _require_token_header(request)
+        hub.notifier.alert("测试告警", "这是一条来自 autogame 设置页的测试消息。",
+                           level="info")
+        return JSONResponse({"ok": True, "notify": hub.notifier.snapshot()})
+
     # ---------------- 图片审查页（图上步骤下） ----------------
 
     @app.get("/review", response_class=HTMLResponse)
@@ -297,15 +439,21 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
                 return items
             d = json.loads(fp.read_text(encoding="utf-8"))
             for it in d.get("items", []):
+                # 命令兼容两种写法：旧回放写字符串，tools/video_batch.py 写完整对象
+                raw = it.get("commands") or []
+                texts = [c.get("text", "") if isinstance(c, dict) else str(c) for c in raw]
                 items.append({
                     "image": f"/review/img?src=replay&name={safe}/{it['image']}",
                     "name": f"{safe}/{it['image']}",
                     "gate": it.get("gate", ""),
                     "pillars": it.get("pillars", []),
                     "aframe": it.get("aframe"),
-                    "steps": [{"tick": it["t"], "cmds": it.get("commands", [])}]
-                             if it.get("commands") else [],
-                    "no_action": not it.get("commands"),
+                    "intent": it.get("intent", ""),
+                    "size": it.get("frame_size"),
+                    "verdict": "FAIL" if it.get("violations") else None,
+                    "steps": [{"tick": it["t"], "intent": it.get("intent", ""),
+                               "cmds": texts}] if texts else [],
+                    "no_action": not texts,
                 })
         return items
 
@@ -337,7 +485,9 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str) -> FastAPI:
             raise HTTPException(status_code=404, detail="图片不存在")
         from fastapi.responses import FileResponse
 
-        return FileResponse(fp, media_type="image/png")
+        media = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".png": "image/png"}.get(fp.suffix.lower(), "application/octet-stream")
+        return FileResponse(fp, media_type=media)
 
     @app.post("/api/task")
     async def start_task(request: Request) -> JSONResponse:

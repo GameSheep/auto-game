@@ -28,8 +28,33 @@ log = logging.getLogger(__name__)
 ROOT_TEMPLATES = Path(__file__).resolve().parent.parent.parent / "templates"
 
 
+def _box_overlap(cx1: float, cy1: float, w1: float, h1: float,
+                 cx2: float, cy2: float, w2: float, h2: float) -> bool:
+    """两个"中心点+宽高"的框是否重叠（用于怪物 vs 文字标签互斥）。"""
+    return (abs(cx1 - cx2) * 2 < (w1 + w2)) and (abs(cy1 - cy2) * 2 < (h1 + h2))
+
+
+def _tpl_usable(tpl: np.ndarray) -> bool:
+    """模板是否可用于 NCC 匹配：需要真实结构（方差）且不是一条线。
+
+    TM_CCOEFF_NORMED 在低方差模板上会退化成"哪里都像"，历史上 q_letter.png
+    （一块图标角落）就因此对每个画面都给出 0.88，等于门禁常开。
+    """
+    if min(tpl.shape[:2]) < 6:
+        return False
+    gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY) if tpl.ndim == 3 else tpl
+    return float(gray.std()) >= 8.0
+
+
+
 class Detector:
     """检测器（含时域光柱跟踪：跨帧持续出现的候选才确认为光柱）。"""
+
+    # 怪物时域确认参数（真实录像验证后定：静态 HUD 图标/悬停物品名必须被滤掉）
+    MONSTER_NEAR_PX = 45        # 跨帧同一目标的中心位移容差
+    MONSTER_MOVE_PX = 2         # 判定"动了"的最小位移（精灵动画/走位都超过）
+    MONSTER_SIZE_TOL = 0.35     # 尺寸变化超过该比例也算"活了"（挥击/受击缩放）
+    MONSTER_CONFIRM_HITS = 1    # 首次确认所需命中次数（0 → 需两帧都见过）
 
     def __init__(self, cfg: VisionConfig, templates_dir: Path | None = None) -> None:
         self.cfg = cfg
@@ -37,22 +62,27 @@ class Detector:
         self._template_name: str | None = None
         self._rechallenge_template: np.ndarray | None = None
         self._skillbar_templates: list[np.ndarray] = []
-        self._letter_template: np.ndarray | None = None
+        # 反例模板（整屏 UI 的静态裁块）：[(名字, 图像)]
+        self._neg_templates: list[tuple[str, np.ndarray]] = []
         self._gate_cache_until: float = 0.0
         self._gate_cache_value: bool = True
+        # 标定诊断：最近一次检测的关键分数（页面"相机标定"用来给反馈，不参与决策）
+        self.diag: dict = {}
+        self._diag_aframe_best: float = 0.0
+        self._diag_gate_best: float = 0.0
+        self._diag_gate_neg_best: float = 0.0
+        self._diag_gate_neg_name: str = ""
+        self._diag_gate_reason: str = ""
         self._last_gray: np.ndarray | None = None
         # 光柱时域跟踪: [(cx, cy, 剩余寿命, 连续可见帧数)]
         self._beam_track: list[tuple[int, int, int, int]] = []
+        # 怪物时域确认: [(x, y, w, h, 命中次数)] —— 静态 HUD 图标/漂浮文字永不累加
+        self._monster_track: list[tuple[int, int, int, int, int]] = []
         self._templates_dir = templates_dir
         self._load_template(templates_dir)
         self._load_rechallenge_template(templates_dir)
         self._load_skillbar_template(templates_dir)
-        # 键位字母锚点模板（随仓库分发）
-        for p in [ROOT_TEMPLATES / "q_letter.png",
-                  Path(__file__).resolve().parent.parent.parent / "templates" / "q_letter.png"]:
-            if p.exists():
-                self._letter_template = cv2.imread(str(p), cv2.IMREAD_COLOR)
-                break
+        self._load_negative_templates(templates_dir)
 
     # ---------------- 模板加载 ----------------
 
@@ -140,7 +170,11 @@ class Detector:
         ground_labels = (self._detect_ground_labels(work, scale)
                          if self.cfg.ground_labels.enabled else [])
         # 3b-3) 怪物检测（战斗区域中型饱和色块 —— 主动清怪目标）
-        monsters = self._detect_monsters(work, ww, wh, scale)
+        # 先抹掉 HUD 排除区：移动端技能轮盘/背包键就压在右侧战斗区里，不抹掉会被
+        # 当成怪物点掉（真实录像验证发现的误报源）；再交给时域确认滤静态图标。
+        work_ground = self._apply_hud_exclusions(work, w0, h0, scale)
+        monsters = self._detect_monsters(work_ground, ww, wh, scale,
+                                         avoid=[*ground_labels, *item_list])
 
         # 3c) 加载/黑屏过场判定（暗像素占比，于排除前的原始画面）
         gray_raw = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
@@ -148,7 +182,8 @@ class Detector:
                        >= self.cfg.loading_dark_ratio)
 
         # 4) HUD 排除区置黑（小地图/任务/聊天/技能栏 —— 地面检测不需要这些区域）
-        work = self._apply_hud_exclusions(work, w0, h0, scale)
+        # 复用上面为怪物检测算好的副本，避免同一帧再复制一次
+        work = work_ground
 
         # 角色中心：屏幕中心（缩放后坐标系）
         char_x, char_y = ww // 2, wh // 2
@@ -183,6 +218,28 @@ class Detector:
                 if not (ax0 <= p.cx <= ax1 and ay0 <= p.cy <= ay1)
             ]
 
+        # 怪物 vs 光柱互斥：光柱是"地上的光"，从它身上点一下等于点空地
+        if monsters and pillars:
+            monsters = [
+                m for m in monsters
+                if not any(_box_overlap(m.x, m.y, m.w, m.h, p.cx, p.cy, p.w, p.h)
+                           for p in pillars)
+            ]
+
+        # 标定诊断（页面"相机标定"用）：即使没检出也要给出"差多少"，否则用户
+        # 只能看到"检不到"，不知道该调亮度、重裁模板还是挪相机。
+        self.diag = {
+            "aframe_best": self._diag_aframe_best,
+            "aframe_threshold": float(self.cfg.aframe.template_threshold),
+            "gate_best": self._diag_gate_best,
+            "gate_threshold": float(self.cfg.scene_gate.threshold),
+            "gate_reason": self._diag_gate_reason,
+            "gate_neg_best": self._diag_gate_neg_best,
+            "gate_neg_name": self._diag_gate_neg_name,
+            "scale": round(float(scale), 3),
+            "detect_w": int(w0),
+            "detect_h": int(h0),
+        }
         return SceneState(
             ts_ms=ts_ms,
             w=w0,
@@ -196,6 +253,7 @@ class Detector:
             ground_labels=ground_labels,
             monsters=monsters,
             in_game=in_game,
+            gate_reason=self._diag_gate_reason,
             loading=loading,
             frame_delta=round(frame_delta, 3),
             ocr_used=False,
@@ -269,14 +327,28 @@ class Detector:
         return work
 
     def _check_scene_gate(self, work: np.ndarray, w0: int, h0: int, scale: float) -> bool:
-        """技能栏多模板任一命中 → in_game=True；无模板 → True（门禁停用）。
+        """反例优先 → 技能栏模板 → 兜底拦下。
+
+        判定顺序就是优先级：反例能拿出"这就是我标过的某张菜单"的证据，任何正向
+        模板都压不过它；两条都拿不出证据时，未标定的画面按 fail_closed 拦下。
 
         性能：ROI 与模板统一降半分辨率匹配（结构锚点精度足够，速度 ×4）。
         """
+        g = self.cfg.scene_gate
+        if not g.enabled:
+            self._diag_gate_reason = "disabled"
+            return True
+        # 1) 反例优先：整屏 UI（关卡选择/背包/结算）靠"有没有 HUD"判不出来，
+        #    靠"这块 UI 长得像不像我标过的某张菜单"才判得出来。
+        neg = self._check_negative_ui(work, w0)
+        if neg is not None:
+            self._diag_gate_reason = f"negative:{neg}"
+            return False
+
         templates = self._skillbar_templates
         if not templates:
+            self._diag_gate_reason = "no_template"
             return True
-        g = self.cfg.scene_gate
         wh, ww = work.shape[:2]
         if g.roi:
             rx, ry, rw, rh = (int(v * scale) for v in g.roi)
@@ -286,6 +358,7 @@ class Detector:
         rx, ry = max(0, rx), max(0, ry)
         rw, rh = min(rw, ww - rx), min(rh, wh - ry)
         if rw <= 10 or rh <= 10:
+            self._diag_gate_reason = "roi_too_small"
             return False
         roi = cv2.resize(work[ry : ry + rh, rx : rx + rw], None, fx=0.5, fy=0.5,
                          interpolation=cv2.INTER_AREA)
@@ -301,47 +374,74 @@ class Detector:
             tpl_gray = cv2.cvtColor(tpl_s, cv2.COLOR_BGR2GRAY)
             res = cv2.matchTemplate(roi_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
             _, max_v, _, _ = cv2.minMaxLoc(res)
+            self._diag_gate_best = round(float(max_v), 3)
             if max_v >= g.threshold:
+                self._diag_gate_reason = "skillbar"
                 return True
-        # 键位字母锚点（Q/W/E/R 同游戏字体恒定，跨 build/跨画质）
-        # 模板可能因 build 技能图标不同而失效 → 红血球结构锚点兜底
-        # （红色六边形血球所有 build 固定在左下；模板在即视为命中）
-        if self._check_key_letter(work, w0, h0, scale):
+        # 一个锚点都没命中：未标定的游戏/未知界面 —— 默认拦下（宁可不动手）
+        self._diag_gate_reason = "unmatched"
+        if not g.fail_closed:
             return True
-        return self._check_red_orb(work, w0, h0, scale)
-
-    def _check_key_letter(self, work: np.ndarray, w0: int, h0: int, scale: float) -> bool:
-        """键位字母 Q 锚点：底部条带灰度匹配（阈值 0.7，实测战斗≥0.788/背包0.638）。"""
-        qtpl = self._letter_template
-        if qtpl is None:
-            return False
-        wh, ww = work.shape[:2]
-        ry, rh = int(wh * 0.78), wh - int(wh * 0.78)
-        strip = work[ry : ry + rh, :]
-        s = cv2.resize(strip, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        t = cv2.resize(qtpl, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        g1 = cv2.cvtColor(s, cv2.COLOR_BGR2GRAY)
-        g2 = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY)
-        res = cv2.matchTemplate(g1, g2, cv2.TM_CCOEFF_NORMED)
-        return cv2.minMaxLoc(res)[1] >= 0.7
-
-    def _check_red_orb(self, work: np.ndarray, w0: int, h0: int, scale: float) -> bool:
-        """红色生命球结构锚点：左下区域的大块红色色斑（build 无关）。"""
-        wh, ww = work.shape[:2]
-        x0, x1 = int(ww * 0.28), int(ww * 0.45)
-        y0, y1 = int(wh * 0.80), int(wh * 1.0)
-        if x1 <= x0 or y1 <= y0:
-            return False
-        roi = work[y0:y1, x0:x1]
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        m1 = cv2.inRange(hsv, np.array([0, 90, 90], np.uint8), np.array([10, 255, 255], np.uint8))
-        m2 = cv2.inRange(hsv, np.array([170, 90, 90], np.uint8), np.array([179, 255, 255], np.uint8))
-        mask = m1 | m2
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            if cv2.contourArea(c) >= 1500:
-                return True
         return False
+
+    def _load_negative_templates(self, templates_dir: Path | None) -> None:
+        """加载反例模板（整屏 UI 的静态裁块）。
+
+        空配置 → 自动加载 templates/neg_*.png。低方差模板直接跳过：TM_CCOEFF_NORMED
+        在近乎纯色/无结构的模板上会给出无意义的高分（历史教训：q_letter.png 实际是
+        技能图标的一个角落，对全部画面都给 0.87~0.88，把场景门变成了常开）。
+        """
+        g = self.cfg.scene_gate
+        if not g.enabled:
+            return
+        import glob as _glob
+
+        base = templates_dir or (ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
+        names: list[str] = list(g.negative_templates)
+        if not names and base:
+            names = sorted(_glob.glob(str(Path(base) / "neg_*.png")))
+        for name in names:
+            img = self._read_template_img(name, templates_dir)
+            if img is None:
+                log.warning("反例模板缺失: %s", name)
+                continue
+            if not _tpl_usable(img):
+                log.warning("反例模板方差过低已跳过（NCC 无意义）: %s", name)
+                continue
+            self._neg_templates.append((Path(name).name, img))
+        if self._neg_templates:
+            log.info("反例模板已加载 %d 张: %s", len(self._neg_templates),
+                     ", ".join(n for n, _ in self._neg_templates))
+
+    def _check_negative_ui(self, work: np.ndarray, w0: int) -> str | None:
+        """整屏反例匹配：任一命中即返回模板名（命中=这是菜单/面板，不是战斗）。"""
+        if not self._neg_templates:
+            return None
+        g = self.cfg.scene_gate
+        full = cv2.resize(work, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        if min(full.shape[:2]) < 12:
+            return None
+        gray = cv2.cvtColor(full, cv2.COLOR_BGR2GRAY)
+        norm = (w0 / 1280.0) * 0.5
+        best, best_name = -1.0, ""
+        for name, tpl in self._neg_templates:
+            th, tw = tpl.shape[:2]
+            tw_s, th_s = max(2, int(tw * norm)), max(2, int(th * norm))
+            if th_s >= gray.shape[0] or tw_s >= gray.shape[1]:
+                continue
+            t = cv2.resize(tpl, (tw_s, th_s), interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(gray, cv2.cvtColor(t, cv2.COLOR_BGR2GRAY),
+                                    cv2.TM_CCOEFF_NORMED)
+            v = float(cv2.minMaxLoc(res)[1])
+            if v > best:
+                best, best_name = v, name
+            if v >= g.negative_threshold:
+                self._diag_gate_neg_best = round(v, 3)
+                self._diag_gate_neg_name = name
+                return name
+        self._diag_gate_neg_best = round(best, 3)
+        self._diag_gate_neg_name = best_name
+        return None
 
     # ---------------- 光柱 ----------------
 
@@ -561,11 +661,16 @@ class Detector:
     # ---------------- 怪物检测 ----------------
 
     def _detect_monsters(self, work: np.ndarray,
-                         ww: int, wh: int, scale: float) -> list[Monster]:
-        """战斗区域怪物：中型饱和色块（排除 HUD 排除区/光柱/标签重合区）。
+                         ww: int, wh: int, scale: float,
+                         avoid: list | None = None) -> list[Monster]:
+        """战斗区域怪物：中型饱和色块 + **时域确认**（静态 HUD/文字一律不算怪物）。
 
-        怪物=移动的敌人精灵：面积 400-12000px、宽 20-170、不规则填充。
-        配色无关（怪物颜色多样），以饱和+亮度范围取掩码。
+        真实录像（1080p 暗黑4 / 火炬之光手游）上纯形状启发式的命中几乎全是误报：
+        命中的是技能图标、漂浮的物品名、爆炸特效。所以这里加三道过滤：
+          1. HUD 排除区在调用前已抹黑（技能轮盘/背包键/聊天框不再是候选）；
+          2. 与已检出的掉落标签/列表条目重叠的候选丢弃（文字不是怪）；
+          3. 时域确认：上一帧同位置也在，且**位移或尺寸有变化** —— 怪物会走、
+             会打、会受击缩放；静态图标和悬停不动的物品名不会累加命中。
         """
         px0, px1 = int(ww * 0.24), int(ww * 0.92)
         py0, py1 = int(wh * 0.10), int(wh * 0.80)
@@ -573,7 +678,7 @@ class Detector:
         mask = cv2.inRange(roi, np.array([0, 100, 80], np.uint8),
                            np.array([179, 255, 255], np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        out: list[Monster] = []
+        raw: list[tuple[int, int, int, int]] = []
         for c in contours:
             a = cv2.contourArea(c)
             if not (400 <= a <= 12000):
@@ -584,12 +689,33 @@ class Detector:
             fill = a / (w * h) if w * h else 0
             if fill < 0.25 or fill > 0.95:  # 怪物精灵：中密度不规则
                 continue
-            out.append(Monster(
-                x=int((px0 + x + w / 2) / scale),
-                y=int((py0 + y + h / 2) / scale),
-                w=int(w / scale), h=int(h / scale)))
-            if len(out) >= 10:
-                break
+            cx, cy = int((px0 + x + w / 2) / scale), int((py0 + y + h / 2) / scale)
+            bw, bh = int(w / scale), int(h / scale)
+            if avoid and any(_box_overlap(cx, cy, bw, bh,
+                                          int(o.x), int(o.y), int(o.w), int(o.h))
+                             for o in avoid):
+                continue  # 与掉落标签/列表条目重叠 → 是文字不是怪
+            raw.append((cx, cy, bw, bh))
+
+        # 时域确认：与前一次检测的追踪表按中心距离配对
+        track: list[tuple[int, int, int, int, int]] = []
+        out: list[Monster] = []
+        for (cx, cy, w, h) in raw:
+            hits = 0
+            best: tuple[float, int, int, int] | None = None
+            for (tx, ty, tw, th, thits) in self._monster_track:
+                d = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
+                if d <= self.MONSTER_NEAR_PX and (best is None or d < best[0]):
+                    best = (d, tw, th, thits)
+            if best is not None:
+                d, tw, th, thits = best
+                size_change = abs(w * h - tw * th) / max(1, tw * th)
+                alive = d >= self.MONSTER_MOVE_PX or size_change >= self.MONSTER_SIZE_TOL
+                hits = thits + 1 if alive else thits
+            track.append((cx, cy, w, h, hits))
+            if hits >= self.MONSTER_CONFIRM_HITS and len(out) < 10:
+                out.append(Monster(x=cx, y=cy, w=w, h=h))
+        self._monster_track = track
         return out
 
     # ---------------- 小地图目标标记 ----------------
@@ -708,6 +834,7 @@ class Detector:
                 res[y0 : y0 + th, x0 : x0 + tw] = -1.0  # 邻域抑制，避免同一处重复
 
         peaks.sort(reverse=True)
+        best_rv = 0.0
         for _mv, px, py, s in peaks[:6]:
             tw = max(3, int(round(tpl_g.shape[1] * s)))
             th = max(3, int(round(tpl_g.shape[0] * s)))
@@ -723,6 +850,7 @@ class Detector:
             tp = cv2.resize(tpl_g, (tw, th), interpolation=cv2.INTER_AREA)
             r = cv2.matchTemplate(roi, tp, cv2.TM_CCOEFF_NORMED)
             _, rv, _, rl = cv2.minMaxLoc(r)
+            best_rv = max(best_rv, float(rv))
             if rv < acfg.template_threshold:
                 continue
             ax, ay = x0 + rl[0], y0 + rl[1]
@@ -736,6 +864,7 @@ class Detector:
                 h=int(th / scale),
                 score=round(float(rv), 3),
             )
+        self._diag_aframe_best = round(best_rv, 3)
         return None
 
     def _detect_aframe(self, work: np.ndarray, hsv: np.ndarray, scale: float) -> AFrame | None:

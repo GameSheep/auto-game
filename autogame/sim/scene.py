@@ -193,10 +193,11 @@ class SimWorld:
     # ------------- 世界推进 -------------
 
     def _advance(self, now: float) -> None:
-        dt = min(0.5, now - self._last_update)
-        self._last_update = now
-        if dt <= 0:
-            return
+        # 时间戳可能相等（同一 tick 内二次推进 / 时钟回拨）：dt 夹到 [0, 0.5]，
+        # **不能直接 return** —— 刷怪/结算都是"时间戳判据"，被吞掉就会表现为
+        # "点了再次挑战却没刷出东西"（e2e 刷图循环曾因此失败）。
+        dt = max(0.0, min(0.5, now - self._last_update))
+        self._last_update = max(now, self._last_update)
         # 键盘持续按住移动
         dx = dy = 0
         if "w" in self._keys_down:
@@ -226,7 +227,8 @@ class SimWorld:
         # 自动刷光柱（在角色周围 300~700px 环带随机生成）；结算期间不刷
         if not self.map_cleared and now - self._last_spawn >= self.spawn_interval:
             self._last_spawn = now
-            for _ in range(6):  # 重roll避开顶部 Boss 血条排除带（y<90 且 x∈[380,900]）
+            placed = False
+            for _ in range(8):  # 重roll避开顶部 Boss 血条排除带（y<90 且 x∈[380,900]）
                 angle = self.rng.uniform(0, 2 * math.pi)
                 dist = self.rng.uniform(300, 700)
                 wx = self.char_wx + math.cos(angle) * dist
@@ -237,7 +239,12 @@ class SimWorld:
                     continue
                 color = self.rng.choice(["gold", "gold", "pink"])
                 self.pillars.append(SimPillar(wx, wy, color))
+                placed = True
                 break
+            if not placed:
+                # 兜底：连续 8 次都落在 Boss 血条带里也要刷 —— "重开却刷不出东西"
+                # 会让模拟器自己卡死（e2e 刷图循环断言会失败）。角色正下方永远安全。
+                self.pillars.append(SimPillar(self.char_wx, self.char_wy + 360, "gold"))
             # 上限控制
             if len(self.pillars) > 8:
                 self.pillars.pop(0)

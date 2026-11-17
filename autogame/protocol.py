@@ -169,6 +169,7 @@ class SceneState(BaseModel):
     ground_labels: list[ListEntry] = Field(default_factory=list)  # 地面掉落标签（黄条=掉落物）
     monsters: list[Monster] = Field(default_factory=list)  # 战斗区域怪物
     in_game: bool = True  # 场景门：战斗 HUD 存在才为 True（False 时 FSM 禁止输出命令）
+    gate_reason: str = ""  # 门禁判定原因：negative:<模板> / skillbar / unmatched / no_template / disabled
     loading: bool = False  # 加载/黑屏过场（FSM 保持不动）
     frame_delta: float = 0.0  # 与上一帧的变化像素占比（防撞墙用）
     ocr_used: bool = False

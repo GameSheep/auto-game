@@ -47,6 +47,8 @@ class ServerFixture:
         self.port = _free_port()
         self.cfg = AppConfig()
         self.cfg.server.token = "e2e-test-token"
+        # 本地默认免鉴权；这些 e2e 专门验证"开鉴权时"的行为，所以显式打开
+        self.cfg.server.require_token = True
         self.cfg.server.port = self.port
         self.cfg.capture.fps = 6.0          # 加速闭环
         self.cfg.vision.max_detect_width = 1280

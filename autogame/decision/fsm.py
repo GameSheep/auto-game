@@ -29,6 +29,7 @@ from ..decision.llm_advisor import LLMAdvisor
 from ..decision.recovery import ProgressMonitor, RecoveryLadder, StallSignals
 from ..decision.vlm import VisionAdvisor
 from ..executor import BaseExecutor
+from ..humanize import Humanizer, softmax_choice
 from ..protocol import Command, Pillar, SceneState
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ log = logging.getLogger(__name__)
 # 目标匹配容差 & 拉黑半径（像素）
 TARGET_MATCH_TOL_PX = 70
 BLACKLIST_RADIUS_PX = 90
+# A框确认窗下限（毫秒）：低于该值不动作，防单帧误检闪烁
+AFRAME_CONFIRM_MS = 150
 
 
 class State(str, enum.Enum):
@@ -73,9 +76,22 @@ class DecisionEngine:
             "recovery_actions": 0,      # 恢复动作发出的命令数
             "gate_escapes": 0,          # 弹窗/菜单 ESC 次数
             "stuck_alarms": 0,          # 多轮仍失败告警次数
+            "drifts": 0,                # 走神（非目标导向噪音操作）次数
+            "misclicks": 0,             # 疲劳导致的走位失误次数
+            "human_breaks": 0,          # 疲劳休息次数
+            "social_msgs": 0,           # 社交噪音发送次数
+            "walk_starts": 0,           # 发起走位（点地面/按方向键）次数
+            "walk_ends": 0,             # 走位等待结束次数
+            "walk_progress": 0,         # 有效接近（距离真的缩短了）
+            "walk_no_progress": 0,      # 点了没走近（撞墙/寻路失败）
+            "walk_settles": 0,          # 人物提前停下（等待 A框的宽限触发）
+            "targets_ignored": 0,       # 选择性无视（懒得捡）次数
+            "off_pick": 0,              # 选了非首个候选的次数（偏好证据）
         }
         # 自主性：看门狗 + 恢复阶梯 + 视觉顾问
         self.monitor = ProgressMonitor(cfg.autonomy)
+        # 拟人化：疲劳/反应时间/走神/社交（只调时序与噪音，不改动作语义）
+        self.human = Humanizer(cfg.humanize, pickup_key=cfg.pickup_key)
         self.vlm = vlm or VisionAdvisor(cfg.vlm)
         self.frame_source: Callable[[], bytes | None] | None = None
         self.vlm.frame_source = self._current_frame
@@ -102,6 +118,7 @@ class DecisionEngine:
         self._label_first_seen_ms: int | None = None
         self._last_nav_ms: int = 0
         self._gate_hold_emitted: bool = False
+        self._gate_uncalibrated_emitted: bool = False
         self.last_intent: str = ""
         self._explore_i: int = 0
         self._last_explore_ms: int = 0
@@ -110,12 +127,26 @@ class DecisionEngine:
         self._target_started: float = 0.0
         self._last_click_ts: float = 0.0
         self._aframe_first_seen_ms: int | None = None
+        self._reaction_ms: int = AFRAME_CONFIRM_MS  # 本目标的反应时间（看到A框→按下）
+        self._aframe_seen_frames: int = 0           # 本目标 A框连续出现帧数（防按空）
+        self._aframe_dist0: float = 0.0             # A框首次出现时的距离（判断"在靠近还是远离"）
         self._taps_this_target: int = 0
         self._stuck_ticks: int = 0
         self._alt_direction_tried: bool = False
         self._cooldown_until: float = 0.0
         self._last_tap_ts: float = 0.0
         self._tap_block_until_ms: int = 0
+        self._hesitate_until: float | None = None   # 进关卡前"愣一下"的截止时刻
+        self._break_emitted: bool = False           # 疲劳休息事件只发一次
+        # 走位等待：点完地面后人物在游戏里自己走过去，这段期间不该再点
+        self._walking: bool = False
+        self._walk_started: float = 0.0
+        self._walk_until: float = 0.0
+        self._walk_dist0: float = 0.0
+        self._walk_still: int = 0
+        self._walk_settled_at: float | None = None
+        self._ignored: list[tuple[int, int, float]] = []   # 选择性无视（拟人化）
+        self._recent: list[tuple[int, int, str, float]] = []  # 最近拾取（新鲜感记忆）
         self._blacklist: list[tuple[int, int, float]] = []  # (x, y, until_frame_ts)
 
     # ------------- 对外控制 -------------
@@ -127,6 +158,11 @@ class DecisionEngine:
         self.exec.reset()
         self.state = State.SCANNING
         self._need_monitor_reset = True
+        self._hesitate_until = None
+        self._break_emitted = False
+        self._walking = False
+        self._ignored.clear()
+        self._recent.clear()
         self.recovery.reset()
         self._recovery_reason = ""
         self._recovery_pause_until = 0.0
@@ -170,6 +206,25 @@ class DecisionEngine:
             self._need_monitor_reset = False
         signals = self.monitor.update(scene, now, self.stats["picks"])
 
+        # ---- 拟人化：状态推进 + 疲劳休息（累了就停手，真人不连轴转） ----
+        self.human.tick(now)
+        if self.human.paused(now):
+            if not self._break_emitted:
+                self._break_emitted = True
+                self.stats["human_breaks"] += 1
+                self._emit_event("human_break",
+                                 seconds=round(self.human.break_seconds_left(now), 1),
+                                 fatigue=round(self.human.fatigue.level, 3))
+                self._intent("疲劳到阈值，停手歇一会儿（休息窗口内不发任何命令）")
+            self._drop_target("human_break")
+            return
+        if self._break_emitted:
+            self._break_emitted = False
+            # 休息后重新计时，否则刚睁眼就被"停滞"判据抓回去
+            self.monitor.reset(now)
+            self._emit_event("human_resume", fatigue=round(self.human.fatigue.level, 3))
+            self._intent("休息结束，恢复作业")
+
         # 加载/黑屏过场：保持不动（等加载完成），不产生任何命令
         if scene.loading:
             if not self._loading_hold_emitted:
@@ -183,6 +238,7 @@ class DecisionEngine:
             self._tick_gated(scene, now, signals)
             return
         self._gate_hold_emitted = False
+        self._gate_uncalibrated_emitted = False
 
         # 拉黑清理
         if self._blacklist:
@@ -234,11 +290,25 @@ class DecisionEngine:
             return None
 
     def _tick_gated(self, scene: SceneState, now: float, signals: StallSignals) -> None:
-        """不在战斗界面：短时间等待；长时间（弹窗/菜单/结算）按 ESC 自救。"""
+        """不在战斗界面：短时间等待；长时间（弹窗/菜单/结算）按 ESC 自救。
+
+        但**门禁说"没认出来"（unmatched）时一律不动**，连 ESC 都不按：
+        未标定的画面可能是菜单，也可能是没标定的战斗画面——在战斗画面按 ESC
+        等于自己把游戏按进暂停菜单（真实录像上连按 6 次，比卡住更糟）。
+        """
         if not self._gate_hold_emitted:
             self._emit_event("scene_gate_hold")
             self._gate_hold_emitted = True
         self._drop_target("scene_gate")
+        # 清掉上一帧的战斗意图：否则审查页/仪表盘会把"接近 auto2 掉落光柱"这种
+        # 上一帧的残留意图挂在关卡选择页上（真实事故，看起来像程序在乱认画面）。
+        self._intent("非战斗界面（关卡选择/背包/菜单）：本帧不决策、不点击")
+        if scene.gate_reason == "unmatched":
+            if not self._gate_uncalibrated_emitted:
+                self._gate_uncalibrated_emitted = True
+                self._emit_event("scene_gate_uncalibrated")
+            self._intent("未识别的画面（HUD 未标定）：不决策、不按键，先标定技能栏")
+            return
         if self.state == State.RECOVERING:
             # 恢复中被弹窗挡住：继续按阶梯走（ESC 就在阶梯里）
             self._tick_recovery(scene, now, signals)
@@ -355,9 +425,17 @@ class DecisionEngine:
     # ------------- SCANNING -------------
 
     def _tick_scan(self, scene: SceneState, now: float) -> None:
+        # 走神 / 社交噪音：偶尔做点和当前任务无关的事（默认只动鼠标，不点击不按键）
+        if self._maybe_drift(scene, now):
+            return
+        if self._maybe_social(now):
+            return
         target = self._pick_target(scene, now)
         if target is None:
             if not self._maybe_rechallenge(scene, now):
+                # 上一次点地面还在走 → 别重发同一指令（点一下 ≠ 走到位）
+                if self._walk_wait_active(scene, now):
+                    return
                 if not self._maybe_click_list_entry(scene, now):
                     if not self._maybe_approach_ground_label(scene, now):
                         if not self._maybe_attack_monster(scene, now):
@@ -368,6 +446,7 @@ class DecisionEngine:
         self._target_started = now
         self._last_click_ts = 0.0
         self._aframe_first_seen_ms = None
+        self._aframe_seen_frames = 0
         self._taps_this_target = 0
         self._stuck_ticks = 0
         self._alt_direction_tried = False
@@ -381,14 +460,89 @@ class DecisionEngine:
         # 立即发出第一步走位
         self._move_toward(scene, target, now, first=True)
 
+    def _maybe_drift(self, scene: SceneState, now: float) -> bool:
+        """走神：偶尔做一件和当前任务无关的事（默认只有鼠标移动）。
+
+        真人跑图会鼠标划过无关角落、在背包里翻两下又关掉、进关卡前停一下。
+        这类操作不会被任务逻辑自然生成 —— 恰恰是真人行为里最"像人"的部分。
+        安全默认：不点击、不按键，移动光标在绝大多数游戏里没有副作用。
+        """
+        if not getattr(self.exec, "supports_mouse_move", True):
+            return False  # 机械舵机后端没有绝对定位，鼠标噪音无从谈起
+        cmds = self.human.maybe_drift(now, scene.w, scene.h)
+        if not cmds:
+            return False
+        for c in cmds:
+            self._act(c)
+        self.stats["drifts"] += 1
+        self._intent("走神：鼠标飘向无关角落（非目标导向的噪音操作）")
+        self._emit_event("drift", commands=len(cmds))
+        return True
+
+    def _maybe_social(self, now: float) -> bool:
+        """社交噪音：偶尔在公共频道说句废话（默认关闭，见 SocialConfig 风险说明）。"""
+        cmds = self.human.maybe_social(now)
+        if not cmds:
+            return False
+        for c in cmds:
+            self._act(c)
+        self.stats["social_msgs"] += 1
+        self._intent("社交噪音：在公共频道发送一句无意义台词")
+        self._emit_event("social_msg", commands=len(cmds))
+        return True
+
     def _pick_target(self, scene: SceneState, now: float) -> Pillar | None:
+        """挑一个目标 —— 不是"永远第一个"。
+
+        原实现是 `(stables or candidates)[0]`：确定性规则，样本一多必然暴露。
+        真人挑目标有自己的偏好，而且偏好会漂移：
+          - 累的时候只捡近的（耐心↓）；
+          - 精神好时愿意绕远捡贵的（贪心↑）；
+          - 刚捡过同色/同位置会腻（新鲜感）；
+          - 偶尔就是懒得捡（直接无视，继续走）。
+
+        拟人化关闭时退回旧行为（确定性选择），保证测试与排障可复现。
+        只有一个候选时也直接选它 —— "选择性无视"是关于**在多个目标里挑**，
+        不是"唯一的目标也放弃"（那属于 _abandon/拉黑的语义）。
+        """
         # 优先取 stable 光柱（掉落物存续长，特效短命）；无 stable 回退全部候选
         candidates = [p for p in scene.pillars
-                      if p.whitelisted and not self._is_blacklisted(p, now)]
+                      if p.whitelisted and not self._is_blacklisted(p, now)
+                      and not self._is_ignored(p, now)]
         if not candidates:
             return None
         stables = [p for p in candidates if p.stable]
-        return (stables or candidates)[0]
+        pool = stables or candidates
+        if not self.human.mood_active or len(pool) == 1:
+            return pool[0]
+
+        mood = self.human.mood
+        # 懒得捡：逐个候选按"距离 + 耐心"决定要不要无视（人真的会漏捡）。
+        # 注意是**逐个**过滤，不是"懒得捡一个就全都不捡"。
+        kept = []
+        for p in pool:
+            if mood.should_skip(p.distance):
+                self._ignore(p, now)
+            else:
+                kept.append(p)
+        if not kept:
+            self.stats["targets_ignored"] += 1
+            self._emit_event("target_ignored", count=len(pool))
+            self._intent("懒得捡：这批掉落全部无视，继续走")
+            return None
+        if len(kept) == 1:
+            return kept[0]
+
+        utils = [mood.utility(p.distance, p.color, self._novelty(p, now)) for p in kept]
+        idx = softmax_choice(utils, self.cfg.humanize.mood.temperature, self.human.rng)
+        chosen = kept[idx]
+        best = max(range(len(kept)), key=lambda i: utils[i])
+        if idx != best:
+            # 统计"挑了次优目标"——这是 softmax 与 argmax 的差别，也是最像人的地方
+            self.stats["off_pick"] += 1
+            self._emit_event("target_choice", index=idx, of=len(kept),
+                             color=chosen.color, distance=round(chosen.distance))
+        return chosen
 
     def _is_blacklisted(self, p: Pillar, now: float) -> bool:
         for bx, by, until in self._blacklist:
@@ -396,6 +550,46 @@ class DecisionEngine:
                     and abs(p.cy - by) <= BLACKLIST_RADIUS_PX:
                 return True
         return False
+
+    # ------------- 选择性无视 + 新鲜感（拟人化目标偏好） -------------
+
+    def _ignore(self, p: Pillar, now: float) -> None:
+        """无视某个目标一段时间（人真的会漏捡，不是每个掉落都值得弯腰）。"""
+        lo, hi = (list(self.cfg.humanize.mood.skip_ignore_s) + [20.0, 60.0])[:2]
+        ttl = random.uniform(min(lo, hi), max(lo, hi))
+        self._ignored.append((p.cx, p.cy, now + ttl))
+        if len(self._ignored) > 32:
+            del self._ignored[:-24]
+
+    def _is_ignored(self, p: Pillar, now: float) -> bool:
+        if not self._ignored:
+            return False
+        self._ignored = [i for i in self._ignored if i[2] > now]
+        for ix, iy, _ in self._ignored:
+            if abs(p.cx - ix) <= BLACKLIST_RADIUS_PX and abs(p.cy - iy) <= BLACKLIST_RADIUS_PX:
+                return True
+        return False
+
+    def _note_recent_pick(self, p: Pillar, now: float) -> None:
+        self._recent.append((p.cx, p.cy, p.color, now))
+        cap = max(1, self.cfg.humanize.mood.recent_memory)
+        if len(self._recent) > cap:
+            del self._recent[:-cap]
+
+    def _novelty(self, p: Pillar, now: float) -> float:
+        """新鲜感：刚捡过同色/同位置的会腻（1=很新鲜，0=腻了）。"""
+        if not self._recent:
+            return 1.0
+        hl = max(5.0, self.cfg.humanize.mood.recent_halflife_s)
+        pen = 0.0
+        for x, y, color, ts in self._recent:
+            age = max(0.0, now - ts)
+            decay = 0.5 ** (age / hl)
+            if color == p.color:
+                pen += 0.15 * decay
+            if abs(p.cx - x) < 150 and abs(p.cy - y) < 150:
+                pen += 0.35 * decay
+        return max(0.0, 1.0 - pen)
 
     # ------------- 刷图循环：再次挑战 -------------
 
@@ -409,6 +603,7 @@ class DecisionEngine:
         btn = scene.rechallenge
         if btn is None:
             self._rechallenge_first_seen = None
+            self._hesitate_until = None
             return
         self._last_rechallenge = (btn.x, btn.y)
         if self._rechallenge_first_seen is None:
@@ -416,6 +611,13 @@ class DecisionEngine:
             return
         if scene.ts_ms - self._rechallenge_first_seen < 200:
             return
+        # 确认要进：先在门口"愣一下"（真人不会确认完 200ms 就点下去）
+        if self._hesitate_until is None:
+            self._hesitate_until = now + self.human.hesitation_s()
+        if now < self._hesitate_until:
+            self._intent("准备进下一层，先在门口停顿一下")
+            return
+        self._hesitate_until = None
         self._rechallenge_first_seen = None
         self._intent("点击『再次挑战』进入下一层（通关循环）")
         self.stats["rechallenges"] += 1
@@ -500,6 +702,7 @@ class DecisionEngine:
             self._click_direction(scene, key, 220)
             self._intent(f"向{_DIR_CN.get(key, key)}方向点地面探索（寻找怪物/掉落）")
             self._emit_event("explore_move", key=key, mode="click")
+            self._begin_walk(now, None)   # 点完等人物走过去，别每秒重发
         else:
             self._emit_move_keys([key], hold)
             self._intent(f"向{_DIR_CN.get(key, key)}方向探索移动（寻找怪物/掉落）")
@@ -593,6 +796,7 @@ class DecisionEngine:
         ok = self.exec.execute(cmd)
         if ok and cmd.op != "stop_all":
             self.monitor.note_action(self._now)
+            self.human.note_action(self._now)
         return ok
 
     def _emit_move_keys(self, keys: list[str], hold_ms: int) -> int:
@@ -631,6 +835,14 @@ class DecisionEngine:
             self.state = State.SCANNING
             return
 
+        # 当前帧的距离：A框判据必须用**这一帧**的数据。
+        # 用 self._target（上一帧的对象）会让"在靠近还是远离"永远滞后一帧，
+        # 于是"人物已经在走远"这件事永远看不见 —— 那就是盲按的根源。
+        _fresh = self._reacquire_target(scene, target, now)
+        if _fresh is not None:
+            target = self._target = _fresh   # 用当前帧的对象（距离/位置都是最新的）
+        dist_now = float(target.distance)
+
         # 1) A框裁决 —— 最高优先级：出现且邻近目标才按拾取键（唯一合法按 A 时机）
         aframe = scene.aframe
         aframe_for_target = (
@@ -640,13 +852,46 @@ class DecisionEngine:
         if aframe_for_target:
             if self._aframe_first_seen_ms is None:
                 self._aframe_first_seen_ms = scene.ts_ms
+                self._aframe_dist0 = dist_now
+                # 反应时间：看到 A框 → 按下拾取键（对数正态右偏，疲劳会拉长）
+                self._reaction_ms = max(AFRAME_CONFIRM_MS, self.human.reaction_ms())
+            self._aframe_seen_frames += 1
             self._stuck_ticks = 0
             # 停止移动再拾取（走位中直接松开方向键更稳）
             self._halt_movement()
+            # 走到位了：结束走位等待（A框出现本身就是"到了"的证据）
+            self._end_walk(now, reason="aframe", gained=self._walk_dist0 - dist_now)
+            # 防"按空"（铁律：绝不盲按拾取键）。帧是"过去"的信息，
+            # 采集→编码→传输→检测往往几百毫秒，这一帧的 A框可能早已失效。
+            # 两个硬判据，任一不满足就再等一帧：
+            #   ① 连续确认够 N 帧（不看帧差 —— 人物减速时帧差可能低于阈值，但仍在外移）；
+            #   ② 距离没有变大（在远离 = 路过/走过头，按下去必然空）。
+            approaching = dist_now <= self._aframe_dist0 + 8.0
+            confirmed = self._aframe_seen_frames >= max(1, self.cfg.aframe_confirm_frames)
+            if not confirmed:
+                self._intent("A框已出现，等连续确认（防旧帧按空）")
+                return
+            if not approaching:
+                self._intent("A框出现但人物在远离（路过/走过头）—— 不按，避免按空")
+                return
             # 拾取复核冷却：上次按键后等游戏处理拾取动画（防连续按 A 捡垃圾）
             if scene.ts_ms >= self._tap_block_until_ms \
-                    and scene.ts_ms - self._aframe_first_seen_ms >= 150:  # 连续≥150ms可见才动作
+                    and scene.ts_ms - self._aframe_first_seen_ms >= self._reaction_ms:
                 self._tap_pickup(now)
+                self._check_pick_result(scene, now, aframe_present=True)
+                return
+            # 按不了（没确认 / 在远离 / 反应时间没到）。**不能死等**：
+            # 光柱可能已丢失检测、A框属于旁边另一件物品、或者根本没进拾取半径。
+            # 长期按不下去 → 再走一步（真人也会"咦，怎么捡不到，挪一下"）。
+            if self._aframe_seen_frames >= max(2, self.cfg.aframe_retry_frames) \
+                    and self._taps_this_target == 0:
+                self._aframe_first_seen_ms = None
+                self._aframe_seen_frames = 0
+                self._aframe_dist0 = 0.0
+                self._emit_event("aframe_reapproach", distance=round(dist_now))
+                self._intent("A框在但按不下去 —— 再走一步靠近")
+                self._move_toward(scene, target, now, first=False)
+                return
             # 等待拾取确认
             self._check_pick_result(scene, now, aframe_present=True)
             return
@@ -677,10 +922,17 @@ class DecisionEngine:
 
         # 3) 走位超时 → 放弃 + 拉黑
         if now - self._target_started > self.cfg.approach_timeout_s:
+            self._end_walk(now, reason="timeout")
             self._abandon("timeout", now)
             return
 
-        # 4) 撞墙检测：连续 N tick 画面几乎没变
+        # 4) 走位等待：点完地面只是"发起移动"，人物走过去是游戏侧的耗时步骤
+        #    （1-3s，且 A框要到一定距离内才出现）。这段期间**不重复点击**，
+        #    只观察：画面在动=在走；画面停了=A框宽限；超预算=没走到，重新点。
+        if self._walking and self._walk_step(scene, tracked, now):
+            return
+
+        # 5) 撞墙检测：连续 N tick 画面几乎没变
         if scene.frame_delta < self.cfg.stuck_delta_thresh:
             self._stuck_ticks += 1
         else:
@@ -695,15 +947,93 @@ class DecisionEngine:
             self._abandon("stuck_wall", now)
             return
 
-        # 5) 继续走位（按节流间隔重复点击/按键）
-        if now - self._last_click_ts >= self._move_interval_s():
+        # 6) 继续走位（按节流间隔重复点击/按键）
+        if now - self._last_click_ts >= self._move_interval_s(now):
             self._move_toward(scene, tracked, now, first=False)
+
+    # ------------- 走位等待（点一下 ≠ 走到位） -------------
+
+    def _begin_walk(self, now: float, target: Pillar | None) -> None:
+        """发起一次走位后进入"等待人物走过去"状态。
+
+        预算与 approach_timeout 联动：至少给 2 轮机会，否则走位超时会把
+        "还在路上"误判成"走不到"（预算 3s + 超时 8s 时原本只能试 2 次）。
+        """
+        walk = self.cfg.walk
+        if not walk.enabled:
+            return
+        remaining = self.cfg.approach_timeout_s - (now - self._target_started)
+        budget = min(walk.budget_s, max(1.0, remaining / 2.0))
+        if self.cfg.approach_mode == "keys":
+            budget = max(budget, self.cfg.key_step_ms / 1000.0 + walk.key_extra_s)
+        self._walking = True
+        self._walk_started = now
+        self._walk_until = now + budget
+        self._walk_dist0 = float(target.distance) if target is not None else 0.0
+        self._walk_still = 0
+        self._walk_settled_at = None
+        self.stats["walk_starts"] += 1
+
+    def _end_walk(self, now: float, reason: str, gained: float | None = None) -> None:
+        if not self._walking:
+            return
+        self._walking = False
+        self.stats["walk_ends"] += 1
+        self._emit_event("walk_end", reason=reason,
+                         waited=round(now - self._walk_started, 2),
+                         gained=None if gained is None else round(gained, 1))
+
+    def _walk_step(self, scene: SceneState, target: Pillar, now: float) -> bool:
+        """走位等待一步。返回 True = 本 tick 什么都不做（人物还在走）。"""
+        walk = self.cfg.walk
+        moving = scene.frame_delta >= walk.motion_delta_thresh
+        if now < self._walk_until:
+            if moving:
+                self._walk_still = 0
+                self._walk_settled_at = None
+                return True                     # 人还在走，等
+            self._walk_still += 1
+            if self._walk_still < walk.settle_frames:
+                return True                     # 可能只是动画间隙，再确认一帧
+            if self._walk_settled_at is None:
+                self._walk_settled_at = now
+                self.stats["walk_settles"] += 1
+            if now - self._walk_settled_at < walk.settle_grace_s:
+                # 人物停了，但 A框提示有延迟 —— 先给游戏一点时间
+                return True
+        gained = self._walk_dist0 - float(target.distance)
+        self._end_walk(now, reason="settled" if now < self._walk_until else "budget",
+                       gained=gained)
+        if gained >= walk.min_progress_px:
+            # 确实靠近了：不算撞墙，立刻允许再点一次继续接近
+            self._stuck_ticks = 0
+            self._last_click_ts = 0.0
+            self.stats["walk_progress"] += 1
+        else:
+            self.stats["walk_no_progress"] += 1
+        return False
+
+    def _walk_wait_active(self, scene: SceneState, now: float) -> bool:
+        """SCANNING 里的走位等待（没有目标可量距离，只看时间与画面动静）。
+
+        探索/点地面走路时同样不该每秒重发同一指令。
+        """
+        if not self._walking:
+            return False
+        if now >= self._walk_until:
+            self._end_walk(now, reason="budget")
+            return False
+        if scene.frame_delta >= self.cfg.walk.motion_delta_thresh:
+            return True
+        self._end_walk(now, reason="settled")   # 人停了，不用等满预算
+        return False
 
     # ------------- 走位动作 -------------
 
-    def _move_interval_s(self) -> float:
+    def _move_interval_s(self, now: float) -> float:
+        """两次走位动作的间隔：基准节拍 × 抖动 × 疲劳倍数（越累越慢）。"""
         base = 1.0 / max(0.5, self.cfg.tick_hz)
-        return base * random.uniform(0.9, 1.1)
+        return base * random.uniform(0.9, 1.1) * self.human.latency_scale(now)
 
     def _move_toward(self, scene: SceneState, target: Pillar, now: float, first: bool) -> None:
         self._last_click_ts = now
@@ -714,6 +1044,13 @@ class DecisionEngine:
             # 只发单条 mouse_click(x,y)：RP2040/RPi5 后端内部先移动后点击。
             gx = int(target.x + random.randint(-8, 8))
             gy = int(target.y + self.cfg.ground_click_offset_px + random.randint(-6, 6))
+            # 疲劳失误：偶尔点到偏离目标的地面（走错一步，下一拍自己纠正）。
+            # 只在**地面点击**上做手脚 —— 绝不涉及按键，铁律不受影响。
+            if self.human.error_prob(now) > random.random():
+                off = random.choice((-1, 1)) * random.randint(40, 110)
+                gx = max(0, min(scene.w - 1, gx + off))
+                self.stats["misclicks"] = self.stats.get("misclicks", 0) + 1
+                self._emit_event("human_misclick", x=gx, y=gy)
             self._act(Command(op="mouse_click", button="left", x=gx, y=gy))
             if first:
                 self._emit_event("move_click", x=gx, y=gy)
@@ -726,6 +1063,8 @@ class DecisionEngine:
                 self._click_direction(scene, "".join(keys), 200)
             if first:
                 self._emit_event("move_keys", keys="".join(keys))
+        # 发起移动 → 进入"等人物走过去"（点一下不等于走到位）
+        self._begin_walk(now, target)
 
     def _direction_keys(self, scene: SceneState, target: Pillar) -> list[str]:
         """按屏幕象限给出方向键（纯键盘走位兜底方案）。"""
@@ -780,7 +1119,8 @@ class DecisionEngine:
         self._intent(f"按拾取键 [{self.cfg.pickup_key.upper()}] 拾取物品（A框确认）")
         self.stats["a_taps"] += 1
         self._taps_this_target += 1
-        hold = _jitter_ms(70, self.cfg.jitter_ratio)
+        # 按压时长：抖动比例随疲劳放大（越累手越不稳）
+        hold = _jitter_ms(70, self.human.jitter_ratio(now, self.cfg.jitter_ratio))
         self._act(Command(op="key_tap", key=self.cfg.pickup_key, hold_ms=hold))
         self._last_tap_ts = now
         # 复核冷却：给游戏拾取动画+视觉确认留时间，期间不得再按
@@ -827,6 +1167,9 @@ class DecisionEngine:
             self.stats["picks"] += 1
             self.advisor.note_success()
             self.monitor.note_progress(now, "pick")
+            if self._target is not None:
+                # 记入"新鲜感"记忆：刚捡过的颜色/位置下次会被打折
+                self._note_recent_pick(self._target, now)
         elif reason in ("timeout", "stuck_wall", "max_taps", "aframe_stuck"):
             self.advisor.note_abandon()
             self._maybe_consult_llm(reason)
@@ -887,8 +1230,11 @@ class DecisionEngine:
     def _drop_target(self, reason: str) -> None:
         self._target = None
         self._aframe_first_seen_ms = None
+        self._aframe_seen_frames = 0
+        self._aframe_dist0 = 0.0
         self._taps_this_target = 0
         self._tap_block_until_ms = 0
+        self._walking = False   # 目标没了，走位等待一并作废
 
     # ------------- 自主性观测（仪表盘/接口） -------------
 
@@ -906,6 +1252,7 @@ class DecisionEngine:
                 "steps_done": self.recovery.steps_done,
             },
             "vlm": self.vlm.snapshot(),
+            "humanize": self.human.snapshot(),
             "llm": {
                 "enabled": self.cfg.llm.enabled,
                 "model": self.cfg.llm.model,

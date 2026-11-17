@@ -2,9 +2,44 @@
 # 完整默认值见 autogame/config.py —— 此文件只覆盖需要调整的项。
 
 server:
-  host: 0.0.0.0        # 局域网小主机监听；所有访问需 token
+  host: 0.0.0.0
   port: 8765
+  # 本地自用**不需要 token**（页面直接打开就能用）。
+  # 要暴露到不可信网络再打开：require_token: true
+  require_token: false
   # token: 留空则自动生成到 .token 文件；或用环境变量 AUTOGAME_TOKEN 覆盖
+
+# ---------------- 视觉看门狗：看不到游戏画面就自动停止 ----------------
+# 两类"看不到"分开计时：没帧（相机被关/掉线）等 30s；有帧但不在游戏里等 45s
+# （autonomy 会先按 ESC 自救，gate_window_s 默认 25s，所以这里必须等更久）。
+watchdog:
+  enabled: true
+  no_frame_stop_s: 30.0
+  no_game_stop_s: 45.0
+  auto_stop: true          # false = 只告警不动手
+  resume_after_s: 0.0      # 0 = 不自动恢复（人工确认更安全）
+
+# ---------------- 告警通知（默认关闭，涉及外部网络/凭据） ----------------
+notify:
+  enabled: false
+  webhook_format: bark     # bark（iOS，最省事）/ generic / wecom / dingtalk / slack
+  bark_key: ""             # Bark App 首页那串 key
+  bark_server: https://api.day.app   # 自建才改
+  webhook_url: ""          # generic/wecom/dingtalk/slack 用
+  # 邮件：密码只从环境变量读，不写进配置文件
+  smtp_host: ""
+  smtp_port: 465
+  smtp_ssl: true
+  smtp_user: ""
+  smtp_password_env: AUTOGAME_SMTP_PASS
+  smtp_to: []
+  min_interval_s: 600.0
+  rules:
+    - {name: "刷图 100 次", metric: rechallenges, threshold: 100, message: "刷满 100 次，可以看一眼收益了"}
+    - {name: "连续运行 2 小时", metric: runtime_s, threshold: 7200, message: "已连续运行 2 小时，建议检查画面与背包"}
+    - {name: "疑似包满", metric: no_pick_with_targets_s, threshold: 180, message: "有目标但 3 分钟没捡到东西，可能背包满了"}
+    - {name: "需要人工判断", metric: manual_needed, threshold: 1, message: "出现模型/规则解决不掉的情况，需要人工确认"}
+    - {name: "盲按违规", metric: blind_taps, threshold: 1, message: "出现盲按拾取键（铁律违规），请立即检查"}
 
 capture:
   fps: 2.0             # 采集帧率（决策 1Hz 足够，见对话定稿）
@@ -19,7 +54,16 @@ vision:
     gold: [[18, 120, 180], [35, 255, 255]]     # 金色光柱
     pink: [[140, 90, 160], [172, 255, 255]]    # 粉色光柱
   pillar_min_area: 40
-  pillar_min_aspect: 1.1
+  pillar_min_aspect: 2.5   # 光柱高宽比下限：低于 2.5 是团光/地图节点，不是柱
+  # 场景门：反例优先 → 技能栏模板 → 红血球 → 兜底拦下（未标定就不动手）
+  # 反向样本（关卡选择/背包/结算这类整屏 UI）放 templates/neg_*.png，命中即拦；
+  # 正向样本放 templates/skillbar*.png，命中即放行。裁模板用 tools/make_template.py。
+  scene_gate:
+    enabled: true
+    threshold: 0.6
+    negative_threshold: 0.80
+    fail_closed: true      # 一个锚点都没命中时：true=拦下（安全），false=当战斗
+    # negative_templates: ["templates/neg_tli_nether_map.png"]   # 留空=自动加载 neg_*.png
   # A框检测
   aframe:
     template: templates/aframe.png   # 真实帧裁出的暗底白字 A 提示框（tools/auto_template.py 可重新生成）
@@ -27,8 +71,7 @@ vision:
     verify_dark_core: true           # 框内必须暗底+亮字形（拒绝伤害数字/技能图标）
     glyph_white_only: true           # 字形必须是白色（再排除红色 Buff 图标类误报）
     color_lo: [15, 100, 200]
-    color_hi: [45, 255, 255]
-  # OCR 白名单（默认关闭 —— 纯颜色模式即可工作）
+    color_hi: [45, 255, 255]  # OCR 白名单（默认关闭 —— 纯颜色模式即可工作）
   ocr: null             # null / tesseract / paddle
   whitelist: []         # 物品名白名单，如 ["破城斧"]；空=不过滤（需 ocr 启用）
   # 稀有度白名单（不需要 OCR）：只捡这些颜色的光柱。空=全部颜色都捡。
@@ -47,6 +90,9 @@ decision:
   abandon_blacklist_s: 30.0
   key_step_ms: 450
   jitter_ratio: 0.15
+  # A框确认（铁律：绝不盲按拾取键）
+  aframe_confirm_frames: 2     # 连续确认几帧才按（帧是"过去"的信息，防按空）
+  aframe_retry_frames: 8       # A框在但按不下去多少帧后重新走位（防死等）
 
   # ---------------- 自主性（默认开启：搬砖机器人不能卡壳） ----------------
   autonomy:
@@ -87,6 +133,56 @@ decision:
     min_confidence: 0.45       # 低置信度建议只记录不执行
     # provider: openai 时可用 api_key_env 指定环境变量名（默认 AUTOGAME_VLM_KEY）
 
+  # ---------------- 走位等待（动作链：点一下 ≠ 走到位） ----------------
+  # 真实链路：点地面 → 人物在游戏里走过去（1-3s）→ 进到一定距离 → A框出现 → 按拾取键。
+  # 开启后走位期间不重复点击，而是观察"画面是否在动 + 距离是否真的缩短"。
+  walk:
+    enabled: true
+    budget_s: 3.0              # 单次点击后最多等多久（超时=没走到，重新点）
+    motion_delta_thresh: 2.5   # 帧变化率(%)高于此值视为人物还在走
+    settle_frames: 2           # 连续 N 帧不动视为人物停下
+    settle_grace_s: 0.5        # 停下后再给 A框多久出现（游戏提示有延迟）
+    min_progress_px: 12.0      # 这一轮至少靠近这么多像素才算有效走位
+
+  # ---------------- 拟人化行为（降短期统计风险，不是安全方案） ----------------
+  # 三层：手抖（轨迹，在 executor.mouse_path）/ 疲劳 / 走神 / 社交。
+  # 注意：这些只改变"看起来像人"的统计特征，不改变"程序驱动"的本质。
+  humanize:
+    enabled: true
+    reaction_ms: [180, 620]    # 看到 A框 → 按下拾取键（对数正态，右偏长尾）
+    fatigue:
+      enabled: true
+      per_action: 0.003        # 每次动作累积疲劳（≈280 次到满）
+      idle_after_s: 8.0        # 连续这么久没动作 → 视为休息，疲劳衰减
+      break_threshold: 0.85    # 到阈值就停手（休息窗口内不发任何命令）
+      break_seconds: [20.0, 90.0]
+      break_recovery: 0.55
+      latency_boost: 0.35      # 满疲劳时延时放大比例
+      jitter_boost: 0.8        # 满疲劳时抖动比例放大倍数
+    drift:                     # 走神：非目标导向的噪音操作
+      enabled: true
+      mean_interval_s: 45.0    # 平均多久走神一次（指数分布，不是固定周期）
+      startup_grace_s: 60.0    # 启动宽限：真人不会一上线就发呆
+      cooldown_s: 10.0
+      moves: [1, 2]            # 每次走神发几次鼠标移动
+      noise_keys: []           # 默认空 = 只动鼠标，不点击不按键（最安全）
+    social:                    # 社交噪音：默认关闭，开之前先读 config.py 里的风险说明
+      enabled: false
+      phrases: []              # 只用 ASCII，且不得含 wasd/拾取键字符（会被硬闸门拒绝）
+      min_interval_s: 600.0
+
+    # 情绪/偏好：让"选哪个目标"也有不确定性（原来是永远选第一个稳定光柱）
+    mood:
+      enabled: true
+      patience: 0.6            # 耐心：高=愿意走远（累的时候自动下降）
+      greed: 0.5               # 贪心：高=偏好稀有度
+      novelty: 0.5             # 新鲜感：高=讨厌连续捡同色/同位置
+      drift_sigma: 0.04        # 偏好漂移强度（不是固定权重）
+      temperature: 0.35        # softmax 温度：越大越随性（偶尔挑次优）
+      color_value: {gold: 1.0, pink: 0.7}
+      skip_prob: 0.02          # 单个候选被"懒得捡"无视的基础概率
+      skip_ignore_s: [8.0, 30.0]
+
 executor:
   backend: dryrun       # dryrun(测试) / rp2040(串口固件) / rpi5_hidg(gadget)
   # rp2040:
@@ -99,6 +195,21 @@ executor:
   #   screen_h: 1080
   min_action_interval_ms: 25
   max_actions_per_sec: 20
+  # ---------------- 鼠标轨迹人类化（WindMouse：重力吸附 + 风力扰动 + 端点减速） ----------------
+  # 只决定"手怎么动"，不决定"往哪动"。enabled: false 时退化为单点移动（旧行为）。
+  mouse_path:
+    enabled: true
+    gravity: 9.0             # 向目标的重力吸附强度
+    wind: 3.0                # 风力扰动（越大轨迹越飘）
+    max_step_px: 10.0        # 单步最大位移（越小轨迹越细）
+    speed_px_s: 900.0        # 名义移动速度
+    max_duration_s: 0.45     # 整段轨迹最长时长（防阻塞决策循环）
+    max_points: 40           # 轨迹点上限（USB HID / 串口带宽预算）
+    endpoint_jitter_px: 2    # 落点偏差（真人不点数学中心）
+    overshoot_prob: 0.12     # 冲过头再拉回的概率
+    micro_pause_prob: 0.25   # 中途微小停顿概率
+    hover_ms: [30, 110]      # 到位后悬停多久再按下（先看清再点）
+    press_ms: [55, 135]      # 左键按下保持时长（固件 delay 由主机下发）
 
 sim:
   width: 1280

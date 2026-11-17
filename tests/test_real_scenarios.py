@@ -36,16 +36,21 @@ SAMPLES = ROOT / "assets" / "samples"
 GAMEPLAY = [
     "real_hud_boss.png",
     "real_combat_hud.png",
-    "real_beamlike_tentacles.png",
     "real_skillfx_storm.png",
     "real_darkmap_farm.png",
+]
+# HUD 没有任何随仓库模板覆盖的画面（技能栏模板 0.18~0.20）。
+# 门禁改为 fail-closed 后这种"未标定的画面"必须被拦下——宁可不动手。
+UNCALIBRATED_HUD = [
+    "real_darkmap_fight.png",
+    "real_beamlike_tentacles.png",  # 是战斗，但技能栏与 skillbar*.png 不同源
 ]
 UI_SCREENS = [
     "real_equip_panel.png",
     "real_inventory.jpg",
 ]
 
-ALL_REAL = GAMEPLAY + UI_SCREENS
+ALL_REAL = GAMEPLAY + UNCALIBRATED_HUD + UI_SCREENS
 
 
 def _load(name: str):
@@ -74,6 +79,22 @@ def test_gameplay_frames_pass_scene_gate(name):
     assert states[-1].in_game is True, f"{name} 是战斗画面，场景门必须放行"
 
 
+@pytest.mark.parametrize("name", UNCALIBRATED_HUD)
+def test_uncalibrated_hud_is_held_not_passed(name):
+    """未标定的 HUD：一个正向锚点都没命中 → 必须拦下（fail-closed），并说明原因。
+
+    这条以前是"必须放行"，靠的是一个裁错的 q_letter.png 模板（实际是技能图标的
+    一块角落）——它对 8 张真实截图里有 7 张都给 0.77~0.99，等于门禁常开。
+    删掉它以后，这块画面的 HUD 没有任何锚点能认出来，所以正确的行为是"不动手"。
+    """
+    det = _det()
+    states = _run_ticks(det, _load(name))
+    assert states[-1].in_game is False, \
+        f"{name} 的 HUD 没有被任何模板覆盖，必须 fail-closed 拦下"
+    assert det.diag["gate_reason"] == "unmatched", \
+        f"拦截原因要显式写成 unmatched（未标定），实际 {det.diag['gate_reason']}"
+
+
 def test_inventory_blocked_by_scene_gate():
     """背包界面（无血球无技能栏）必须被场景门拦截。"""
     det = _det()
@@ -81,10 +102,11 @@ def test_inventory_blocked_by_scene_gate():
     assert states[-1].in_game is False, "背包界面必须被场景门拦截"
 
 
-def test_equip_panel_never_emits_key_commands():
-    """装备面板：红血球锚点可能误放行（红物品图标在血球区，已知边界），但
-    无论门禁状态如何，绝不允许产生任何按键命令（鼠标点击最多）。"""
+def test_equip_panel_blocked_and_silent():
+    """装备面板：整屏 UI，门禁必须拦下，且无论门禁如何都不许产出按键命令。"""
     det = _det()
+    assert _run_ticks(det, _load("real_equip_panel.png"))[-1].in_game is False, \
+        "装备面板是整屏 UI，必须被场景门拦下（红血球锚点已删除，它曾把面板放行）"
     ex = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000))
     eng = DecisionEngine(DecisionConfig(tick_hz=1.0), ex)
     eng.start()
@@ -103,9 +125,18 @@ def test_equip_panel_never_emits_key_commands():
 
 # ---------------- 误报抑制（战斗特效 ≠ 光柱） ----------------
 
-@pytest.mark.parametrize("name", GAMEPLAY)
+# 特效压力样本：Boss 触手/技能光束/满屏光效（不管门禁是否放行，都不许被当成光柱）
+FX_SAMPLES = [
+    "real_beamlike_tentacles.png",
+    "real_skillfx_storm.png",
+    "real_hud_boss.png",
+    "real_darkmap_farm.png",
+]
+
+
+@pytest.mark.parametrize("name", FX_SAMPLES)
 def test_combat_fx_not_confirmed_as_pillars(name):
-    """真实战斗特效（Boss 触手/技能光束）跨 3 帧不得确认为光柱。"""
+    """真实战斗特效（Boss 触手/技能光束）跨 4 帧不得确认为光柱。"""
     det = _det()
     states = _run_ticks(det, _load(name), n=4)
     for i, st in enumerate(states):

@@ -96,18 +96,27 @@ def test_timeout_abandon_and_blacklist():
 
 
 def test_stuck_wall_detection():
-    """连续帧差极低 → 撞墙 → 侧向脱困 → 仍卡则放弃。"""
+    """连续帧差极低 → 撞墙 → 侧向脱困 → 仍卡则放弃。
+
+    注意：现在"点一下"之后有走位等待（decision.walk）——人物没走过去之前
+    不会重复点击。所以这里用 1s 步进（真实决策节拍），等走位预算耗尽
+    后才进入撞墙判定。
+    """
     eng, ex = _mk_engine(stuck_frames=2, stuck_delta_thresh=6.0)
     eng.start()
     ts = 1000
-    eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=100, ts_ms=ts)); ts += 100
+    eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=100, ts_ms=ts)); ts += 1000
     assert eng.state == State.APPROACHING
-    eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=1.0, ts_ms=ts)); ts += 100
-    eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=1.0, ts_ms=ts)); ts += 100
+    for _ in range(8):
+        if eng._alt_direction_tried:
+            break
+        eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=1.0, ts_ms=ts)); ts += 1000
     # 触发侧向脱困
     assert eng._alt_direction_tried is True
-    eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=1.0, ts_ms=ts)); ts += 100
-    eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=1.0, ts_ms=ts)); ts += 100
+    for _ in range(6):
+        if eng.state == State.COOLDOWN:
+            break
+        eng.on_scene(_scene([_pillar(cx=900, cy=400)], delta=1.0, ts_ms=ts)); ts += 1000
     assert eng.stats["abandons"] == 1, "侧向脱困无效必须放弃"
     assert eng.state == State.COOLDOWN
 

@@ -133,3 +133,64 @@ def test_in_game_gate_blocks_detections():
     det2.process(frame_ui, 1000)
     st_ui = det2.process(frame_ui, 2000)
     assert st_ui.in_game is False, "无技能栏的 UI 画面 → in_game 必须 False"
+
+
+# ---------------- 怪物检测：真实录像暴露的误报（技能图标/漂浮文字） ----------------
+
+def _draw_blob(frame, cx, cy, r=16, color=(200, 60, 220)):
+    """画一个"像怪物"的饱和色块（面积/尺寸/填充率都在怪物判据内）。"""
+    import cv2 as _cv2
+
+    _cv2.circle(frame, (cx, cy), r, color, -1)
+
+
+def test_static_blob_is_not_a_monster():
+    """静态图标（技能轮盘/背包键）不是怪物：只出现、不动、不变 → 永不确认。"""
+    cfg = VisionConfig()
+    det = Detector(cfg)
+    frame = _empty_frame()
+    _draw_blob(frame, 900, 400)
+    for i in range(4):
+        st = det.process(frame, 1000 + i * 500)
+        assert st.monsters == [], f"第{i+1}帧静态色块被当成怪物（真实录像里的误报源）"
+
+
+def test_moving_blob_becomes_monster():
+    """会动的才是怪：位移超过容差 → 第二帧起确认。"""
+    cfg = VisionConfig()
+    det = Detector(cfg)
+    seen = 0
+    for i in range(4):
+        frame = _empty_frame()
+        _draw_blob(frame, 860 + i * 12, 400)  # 每帧右移 12px
+        st = det.process(frame, 1000 + i * 500)
+        seen += len(st.monsters)
+    assert seen >= 1, "移动的色块必须被确认为怪物"
+
+
+def test_blob_inside_hud_exclusion_is_masked():
+    """HUD 排除区内的色块（移动端技能按钮就压在战斗区里）不得成为怪物。"""
+    cfg = VisionConfig(hud_exclusions=[[820, 330, 200, 160]])
+    det = Detector(cfg)
+    for i in range(3):
+        frame = _empty_frame()
+        _draw_blob(frame, 900 + i * 12, 400)  # 在排除区内移动
+        st = det.process(frame, 1000 + i * 500)
+        assert st.monsters == [], "HUD 排除区内的候选必须被抹掉"
+
+
+def test_blob_overlapping_ground_label_is_not_monster():
+    """与掉落标签重叠的候选是文字，不是怪。"""
+    from autogame.protocol import ListEntry
+
+    cfg = VisionConfig()
+    det = Detector(cfg)
+    for i in range(3):
+        frame = _empty_frame()
+        _draw_blob(frame, 860 + i * 12, 400)
+        st = det.process(frame, 1000 + i * 500)
+        # 直接把标签按候选位置喂进互斥逻辑，断言不产出怪物
+        got = det._detect_monsters(frame, frame.shape[1], frame.shape[0], 1.0,
+                                   avoid=[ListEntry(x=860 + i * 12, y=400, w=90, h=24)])
+        assert got == [], "与掉落标签重叠的色块不能当怪物点"
+        _ = st

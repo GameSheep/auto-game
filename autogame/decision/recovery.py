@@ -291,7 +291,15 @@ class RecoveryLadder:
         )
 
     def _step_escape(self, now: float, scene: SceneState, ctx: dict) -> RecoveryResult:
-        """ESC：关掉可能挡住操作的弹窗/菜单（最多连按 3 次，防在菜单里反复开关）。"""
+        """ESC：关掉可能挡住操作的弹窗/菜单（最多连按 3 次，防在菜单里反复开关）。
+
+        **只在"已经不在战斗界面"时才按**：真实录像验证发现，走到这一级时如果
+        场景门仍判定在战斗 HUD 里（in_game=True），ESC 不会关弹窗，而是直接
+        弹出游戏暂停菜单 —— 打断战斗、把机器人锁进菜单，比卡住更糟。
+        """
+        if ctx.get("in_game", scene.in_game):
+            return RecoveryResult(step="escape",
+                                  note="仍在战斗界面，ESC 只会开暂停菜单 → 跳过")
         if self._escape_taps >= 3:
             return RecoveryResult(step="escape", note="ESC 已按 3 次，跳过")
         self._escape_taps += 1

@@ -294,3 +294,32 @@ def test_frame_stall_ignored_when_paused():
     hub._latest_ts = time.time() - 30
     hub.check_frame_stall()  # PAUSED → 不该报警
     assert not any(e["event"] == "frame_stall" for e in hub.fsm.events)
+
+
+def test_escape_step_skipped_while_still_in_combat():
+    """真实录像验证：卡壳时如果仍判定在战斗界面，ESC 只会开暂停菜单 → 绝不能按。
+
+    （暗黑4 实战帧上曾连按 6 次 ESC：机器人把自己锁进菜单，比卡住更糟。）
+    """
+    eng, ex = _engine(level_interval_s=0.3, step_interval_s=0.05,
+                      stall_window_s=1.0, frozen_window_s=999, idle_window_s=999)
+    # 有目标但零进展 → stalled → 阶梯升级到 escape；in_game 始终 True
+    for i in range(40):
+        eng.on_scene(_scene(1000 + i * 500, pillars=[_pillar()], delta=50.0))
+    esc = [j for j in ex.journal if j["op"] == "key_tap" and j["key"] == "esc"]
+    assert esc == [], "在战斗界面按 ESC 会弹暂停菜单，恢复阶梯必须跳过这一级"
+    assert len(ex.journal) > 0, "跳过 ESC 不等于停手：其它恢复动作仍要发"
+
+
+def test_escape_step_works_when_gate_says_not_in_game():
+    """门禁判定不在战斗界面（真弹窗/菜单）时，ESC 才是正确的自救动作。"""
+    from autogame.decision.recovery import RecoveryLadder
+
+    a = AutonomyConfig()
+    lad = RecoveryLadder(a, None, None, forbidden_keys={"a"})
+    lad.begin(0.0)
+    lad.level = RecoveryLadder.STEPS.index("escape")
+    scene = _scene(1000, in_game=False)
+    res = lad.step(100.0, scene, {"in_game": False})
+    assert any(c.op == "key_tap" and c.key == a.escape_key for c in res.commands), \
+        "非战斗界面下 ESC 必须能发出来"
