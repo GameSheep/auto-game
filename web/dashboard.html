@@ -41,6 +41,7 @@
   <span id="state-badge" class="st-PAUSED">PAUSED</span>
   <span class="muted" id="frame-info">-</span>
   <span style="flex:1"></span>
+  <a href="/settings" style="color:var(--accent); text-decoration:none">⚙️ 设置</a>
   <span class="muted">Token <input id="token" type="password" placeholder="粘贴 token（同 .token 文件）" style="width:220px"></span>
 </header>
 <main>
@@ -88,6 +89,7 @@
         <tr><th>视觉模型</th><td id="au-vlm">-</td></tr>
         <tr><th>视觉建议</th><td id="au-vlm-advice">-</td></tr>
         <tr><th>文本顾问</th><td id="au-llm">-</td></tr>
+        <tr><th>拟人化</th><td id="au-human">-</td></tr>
         <tr><th>帧间隔</th><td id="au-frame">-</td></tr>
       </table>
     </div>
@@ -153,6 +155,17 @@ function refresh() {
       $("au-llm").textContent = llm.enabled
         ? `${llm.model} 咨询${llm.queries||0}次`
         : "未启用";
+      // 拟人化：疲劳度 / 走神 / 休息 / 偏好（降短期统计风险，不是安全方案）
+      const hu = au.humanize || {};
+      const mo = hu.mood || {};
+      $("au-human").textContent = hu.enabled
+        ? `疲劳${Math.round((hu.fatigue||0)*100)}% 延时x${hu.latency_scale||1}`
+          + ` 走神${hu.drifts||0} 休息${hu.breaks||0}${hu.breaking ? " [休息中]" : ""}`
+          + (mo.patience != null
+              ? ` | 耐心${mo.effective ? mo.effective.patience : mo.patience}`
+                + ` 贪心${mo.effective ? mo.effective.greed : mo.greed}`
+              : "")
+        : "已关闭（config.yaml: decision.humanize.enabled）";
       $("au-frame").textContent = d.frame_stalled
         ? `⚠ 中断 ${d.frame_gap_s}s`
         : (d.frame_gap_s == null ? "-" : `${d.frame_gap_s}s`);

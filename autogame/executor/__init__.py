@@ -33,7 +33,9 @@ class DryRunExecutor(BaseExecutor):
     backend_name = "dryrun"
 
     def _emit(self, cmd: Command, bypass: bool = False) -> None:
-        log.info("[dryrun] %s", cmd.model_dump_json(exclude_none=True))
+        n = len(self.last_path)
+        suffix = f" path={n}pts" if n > 1 else ""
+        log.info("[dryrun] %s%s", cmd.model_dump_json(exclude_none=True), suffix)
 
 
 class RP2040Executor(BaseExecutor):
@@ -51,6 +53,31 @@ class RP2040Executor(BaseExecutor):
         self._ser = serial.Serial(cfg.serial_port, cfg.serial_baud, timeout=0.5)
         log.info("RP2040 串口已连接: %s @%d", cfg.serial_port, cfg.serial_baud)
 
+    def _drain(self) -> None:
+        """非阻塞清空串口回显缓冲。
+
+        轨迹模式下一条命令会下发几十行，固件每行都回 ack；
+        主机不读，RP2040 的 CDC TX FIFO 会写满并**卡住固件**。
+        """
+        try:
+            n = getattr(self._ser, "in_waiting", 0)
+            if n:
+                self._ser.read(n)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _write(self, payload: dict, ack: bool = True) -> None:
+        self._ser.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+        if not ack:
+            self._drain()
+            return
+        try:
+            line = self._ser.readline()
+            if line:
+                log.debug("rp2040 ack: %s", line.decode(errors="replace").strip())
+        except Exception:  # noqa: BLE001
+            pass
+
     def _emit(self, cmd: Command, bypass: bool = False) -> None:
         payload = cmd.model_dump(exclude_none=True)
         # 帧最小化：各命令只保留固件用得到的字段
@@ -61,15 +88,32 @@ class RP2040Executor(BaseExecutor):
                 "mouse_click": ("op", "button", "x", "y"),
                 "stop_all": ("op",)}[cmd.op]
         payload = {k: v for k, v in payload.items() if k in keep}
-        self._ser.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
-        if not bypass:
-            # 尽力读取回显（非阻塞预算内）
-            try:
-                line = self._ser.readline()
-                if line:
-                    log.debug("rp2040 ack: %s", line.decode(errors="replace").strip())
-            except Exception:  # noqa: BLE001
-                pass
+
+        if cmd.op in ("mouse_move", "mouse_click") and self.last_path:
+            # 沿人类化轨迹逐点下发；中间点不等回显（串口 115200 下等回显会拖成幻灯片）
+            for p in self.last_path[:-1]:
+                if p.dt > 0:
+                    time.sleep(p.dt)
+                self._write({"op": "mouse_move", "x": p.x, "y": p.y}, ack=False)
+            last = self.last_path[-1]
+            if last.dt > 0:
+                time.sleep(last.dt)
+            if cmd.op == "mouse_move":
+                self._write({"op": "mouse_move", "x": last.x, "y": last.y},
+                            ack=not bypass)
+            else:
+                # 点击 = 悬停(主机侧) → 按下 → 保持(固件 delay) → 抬起
+                if self.click_hover_ms > 0:
+                    time.sleep(self.click_hover_ms / 1000.0)
+                self._write({"op": "mouse_click", "button": cmd.button,
+                             "x": last.x, "y": last.y, "hold_ms": self.click_press_ms},
+                            ack=not bypass)
+            return
+
+        if cmd.op == "mouse_click":
+            payload["hold_ms"] = self.click_press_ms
+
+        self._write(payload, ack=not bypass)
 
     def close(self) -> None:
         try:
@@ -125,17 +169,27 @@ class RPi5HidgExecutor(BaseExecutor):
             else:
                 self._kb.write(build_keyboard_report())
         elif cmd.op == "mouse_move":
-            self._mouse_abs(cmd.x or 0, cmd.y or 0)
+            if self.last_path:
+                self._walk_path(self.last_path, self._mouse_abs)
+            else:
+                self._mouse_abs(cmd.x or 0, cmd.y or 0)
         elif cmd.op == "mouse_click":
             # 绝对鼠标：按下/抬起报文必须保持同一坐标（否则光标会跳回原点）
-            cx = cmd.x if cmd.x is not None else 0
-            cy = cmd.y if cmd.y is not None else 0
-            self._ms.write(build_abs_mouse_report(cx, cy, self.cfg.screen_w, self.cfg.screen_h))
-            time.sleep(0.03)
+            if self.last_path:
+                # 先沿人类化轨迹滑过去（最后一点即落点），再按下
+                self._walk_path(self.last_path, self._mouse_abs)
+                cx, cy = self.last_path[-1].x, self.last_path[-1].y
+            else:
+                cx = cmd.x if cmd.x is not None else 0
+                cy = cmd.y if cmd.y is not None else 0
+                self._mouse_abs(cx, cy)
+            # 点击手势：悬停（先看清）→ 按下 → 保持（真人不会 45ms 就松）→ 抬起
+            if self.click_hover_ms > 0:
+                time.sleep(self.click_hover_ms / 1000.0)
             btn = 0x01 if cmd.button == "left" else 0x02
             self._ms.write(build_abs_mouse_report(cx, cy, self.cfg.screen_w,
                                                   self.cfg.screen_h, button=btn))
-            time.sleep(0.05)
+            time.sleep(max(0.01, self.click_press_ms / 1000.0))
             self._ms.write(build_abs_mouse_report(cx, cy, self.cfg.screen_w, self.cfg.screen_h))
         elif cmd.op == "stop_all":
             self._kb.write(build_keyboard_report())

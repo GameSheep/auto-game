@@ -84,6 +84,7 @@ class Pca9685Executor(BaseExecutor):
     """
 
     backend_name = "pca9685"
+    supports_mouse_move = False  # 机械结构无绝对定位 → 走神/轨迹层自动跳过鼠标噪音
 
     def __init__(self, cfg: Any) -> None:
         super().__init__(cfg)

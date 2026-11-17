@@ -7,8 +7,10 @@ import logging
 import random
 import threading
 import time
+from typing import Sequence
 
 from ..config import ExecutorConfig
+from ..humanize import PathPoint, build_mouse_path
 from ..protocol import Command
 from ..security import ActionRateLimiter
 
@@ -23,17 +25,39 @@ def _jitter(value_ms: int, ratio: float) -> int:
     return max(1, value_ms + random.randint(-delta, delta))
 
 
+def _rand_in(pair: Sequence[int] | None, default: tuple[int, int]) -> int:
+    """从 [lo, hi] 区间取随机整数（区间缺失/非法时回落到 default）。"""
+    lo, hi = default
+    if pair:
+        vals = list(pair)[:2]
+        if len(vals) == 2:
+            lo, hi = vals
+    lo, hi = int(min(lo, hi)), int(max(lo, hi))
+    return random.randint(max(0, lo), max(0, hi))
+
+
 class BaseExecutor(abc.ABC):
-    """执行器基类：限速 + 急停 + 统计。"""
+    """执行器基类：限速 + 急停 + 统计 + 人类化鼠标轨迹。"""
+
+    #: 后端是否支持绝对坐标鼠标移动（机械舵机按压后端为 False，走位需配 keys 模式）
+    supports_mouse_move: bool = True
 
     def __init__(self, cfg: ExecutorConfig) -> None:
         self.cfg = cfg
         self._limiter = ActionRateLimiter(cfg.min_action_interval_ms, cfg.max_actions_per_sec)
+        self._rate_sig = (cfg.min_action_interval_ms, cfg.max_actions_per_sec)
         self._panic = threading.Event()
         self.sent = 0
         self.dropped = 0
         self.journal: list[dict] = []  # 最近动作日志（仪表盘/测试断言用）
         self._lock = threading.Lock()
+        # 光标位置：作为下一次轨迹的起点（None=未知，首帧退化为单点）
+        self.cursor: tuple[int, int] | None = None
+        self.last_path: list[PathPoint] = []
+        self.path_points_total = 0
+        # 本次点击手势参数（execute 里定，后端只管执行）
+        self.click_hover_ms = 0
+        self.click_press_ms = 0
 
     @property
     def panicked(self) -> bool:
@@ -58,27 +82,66 @@ class BaseExecutor(abc.ABC):
             self.dropped += 1
             return False
         if cmd.op != "stop_all":
-            # 最小间隔：自适应等待（上限50ms），保证连续合法命令不被丢弃
-            delay = self._limiter.delay_needed()
-            if delay > 0:
-                time.sleep(min(delay, 0.05))
-            if not self._limiter.allow():
+            # 限速参数每帧跟随 config（配置页热更新后立即生效，不用重启）
+            rate = (self.cfg.min_action_interval_ms, self.cfg.max_actions_per_sec)
+            if rate != self._rate_sig:
+                self._rate_sig = rate
+                self._limiter.sync(*rate)
+            # 最小间隔：由限速器自己等到可发送（不依赖 sleep 精度，见 acquire 注释）
+            if not self._limiter.acquire(0.25):
                 self.dropped += 1
                 return False
+        # 鼠标类命令先规划人类化轨迹（WindMouse），后端按点输出
+        self.last_path = self._plan_mouse_path(cmd)
+        # 点击手势参数（悬停/按压）在这里定，后端只管执行 —— 日志才能如实记录
+        if cmd.op == "mouse_click":
+            self.click_hover_ms = _rand_in(self.cfg.mouse_path.hover_ms, (30, 110))
+            self.click_press_ms = _rand_in(self.cfg.mouse_path.press_ms, (55, 135))
+        else:
+            self.click_hover_ms = 0
+            self.click_press_ms = 0
         try:
             self._emit(cmd)
         except Exception:  # noqa: BLE001
             log.exception("执行命令失败 op=%s", cmd.op)
             return False
         self.sent += 1
+        if self.last_path:
+            self.cursor = (self.last_path[-1].x, self.last_path[-1].y)
         with self._lock:
             self.journal.append(
                 {"ts": time.time(), "op": cmd.op, "key": cmd.key, "x": cmd.x, "y": cmd.y,
-                 "button": cmd.button, "hold_ms": cmd.hold_ms}
+                 "button": cmd.button, "hold_ms": cmd.hold_ms, "path": len(self.last_path),
+                 "press_ms": self.click_press_ms}
             )
             if len(self.journal) > 500:
                 del self.journal[:-300]
         return True
+
+    # ------------- 人类化鼠标轨迹 -------------
+
+    def _plan_mouse_path(self, cmd: Command) -> list[PathPoint]:
+        """为 mouse_move / mouse_click 规划轨迹；其他命令返回空列表。"""
+        if cmd.op not in ("mouse_move", "mouse_click"):
+            return []
+        if cmd.x is None or cmd.y is None:
+            return []
+        tx, ty = int(cmd.x), int(cmd.y)
+        start = self.cursor if self.cursor is not None else (tx, ty)
+        path = build_mouse_path(start, (tx, ty), self.cfg.mouse_path)
+        self.path_points_total += len(path)
+        return path
+
+    def _walk_path(self, path: list[PathPoint], move) -> None:
+        """按轨迹逐点输出（move(x, y) 由后端实现），点间按 dt 等待。
+
+        注意：轨迹点在 _emit 内部输出，绕过 ActionRateLimiter ——
+        它们属于**同一条**逻辑命令，不应被限速器拆散或丢弃。
+        """
+        for p in path:
+            if p.dt > 0:
+                time.sleep(p.dt)
+            move(p.x, p.y)
 
     @abc.abstractmethod
     def _emit(self, cmd: Command, bypass: bool = False) -> None:

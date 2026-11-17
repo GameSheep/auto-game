@@ -20,6 +20,7 @@ from ..decision.fsm import DecisionEngine, State
 from ..executor import BaseExecutor
 from ..protocol import SceneState
 from ..vision.pipeline import VisionPipeline
+from .notify import Notifier
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +55,16 @@ class Hub:
             self.fsm.on_event = self._append_event_log
         # 当前代理连接（新连接踢旧连接，防断线风暴下双路帧交错）
         self.agent_ws = None
+        # 视觉看门狗 + 告警（"看不到游戏就停" / "刷够了提醒我"）
+        self.notifier = Notifier(cfg.notify)
+        self._started_at: float = 0.0          # 本轮运行开始时刻
+        self._vision_lost_since: float = 0.0   # 连续看不到游戏的起点
+        self._vision_lost_reason = ""
+        self._auto_stopped = False
+        self._manual_needed = 0                # 需要人工判断的次数
+        self._last_pick_ts: float = 0.0        # 最近一次成功拾取
+        self._last_pick_count: int = 0
+        self._no_pick_since: float = 0.0
         # UI 任务（交易行/装备/天赋/技能 —— 配方引擎，激活时接管决策循环）
         self.ui_task: Any | None = None
         self.ui_task_ends: deque = deque(maxlen=20)  # 已结束任务的完成记录
@@ -156,8 +167,123 @@ class Hub:
             await asyncio.sleep(2.0)
             try:
                 self.check_frame_stall()
+                self.check_vision_lost()
+                self.check_notify_rules()
             except Exception:  # noqa: BLE001
-                log.exception("帧流看门狗异常（忽略）")
+                log.exception("看门狗异常（忽略）")
+
+    # ------------- 视觉看门狗：看不到游戏画面就自动停止 -------------
+
+    def check_vision_lost(self) -> None:
+        """看不到游戏画面 → 自动停止。
+
+        两类"看不到"分开计时，因为它们的正确处置不一样：
+          - 完全没有新帧：相机被关/代理掉线/游戏退出。没有任何决策依据，
+            多等一秒都是白跑，`no_frame_stop_s`（默认 30s）到点就停。
+          - 有帧但判定不在游戏里：可能是菜单/弹窗，autonomy 会先按 ESC 自救
+            （gate_window_s 默认 25s）。所以这里必须等更久（默认 45s），
+            否则会在自救进行到一半时把程序掐掉。
+        """
+        wd = self.cfg.watchdog
+        if not wd.enabled or self._auto_stopped:
+            return
+        if self.fsm.state in (State.PAUSED, State.PANIC):
+            self._vision_lost_since = 0.0
+            return
+        now = time.time()
+
+        reason = ""
+        if self._latest_ts <= 0:
+            return                                  # 还没收到过帧，不算"丢失"
+        gap = now - self._latest_ts
+        with self._lock:
+            scene = self._latest_scene
+        in_game = bool(scene.in_game) if scene is not None else False
+
+        if gap >= wd.no_frame_stop_s:
+            reason = f"连续 {gap:.0f}s 没有新帧（相机被关/代理掉线/游戏退出）"
+        elif not in_game and gap < 5.0:
+            # 有帧但判定不在游戏里：从第一次判定开始计时
+            if self._vision_lost_since <= 0:
+                self._vision_lost_since = now
+            lost_for = now - self._vision_lost_since
+            if lost_for >= wd.no_game_stop_s:
+                reason = f"连续 {lost_for:.0f}s 看不到游戏画面（相机没对准/窗口被挡）"
+        else:
+            if self._vision_lost_since > 0 and in_game:
+                log.info("画面恢复，取消自动停止计时")
+            self._vision_lost_since = 0.0
+            return
+
+        if not reason:
+            return
+        self._vision_lost_reason = reason
+        ev = {"ts": now, "state": self.fsm.state.value,
+              "event": "vision_lost", "reason": reason,
+              "auto_stop": bool(wd.auto_stop)}
+        self.fsm.events.append(ev)
+        if len(self.fsm.events) > 400:
+            del self.fsm.events[:-200]
+        self._emit_event_log(ev)
+        log.error("视觉看门狗: %s", reason)
+
+        if wd.auto_stop:
+            self._auto_stopped = True
+            self._manual_needed += 1
+            try:
+                self.fsm.stop()
+            except Exception:  # noqa: BLE001
+                log.exception("自动停止失败")
+            self.notifier.alert(
+                "已自动停止：看不到游戏画面",
+                f"{reason}\n状态已切到 PAUSED，请检查相机位置/游戏窗口后手动重新开始。",
+                level="error",
+            )
+        else:
+            self.notifier.alert("看不到游戏画面（仅告警）", reason, level="warn")
+
+    # ------------- 告警规则 -------------
+
+    def metrics(self) -> dict[str, float]:
+        """告警规则用的指标快照。"""
+        now = time.time()
+        stats = self.fsm.stats
+        runtime = (now - self._started_at) if self._started_at > 0 else 0.0
+        # "有目标但捡不到" → 疑似背包满（游戏玩法内程序判断不了的东西）
+        with self._lock:
+            scene = self._latest_scene
+        has_targets = bool(scene is not None and (scene.pillars or scene.item_list))
+        if stats["picks"] != self._last_pick_count:
+            self._last_pick_count = stats["picks"]
+            self._last_pick_ts = now
+            self._no_pick_since = 0.0
+        elif has_targets and self.fsm.state not in (State.PAUSED, State.PANIC):
+            if self._no_pick_since <= 0:
+                self._no_pick_since = now
+        else:
+            self._no_pick_since = 0.0
+        no_pick_for = (now - self._no_pick_since) if self._no_pick_since > 0 else 0.0
+        return {
+            "rechallenges": float(stats.get("rechallenges", 0)),
+            "picks": float(stats.get("picks", 0)),
+            "runtime_s": float(runtime),
+            "abandons": float(stats.get("abandons", 0)),
+            "recoveries": float(stats.get("recoveries", 0)),
+            "manual_needed": float(self._manual_needed),
+            "no_pick_with_targets_s": float(no_pick_for),
+            "blind_taps": float(stats.get("blind_tap_violations", 0)),
+            "dropped_commands": float(self.executor.dropped),
+        }
+
+    def check_notify_rules(self) -> None:
+        if not self.cfg.notify.enabled:
+            return
+        self.notifier.check(self.metrics())
+
+    def note_manual_needed(self, reason: str) -> None:
+        """标记"这件事程序判断不了，需要人看一眼"。"""
+        self._manual_needed += 1
+        self.notifier.alert("需要人工判断", reason, level="warn")
 
     async def decision_loop(self) -> None:
         """决策循环：每个新帧 tick 一次 FSM（默认 1Hz 由代理 fps 决定）。
@@ -223,8 +349,182 @@ class Hub:
             "events": self.fsm.events[-40:],
             "ui_task_ends": list(self.ui_task_ends),
             "history_len": len(self._history),
+            "watchdog": {
+                "enabled": self.cfg.watchdog.enabled,
+                "auto_stopped": self._auto_stopped,
+                "reason": self._vision_lost_reason,
+                "vision_lost_for_s": (round(time.time() - self._vision_lost_since, 1)
+                                      if self._vision_lost_since > 0 else 0.0),
+                "no_frame_stop_s": self.cfg.watchdog.no_frame_stop_s,
+                "no_game_stop_s": self.cfg.watchdog.no_game_stop_s,
+            },
+            "notify": self.notifier.snapshot(),
+            "metrics": self.metrics(),
+            "runtime_s": (round(time.time() - self._started_at, 0)
+                          if self._started_at > 0 else 0),
         }
         return d
+
+    # ------------- 相机标定反馈 -------------
+
+    def calibration_report(self) -> dict:
+        """最新一帧的标定诊断（页面"相机与标定"用）。
+
+        关键点：**即使检不到也要给出"差多少"**。只告诉用户"检不到"等于没说，
+        他会去瞎调相机方向；告诉他"A框模板 0.41 / 阈值 0.72"他就知道该重裁模板了。
+        """
+        from . import calib
+
+        with self._lock:
+            jpeg = self._latest_jpeg
+            scene = self._latest_scene
+            ts = self._latest_ts
+        if jpeg is None:
+            return {"ok": False, "reason": "尚无画面（代理未连接或相机未采集）"}
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return {"ok": False, "reason": "帧解码失败"}
+        diag = getattr(self.pipeline.detector, "diag", {}) or {}
+        rep = calib.analyze(frame, scene, diag, self.cfg.vision,
+                            frame_age_s=(time.time() - ts) if ts else None)
+        rep["ok"] = True
+        rep["verdict"] = calib.verdict_label(rep["scores"]["overall"])
+        return rep
+
+    def sample_hsv(self) -> dict:
+        """从当前画面自动采样 HSV 范围。
+
+        颜色名 = HSV 字典的键，而 `vision.whitelist_colors` 用的是这些名字。
+        所以按**现有键的顺序**填回，不能瞎起名（起成 auto0/auto1 会让
+        whitelist_colors: [gold] 直接失效 —— 那是静默失效，最难查）。
+        """
+        from ..vision.auto_calib import auto_hsv_ranges
+
+        with self._lock:
+            jpeg = self._latest_jpeg
+        if jpeg is None:
+            return {"ok": False, "reason": "尚无画面"}
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return {"ok": False, "reason": "帧解码失败"}
+        names = list(self.cfg.vision.hsv.keys()) or ["gold", "pink"]
+        ranges = auto_hsv_ranges(frame, max_ranges=max(1, len(names) + 1))
+        if not ranges:
+            return {"ok": False, "reason": "画面里没有足够的高亮饱和像素，采样失败"
+                                           "（先让游戏里出现光柱再点）"}
+        new: dict = {}
+        for i, r in enumerate(ranges):
+            new[names[i] if i < len(names) else f"auto{i}"] = r
+        self.cfg.vision.hsv = new
+        return {"ok": True, "hsv": new,
+                "note": "按现有颜色名顺序填回（第 1 个颜色名 = 像素最多的色簇）。"
+                        "若金柱不是画面里最多的颜色，名字可能对不上，请核对再保存。"}
+
+    # ------------- 试跑 / 直发 HID（页面上手动验证用） -------------
+
+    def _hid_preview(self, cmd) -> dict:
+        """一条命令最终会变成什么：RP2040 JSON 行 + 原始 HID 报文（十六进制）。"""
+        from ..executor import RPi5HidgExecutor
+        from ..executor.base import build_abs_mouse_report, build_keyboard_report
+
+        sw, sh = self.cfg.executor.screen_w, self.cfg.executor.screen_h
+        item: dict = {"op": cmd.op, "key": cmd.key, "x": cmd.x, "y": cmd.y,
+                      "button": cmd.button, "hold_ms": cmd.hold_ms}
+        if cmd.op in ("mouse_move", "mouse_click"):
+            btn = 0x01 if (cmd.op == "mouse_click" and cmd.button == "left") else (
+                0x02 if cmd.op == "mouse_click" else 0x00)
+            rep = build_abs_mouse_report(int(cmd.x or 0), int(cmd.y or 0), sw, sh, button=btn)
+            item["hid_hex"] = " ".join(f"{b:02X}" for b in rep)
+            item["hid_desc"] = f"6B 绝对鼠标 btn=0x{btn:02X} x={cmd.x} y={cmd.y}"
+            payload = {"op": cmd.op, "x": int(cmd.x or 0), "y": int(cmd.y or 0)}
+            if cmd.op == "mouse_click":
+                payload["button"] = cmd.button
+                payload["hold_ms"] = self.executor.click_press_ms or 90
+            item["serial_json"] = json.dumps(payload, ensure_ascii=False)
+        else:
+            code = RPi5HidgExecutor._KEYMAP.get((cmd.key or "").lower(), 0)
+            rep = build_keyboard_report(code)
+            item["hid_hex"] = " ".join(f"{b:02X}" for b in rep)
+            item["hid_desc"] = f"8B 键盘 key={cmd.key} code=0x{code:02X}"
+            item["serial_json"] = json.dumps(
+                {"op": cmd.op, "key": cmd.key, "hold_ms": cmd.hold_ms},
+                ensure_ascii=False)
+        return item
+
+    def test_plan(self) -> dict:
+        """用一份**影子 FSM** 在当前帧上跑一拍，回答"接下来几步会做什么"。
+
+        为什么用影子而不是线上那个：线上 FSM 有自己的状态（可能正在走位/冷却），
+        直接借来跑会打乱它。影子实例同配置、干跑执行器，结论是"如果现在从扫描
+        开始，它打算这么动" —— 对"我是不是配对了"这个问题，这已经够用。
+        """
+        with self._lock:
+            scene = self._latest_scene
+        if scene is None:
+            return {"ok": False, "reason": "尚无画面（代理未连接或相机未采集）"}
+        from ..config import ExecutorConfig
+        from ..decision.fsm import DecisionEngine
+        from ..executor import DryRunExecutor
+        from ..protocol import Command
+
+        dry = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0,
+                                            max_actions_per_sec=1000))
+        shadow = DecisionEngine(self.cfg.decision, dry)
+        shadow.start()
+        shadow.on_scene(scene)
+        cmds = [Command(**{k: j[k] for k in Command.model_fields if k in j})
+                for j in dry.journal]
+        return {
+            "ok": True,
+            "state": shadow.state.value,
+            "intent": shadow.last_intent,
+            "scene": {
+                "in_game": scene.in_game,
+                "pillars": len(scene.pillars),
+                "aframe": scene.aframe is not None,
+                "rechallenge": scene.rechallenge is not None,
+                "item_list": len(scene.item_list),
+                "ground_labels": len(scene.ground_labels),
+                "monsters": len(scene.monsters),
+            },
+            "commands": [self._hid_preview(c) for c in cmds],
+        }
+
+    def test_send(self, commands: list[dict]) -> dict:
+        """把命令真发给执行器（含 RP2040），返回每条的结果。
+
+        这是**手动测试工具**，不走决策路径：唯一的额外保护是拾取键盲按会被
+        标记 `blind_risk` 并写事件 —— 不拦，因为你可能就是在验证这个键通不通。
+        """
+        from ..protocol import Command
+
+        if not commands:
+            return {"ok": False, "reason": "没有要发送的命令"}
+        pickup = (self.cfg.decision.pickup_key or "a").lower()
+        results = []
+        for raw in commands[:12]:
+            try:
+                cmd = Command(**{k: v for k, v in raw.items()
+                                 if k in Command.model_fields})
+            except Exception as e:  # noqa: BLE001
+                results.append({"ok": False, "error": f"命令格式错误: {e}"})
+                continue
+            preview = self._hid_preview(cmd)
+            blind_risk = (cmd.op in ("key_tap", "key_down")
+                          and (cmd.key or "").lower() == pickup)
+            if blind_risk:
+                ev = {"ts": time.time(), "state": self.fsm.state.value,
+                      "event": "manual_pickup_test", "key": cmd.key}
+                self.fsm.events.append(ev)
+                if len(self.fsm.events) > 400:
+                    del self.fsm.events[:-200]
+                self._emit_event_log(ev)
+            ok = self.executor.execute(cmd)
+            preview["ok"] = bool(ok)
+            preview["blind_risk"] = bool(blind_risk)
+            results.append(preview)
+        return {"ok": True, "sent": sum(1 for r in results if r.get("ok")),
+                "results": results}
 
     def annotated_jpeg(self, quality: int | None = None) -> bytes | None:
         """带检测标注的 JPEG（仪表盘用）。"""
@@ -279,6 +579,12 @@ class Hub:
     def control(self, action: str) -> dict:
         if action == "start":
             self.fsm.start()
+            self._started_at = time.time()
+            self._auto_stopped = False
+            self._vision_lost_since = 0.0
+            self._vision_lost_reason = ""
+            self._last_pick_ts = 0.0
+            self._no_pick_since = 0.0
         elif action == "stop":
             self.fsm.stop()
         elif action == "panic":

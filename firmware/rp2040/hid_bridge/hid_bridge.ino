@@ -187,7 +187,8 @@ static bool handle_line(const String& line) {
     }
     ms_report[1] = (button == "right") ? 0x02 : 0x01;
     usb_hid.sendReport(2, ms_report, sizeof(ms_report));
-    delay(45);
+    // 按压时长由主机下发（人类化：55-135ms 随机）；缺省回落 45ms 兼容旧客户端
+    delay(constrain(hold_ms > 0 ? hold_ms : 45, 10, 500));
     ms_report[1] = 0;
     usb_hid.sendReport(2, ms_report, sizeof(ms_report));
     send_json(Serial, true);

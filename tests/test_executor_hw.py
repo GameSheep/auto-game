@@ -97,8 +97,11 @@ def test_rpi5_hidg_executor_report_sequence(monkeypatch, tmp_path):
     ex.execute(Command(op="mouse_click", button="left", x=960, y=540))
     assert len(ms.written) == 3, "点击 = 移动 + 按下 + 抬起"
     move, down, up = ms.written
-    assert (move[1] | (move[2] << 8)) == (down[1] | (down[2] << 8)) == \
-        (960 * 32767 // 1919), "移动与按下应同坐标"
+    mx, my = move[1] | (move[2] << 8), move[3] | (move[4] << 8)
+    assert (mx, my) == (down[1] | (down[2] << 8), down[3] | (down[4] << 8)), \
+        "移动与按下必须同坐标（否则光标会跳回原点）"
+    # 落点允许人类化偏差（endpoint_jitter_px 默认 2px，换算到 16bit 约 ±35）
+    assert abs(mx - 960 * 32767 // 1919) <= 64, "落点偏差应在人类化范围内"
     assert down[0] == 0x01 and up[0] == 0x00, "左键按下/抬起"
 
     ex.execute(Command(op="key_tap", key="a", hold_ms=30))
@@ -139,15 +142,16 @@ def test_rp2040_json_framing(fake_serial_module):
     ex = RP2040Executor(cfg)
     ex.execute(Command(op="key_tap", key="a", hold_ms=70))
     ex.execute(Command(op="mouse_click", button="left", x=800, y=600))
-    assert len(ex._ser.lines) == 2
     line1 = json.loads(ex._ser.lines[0])
     assert line1 == {"op": "key_tap", "key": "a", "hold_ms": 70}
     assert ex._ser.lines[0].endswith("\n"), "JSON 行协议必须换行结尾"
-    line2 = json.loads(ex._ser.lines[1])
-    assert line2 == {"op": "mouse_click", "button": "left", "x": 800, "y": 600}
+    # 鼠标命令可能是多点轨迹（WindMouse），最后一帧必须落在点击上
+    line2 = json.loads(ex._ser.lines[-1])
+    assert line2["op"] == "mouse_click" and line2["button"] == "left"
+    assert abs(line2["x"] - 800) <= 2 and abs(line2["y"] - 600) <= 2, "落点偏差应很小"
     # 急停帧
     ex.panic()
-    assert json.loads(ex._ser.lines[2]) == {"op": "stop_all"}
+    assert json.loads(ex._ser.lines[-1]) == {"op": "stop_all"}
     ex.close()
 
 
@@ -162,3 +166,29 @@ def test_rp2040_keymap_finite_and_covers_fsm_keys():
     # 固件 JSON 协议键码映射（hid_bridge.ino KEYMAP）与 hidg 键位映射一致性抽查
     ino = (RPi5HidgExecutor.__module__, )
     assert km["f5"] == 0x3E and km["esc"] == 0x29 and km["space"] == 0x2C
+
+
+def test_rate_limit_follows_config_hot_update():
+    """限速参数必须跟随配置热更新。
+
+    回归：ActionRateLimiter 曾在构造时把 min/max 复制成标量，
+    配置页把「执行速度」拖到另一档后，限速器仍按启动时的旧值工作 ——
+    界面显示已保存，实际动作节奏没变。
+    """
+    cfg = ExecutorConfig()
+    from autogame.executor import DryRunExecutor
+    ex = DryRunExecutor(cfg)
+    try:
+        assert ex._limiter.max_per_sec == cfg.max_actions_per_sec
+        assert abs(ex._limiter.min_interval - cfg.min_action_interval_ms / 1000) < 1e-9
+
+        # 模拟配置页保存：原地改 cfg（apply_patch 就是这么做的）
+        cfg.max_actions_per_sec = 3
+        cfg.min_action_interval_ms = 90
+
+        # 下一条命令就该用新值
+        ex.execute(Command(op="key_tap", key="a"))
+        assert ex._limiter.max_per_sec == 3
+        assert abs(ex._limiter.min_interval - 0.09) < 1e-9
+    finally:
+        ex.close()

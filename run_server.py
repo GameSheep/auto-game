@@ -40,6 +40,38 @@ def _load_dashboard() -> str:
     return (ROOT / "web" / "dashboard.html").read_text(encoding="utf-8")
 
 
+def _lan_ips() -> list[str]:
+    """本机对外的 IPv4 地址，用于打印「从别的电脑该用哪个地址」。
+
+    部署在小主机（RK3566 等）上时，用户是在自己电脑上打开配置页的，
+    提示 127.0.0.1 只会点错地方，所以启动时直接把局域网地址打出来。
+    """
+    import socket
+
+    ips: list[str] = []
+
+    # 1) UDP 连一下外网地址查出口网卡（不实际发包，不会产生流量）
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.append(ip)
+    except OSError:
+        pass
+
+    # 2) 补上其它网卡（多网口 / docker 网桥 / 无默认路由的情况）
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except OSError:
+        pass
+
+    return ips
+
+
 def _ensure_port_free(host: str, port: int) -> None:
     """启动前探测端口；被占用时给出可执行的排查命令并退出。
 
@@ -90,7 +122,7 @@ def main() -> None:
     pipeline = VisionPipeline(cfg.vision)
     hub = Hub(cfg, executor, pipeline)
 
-    app = create_app(cfg, hub, _load_dashboard())
+    app = create_app(cfg, hub, _load_dashboard(), config_path=str(args.config))
 
     # 端口占用检查：先自己探测再启动，否则 uvicorn 在后台报错、前台仍打印
     # "服务端已启动"，用户会以为启动成功（真实踩过的坑：旧进程占着 8765）。
@@ -102,11 +134,27 @@ def main() -> None:
     )
     server = uvicorn.Server(config)
 
-    url = f"http://{'127.0.0.1' if cfg.server.host == '0.0.0.0' else cfg.server.host}:{cfg.server.port}"
+    port = cfg.server.port
     print("=" * 62)
-    print(f"  autogame 服务端  {url}")
-    print(f"  仪表盘: {url}/  （Token 见 .token 文件或 AUTOGAME_TOKEN）")
-    print(f"  代理连接: ws://<游戏PC> → {url}/ws/agent?token=<token>")
+    if cfg.server.host in ("0.0.0.0", "::", ""):
+        ips = _lan_ips()
+        local = f"http://127.0.0.1:{port}"
+        print(f"  autogame 服务端  监听 {cfg.server.host}:{port}（局域网可访问）")
+        print(f"  配置页: {local}/settings")
+        if ips:
+            print(f"          http://{ips[0]}:{port}/settings   ← 从别的电脑/手机用这个")
+            for ip in ips[1:3]:
+                print(f"          http://{ip}:{port}/settings")
+        else:
+            print(f"          http://<本机局域网IP>:{port}/settings   ← 从别的电脑/手机用这个")
+        print(f"  仪表盘: {local}/")
+        print(f"  代理连接: ws://<游戏PC> → {f'http://{ips[0]}' if ips else local}/ws/agent?token=<token>")
+    else:
+        url = f"http://{cfg.server.host}:{port}"
+        print(f"  autogame 服务端  {url}")
+        print(f"  配置页: {url}/settings")
+        print(f"  仪表盘: {url}/")
+        print(f"  代理连接: ws://<游戏PC> → {url}/ws/agent?token=<token>")
     print(f"  执行器: {cfg.executor.backend}  采集fps: {cfg.capture.fps}")
     print("=" * 62)
 
