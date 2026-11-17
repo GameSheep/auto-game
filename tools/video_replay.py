@@ -32,9 +32,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from autogame.config import DecisionConfig, ExecutorConfig, VisionConfig  # noqa: E402
+from autogame.config import load_config  # noqa: E402
 from autogame.decision.fsm import DecisionEngine  # noqa: E402
 from autogame.executor import DryRunExecutor  # noqa: E402
+from autogame.executor.base import ExecutorConfig  # noqa: E402
 from autogame.protocol import Command, format_command  # noqa: E402
 from autogame.vision.auto_calib import auto_hsv_ranges  # noqa: E402
 from autogame.vision.detector import Detector, ROOT_TEMPLATES  # noqa: E402
@@ -88,6 +89,8 @@ def main() -> None:
     parser.add_argument("--aframe-template", default=None,
                         help="A框/拾取提示模板（真实游戏提示样式，配合光柱判定按A）")
     parser.add_argument("--max-min", type=float, default=10.0, help="最多回放分钟数")
+    parser.add_argument("--config", default=str(ROOT / "config.yaml"),
+                        help="部署配置（默认用线上那套，避免验证的不是生产参数）")
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -103,7 +106,8 @@ def main() -> None:
     if not ok:
         raise SystemExit("视频无帧")
     ranges = auto_hsv_ranges(first)
-    cfg = VisionConfig()
+    app_cfg = load_config(args.config)
+    cfg = app_cfg.vision
     if ranges:
         cfg.hsv = {f"auto{i}": r for i, r in enumerate(ranges)}
     print(f"[标定] {len(ranges)} 个色簇: "
@@ -114,7 +118,7 @@ def main() -> None:
         cfg.aframe.template_threshold = 0.8
     det = Detector(cfg, ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
     ex = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000))
-    eng = DecisionEngine(DecisionConfig(tick_hz=args.hz), ex)
+    eng = DecisionEngine(app_cfg.decision.model_copy(update={"tick_hz": args.hz}), ex)
     eng.start()
     random.seed(2026)
 
