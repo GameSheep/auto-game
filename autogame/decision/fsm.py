@@ -27,6 +27,9 @@ from pathlib import Path
 from typing import Callable
 
 from ..config import DecisionConfig
+from ..decision.actions import ActionRegistry
+from ..decision.arbiter import Arbiter
+from ..decision.knowledge import KnowledgeBase
 from ..decision.llm_advisor import LLMAdvisor
 from ..decision.recovery import ProgressMonitor, RecoveryLadder, StallSignals
 from ..decision.supervisor import Supervisor, Verdict
@@ -38,6 +41,19 @@ from ..protocol import Command, Pillar, SceneState
 log = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parents[2]
+
+
+def _knowledge_dir(cfg) -> Path:
+    """经验库目录：profile 指定优先，否则落在默认 profile 下。
+
+    不放到仓库根，是为了让"一个游戏一个目录"这条约定不出例外 ——
+    否则用户会看到根的 knowledge/ 和 profiles/<id>/knowledge/ 两份，不知道该填哪个。
+    """
+    raw = str(getattr(cfg, "knowledge_dir", "") or "").strip()
+    if raw:
+        p = Path(raw)
+        return p if p.is_absolute() else _ROOT / p
+    return _ROOT / "profiles" / "generic_1280x720" / "knowledge"
 
 # 目标匹配容差 & 拉黑半径（像素）
 TARGET_MATCH_TOL_PX = 70
@@ -62,7 +78,8 @@ class DecisionEngine:
                  advisor: LLMAdvisor | None = None,
                  on_event: Callable[[dict], None] | None = None,
                  vlm: VisionAdvisor | None = None,
-                 supervisor: Supervisor | None = None) -> None:
+                 supervisor: Supervisor | None = None,
+                 arbiter: Arbiter | None = None) -> None:
         self.cfg = cfg
         self.exec = executor
         self.advisor = advisor or LLMAdvisor(cfg.llm)
@@ -96,6 +113,7 @@ class DecisionEngine:
             "supervisor_blocks": 0,     # 被监督层拦下的命令数（shadow 下恒 0）
             "supervisor_takeovers": 0,  # 监督层接管次数（esc/reset_stage）
             "supervisor_panics": 0,     # 监督层停车次数
+            "arbiter_actions": 0,       # 三级裁决实际执行的动作数（shadow 下恒 0）
         }
         # 自主性：看门狗 + 恢复阶梯 + 视觉顾问
         self.monitor = ProgressMonitor(cfg.autonomy)
@@ -106,6 +124,15 @@ class DecisionEngine:
         self.vlm.frame_source = self._current_frame
         # LLM 监督层：对账"动作有没有用"，有权踩刹车（默认 shadow，不真的拦）
         self.supervisor = supervisor or Supervisor(cfg.supervisor, root=_ROOT)
+        # 三级裁决：经验直出 → laya 从能力清单里选 → 都不行才问大模型。
+        # 行为清单必须由 action_table() 提供实现，清单里没有实现的动作执行不了，
+        # 所以 registry 只描述、FSM 才拥有"能不能做"的最终解释权。
+        self.actions = ActionRegistry()
+        self.kb = KnowledgeBase(_knowledge_dir(cfg.arbiter))
+        self.arbiter = arbiter or Arbiter(cfg.arbiter, self.actions, self.kb, root=_ROOT)
+        self._scene: SceneState | None = None
+        self._last_action_at = 0.0
+        self._arbiter_paused_until = 0.0
         self.recovery = RecoveryLadder(
             cfg.autonomy, self.vlm, self.advisor,
             forbidden_keys={cfg.pickup_key},  # 铁律：恢复动作永不按拾取键
@@ -201,6 +228,8 @@ class DecisionEngine:
         # 人工复位时一并清掉监督层结论：否则那条 panic 会挂到 ttl 到期，
         # 复位后每帧又被拦，看起来像"复位没用"。
         self.supervisor.reset()
+        self.arbiter.reset()
+        self._last_action_at = 0.0
         self._emit_event("panic_reset")
 
     # ------------- 主 tick -------------
@@ -215,6 +244,7 @@ class DecisionEngine:
             return
         now = self._frame_time(scene.ts_ms)
         self._now = now
+        self._scene = scene
         if self._need_monitor_reset:
             self.monitor.reset(now)
             self._need_monitor_reset = False
@@ -255,6 +285,12 @@ class DecisionEngine:
             self._drop_target("loading")
             return
         self._loading_hold_emitted = False
+
+        # ---- 三级裁决：只在快通道答不上来时介入（闲置/未标定/连续落空） ----
+        # 认得就自己做（上面那些规则），认不得才问。它返回的是一条高层动作，
+        # 由 action_table() 翻译成本机的真实操作，绝不接受模型给的坐标。
+        if self._tick_arbiter(scene, now):
+            return
 
         if not scene.in_game:
             self._tick_gated(scene, now, signals)
@@ -366,6 +402,132 @@ class DecisionEngine:
                 self._intent("监督层要重开，但画面没有『再次挑战』，改为观察")
         else:
             self._intent(f"监督层接管：暂停观察（{reason or '等一帧'}）")
+        return True
+
+    # ------------- 三级裁决（arbiter） -------------
+
+    def _arb_probe(self, scene: SceneState) -> dict:
+        """给裁决层的实测快照。字段名与 knowledge.fingerprint 对齐。
+
+        多出来的这几个字段不是为了给模型看，是给**指纹**用的：
+        同一个界面在不同帧的像素完全不同，唯一稳定的匹配依据就是这些定性特征。
+        """
+        p = self._sup_probe(scene)
+        p.update({
+            "gate_reason": str(getattr(scene, "gate_reason", "") or ""),
+            "pillars": len(scene.pillars or []),
+            "monsters": len(scene.monsters or []),
+            "w": scene.w, "h": scene.h,
+            "nav_enabled": bool(self.cfg.nav_enabled),
+            "rechallenge_visible": self._last_rechallenge is not None,
+            "intent": self.last_intent,
+            "miss_streak": int(self.supervisor.last_health.get("miss_streak", 0) or 0),
+        })
+        return p
+
+    def action_table(self) -> dict[str, Callable[[], bool]]:
+        """行为清单的实现端 —— 注册表描述"叫什么"，这里决定"真能不能做"。
+
+        为什么把映射留在 FSM：动作需要访问内部状态（当前目标、走位等待窗口、
+        上次看到的按钮位置）。如果让注册表自己实现，它会不得不把 FSM 的一大半
+        状态复制一遍，然后两份状态开始漂移。
+        """
+        return {
+            "pickup": self._arb_pickup,
+            "approach_nearest": self._arb_approach,
+            "attack_nearest": self._arb_attack,
+            "explore": self._arb_explore,
+            "navigate": self._arb_navigate,
+            "rechallenge": self._arb_rechallenge,
+            "esc": self._arb_esc,
+            "wait": self._arb_wait,
+            "reset_stage": self._arb_rechallenge,   # 同一入口：点『再次挑战』
+        }
+
+    def _arb_pickup(self) -> bool:
+        self._tap_pickup(self._now)
+        return True
+
+    def _arb_approach(self) -> bool:
+        scene, now = self._scene, self._now
+        if scene is None:
+            return False
+        tgt = self._target or self._pick_target(scene, now)
+        if tgt is None:
+            return False
+        self._target = tgt
+        self._move_toward(scene, tgt, now, first=True)
+        return True
+
+    def _arb_attack(self) -> bool:
+        if self._scene is None:
+            return False
+        return self._maybe_attack_monster(self._scene, self._now)
+
+    def _arb_explore(self) -> bool:
+        if self._scene is None:
+            return False
+        return self._maybe_explore(self._scene, self._now)
+
+    def _arb_navigate(self) -> bool:
+        if self._scene is None:
+            return False
+        self._maybe_navigate(self._scene, self._now)
+        return True
+
+    def _arb_rechallenge(self) -> bool:
+        btn = self._last_rechallenge
+        if btn is None:
+            return False
+        self._act(Command(op="mouse_click", button="left", x=btn[0], y=btn[1]))
+        return True
+
+    def _arb_esc(self) -> bool:
+        # 未标定的画面不许按 ESC：它可能是没标定的战斗画面，一按就进暂停菜单。
+        # 这条规则以前在 _tick_gated 里，现在裁决层也能发 ESC，所以必须在这里再挡一次。
+        if self._scene is not None and str(getattr(self._scene, "gate_reason", "")) == "unmatched":
+            return False
+        self._act(Command(op="key_tap", key=self.cfg.autonomy.escape_key, hold_ms=60))
+        return True
+
+    def _arb_wait(self) -> bool:
+        return True
+
+    def _tick_arbiter(self, scene: SceneState, now: float) -> bool:
+        """问裁决层：现在该做什么。返回 True = 本帧已由它处理。
+
+        关键：arbiter.tick() 不会阻塞。模型在后台跑，这一帧该干什么还干什么。
+        """
+        if self.arbiter.cfg.mode == "off":
+            return False
+        if now < self._arbiter_paused_until:
+            return False
+        idle_s = (now - self._last_action_at) if self._last_action_at else 0.0
+        call = self.arbiter.tick(self._arb_probe(scene), now,
+                                 idle_s=max(0.0, idle_s), intent=self.last_intent)
+        if call is None:
+            return False
+        fn = self.action_table().get(call.action_id)
+        if fn is None:
+            # 清单和实现对不上 = 代码 bug。拒绝执行并留痕，不要静默失败。
+            log.error("裁决动作没有实现: %s（清单与 action_table 不同步）", call.action_id)
+            self._emit_event("arbiter_missing_impl", action=call.action_id)
+            self._arbiter_paused_until = now + 30.0
+            return False
+        try:
+            ok = bool(fn())
+        except Exception:  # noqa: BLE001
+            log.exception("裁决动作执行异常: %s", call.action_id)
+            ok = False
+        if not ok:
+            # 执行不了（比如没有目标/没有按钮）：不记对账，否则会污染经验库
+            self._emit_event("arbiter_noop", action=call.action_id)
+            return False
+        self.arbiter.execute_hook(call, self._arb_probe(scene), now)
+        self.stats["arbiter_actions"] += 1
+        self._emit_event("arbiter_action", action=call.action_id,
+                         stage=call.stage, reason=call.reason[:120])
+        self._intent(f"三级裁决[{call.stage}] {call.action_id}：{call.reason or '模型选择'}")
         return True
 
     def _tick_gated(self, scene: SceneState, now: float, signals: StallSignals) -> None:
@@ -889,6 +1051,8 @@ class DecisionEngine:
             self.monitor.note_action(self._now)
             self.human.note_action(self._now)
             self.supervisor.note_command(self._now)
+            # 裁决层的闲置判据：真的发出命令才算"动了"，被拦下的不算
+            self._last_action_at = self._now
         return ok
 
     def _emit_move_keys(self, keys: list[str], hold_ms: int) -> int:
@@ -1361,6 +1525,7 @@ class DecisionEngine:
             },
             "vlm": self.vlm.snapshot(),
             "supervisor": self.supervisor.snapshot(),
+            "arbiter": self.arbiter.snapshot(),
             "humanize": self.human.snapshot(),
             "llm": {
                 "enabled": self.cfg.llm.enabled,

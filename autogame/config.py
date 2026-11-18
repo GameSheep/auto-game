@@ -424,6 +424,67 @@ class SupervisorConfig(BaseModel):
                             description="每条裁决落盘（把模型输出变成回归用例的原料）")
 
 
+class ArbiterModelConfig(BaseModel):
+    """一个模型端点。arbiter 用两份：laya（快、便宜）和 planner（慢、能想）。"""
+
+    provider: Literal["ollama", "openai"] = "ollama"
+    base_url: str = "http://127.0.0.1:11434"
+    model: str = "qwen2.5:3b"
+    timeout_s: float = Field(10.0, ge=2.0, le=120.0)
+    api_key: Optional[str] = None
+    api_key_env: str = "AUTOGAME_ARBITER_KEY"
+
+
+class ArbiterConfig(BaseModel):
+    """三级裁决配置 —— 认得就自己做，拿不准问小模型，小模型也不会才问大模型。
+
+    三级的分工（顺序就是代价从低到高）：
+      L0 经验直出   已验证的经验命中 → 直接执行，0 次模型调用
+      L1 laya       把「系统已支持的行为清单」递过去，让它选一个（单选，enum 约束）
+      L2 planner    清单里都不合适 → 自由规划，但每一步仍要能翻译回清单原动作
+
+    两个模型端点分开配，是因为这两个活的难度差一个量级：选一个已有动作用 3B
+    足够快；而"看明白一个没见过的局面该干什么"需要更大的模型。混用会两头不讨好。
+
+    mode 默认 shadow：照常判断、照常请求、照常记账，但**不执行**。
+    这个层会真的发命令，比 supervisor 危险，所以先跑一段看它的日志。
+    """
+
+    mode: Literal["off", "shadow", "enforce"] = "shadow"
+
+    # 快选择器：从固定选项里挑一个，小模型够用、要快
+    laya: ArbiterModelConfig = Field(default_factory=lambda: ArbiterModelConfig(
+        model="qwen2.5:3b", timeout_s=8.0))
+    # 慢规划器：自由推理，给更大模型、给更长时间
+    planner: ArbiterModelConfig = Field(default_factory=lambda: ArbiterModelConfig(
+        provider="openai", base_url="https://api.deepseek.com",
+        model="deepseek-chat", timeout_s=30.0))
+
+    # 经验库位置：空 → profiles/<当前 profile>/knowledge（和人写的 game.md 同目录）
+    knowledge_dir: str = ""
+
+    # 什么时候才允许打扰模型（都不满足就一声不吭，规则自己跑）
+    cooldown_s: float = Field(20.0, ge=1.0, description="两次裁决最小间隔")
+    idle_trigger_s: float = Field(8.0, ge=2.0, description="无事可做多少秒后求助")
+    unmatched_trigger_s: float = Field(15.0, ge=5.0, description="画面未标定持续多少秒后求助")
+    miss_trigger: int = Field(3, ge=2, description="动作连续落空多少次后求助")
+
+    # 效力
+    min_confidence: float = Field(0.55, ge=0.0, le=1.0,
+                                  description="低于此值不执行，升级到下一级")
+    verify_horizon_s: float = Field(4.0, ge=1.0, le=20.0, description="执行后多久对账")
+    plan_ttl_s: float = Field(10.0, ge=2.0, le=60.0, description="计划有效期（过期丢弃）")
+
+    # 保命：等模型时不许站着挨打
+    keepalive_after_s: float = Field(2.5, ge=0.5, description="闲置多久后允许保命动作插一脚")
+    keepalive_interval_s: float = Field(2.0, ge=0.5, description="保命动作最小间隔")
+
+    # 预算
+    failure_threshold: int = Field(3, ge=1)
+    cooldown_after_failure_s: float = Field(180.0, ge=10.0)
+    audit_path: str = Field("logs/arbiter.jsonl", description="每次裁决落盘（含 shadow 想执行什么）")
+
+
 class AutonomyConfig(BaseModel):
     """自主性配置 —— 进度看门狗 + 分级恢复阶梯 + 空闲策略。
 
@@ -689,6 +750,8 @@ class DecisionConfig(BaseModel):
     vlm: "VLMConfig" = Field(default_factory=lambda: VLMConfig())
     # LLM 监督层：看预测-实测对账，判断"这串动作有没有用"，有权踩刹车
     supervisor: "SupervisorConfig" = Field(default_factory=lambda: SupervisorConfig())
+    # 三级裁决：认得就自己做 → 问 laya 从清单里选 → 都不行才问大模型
+    arbiter: "ArbiterConfig" = Field(default_factory=lambda: ArbiterConfig())
     # 拟人化行为（疲劳/反应时间/走神/社交噪音）—— 降短期统计风险，非安全方案
     humanize: "HumanizeConfig" = Field(default_factory=lambda: HumanizeConfig())
     # 走位等待：把"点地面→人物走过去→A框出现→按拾取键"拆成显式多步
@@ -939,6 +1002,15 @@ def load_config(path: str | os.PathLike | None = None,
         if isinstance(vision, dict):
             vision.setdefault("reference_resolution", list(prof.reference_resolution))
             vision.setdefault("templates_dir", str(prof.templates_dir))
+        # 经验库跟着 profile 走：和人工整理的 game.md 放在同一个 knowledge 目录，
+        # 用户明确要求"这次行为作为经验存储出来，和我最开始整理的游戏内容放一起"。
+        decision = data.setdefault("decision", {})
+        if isinstance(decision, dict):
+            arb = decision.setdefault("arbiter", {})
+            # 注意用"值为空才填"而不是 setdefault：config.yaml 里显式写了
+            # knowledge_dir: ""（表示"跟着 profile 走"），setdefault 会当成已有值跳过。
+            if isinstance(arb, dict) and not str(arb.get("knowledge_dir") or "").strip():
+                arb["knowledge_dir"] = str(prof.root / "knowledge")
     if path:
         p = Path(path)
         overlay = runtime_overlay_path(p)

@@ -167,6 +167,41 @@ decision:
     panic_confirm: 2           # 停车要连续 2 次一致（防单次幻觉）
     audit_path: logs/supervisor.jsonl
 
+  # 三级裁决：认得就自己做 → 拿不准问 laya（从动作清单里选）→ 都不行才问大模型
+  arbiter:
+    mode: shadow               # off / shadow（只记账不执行）/ enforce
+    # 快选择器：只从固定清单里挑一个，小模型够用，要快
+    laya:
+      provider: ollama
+      base_url: http://127.0.0.1:11434
+      model: qwen2.5:3b
+      timeout_s: 8.0
+    # 慢规划器：自由推理"这局面该怎么办"，给更大的模型
+    planner:
+      provider: openai
+      base_url: https://api.deepseek.com
+      model: deepseek-chat
+      timeout_s: 30.0
+      api_key_env: AUTOGAME_ARBITER_KEY
+    # 经验库：留空 = profiles/<当前profile>/knowledge（和人工整理的 game.md 同目录）
+    knowledge_dir: ""
+    # 什么时候才允许打扰模型（都不满足就一声不吭让规则自己跑）
+    cooldown_s: 20.0           # 两次裁决最小间隔
+    idle_trigger_s: 8.0        # 无事可做多少秒后求助
+    unmatched_trigger_s: 15.0  # 画面未标定持续多少秒后求助
+    miss_trigger: 3            # 动作连续落空多少次后求助
+    # 效力
+    min_confidence: 0.55       # 低于此值不执行，升级到下一级
+    verify_horizon_s: 4.0      # 执行后多久对账（决定经验升不升级）
+    plan_ttl_s: 10.0           # 计划有效期，过期丢弃（局面变了就别按老计划走）
+    # 保命：等模型时不许站着挨打
+    keepalive_after_s: 2.5
+    keepalive_interval_s: 2.0
+    # 预算
+    failure_threshold: 3
+    cooldown_after_failure_s: 180.0
+    audit_path: logs/arbiter.jsonl
+
   # ---------------- 走位等待（动作链：点一下 ≠ 走到位） ----------------
   # 真实链路：点地面 → 人物在游戏里走过去（1-3s）→ 进到一定距离 → A框出现 → 按拾取键。
   # 开启后走位期间不重复点击，而是观察"画面是否在动 + 距离是否真的缩短"。
