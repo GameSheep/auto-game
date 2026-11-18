@@ -36,7 +36,7 @@ sys.path.insert(0, str(ROOT))
 from autogame.config import load_config  # noqa: E402
 from autogame.profile import load_profile  # noqa: E402
 from autogame.teach import load_lessons  # noqa: E402
-from autogame.teach_crop import ROLE_LABEL, _parse_set, run  # noqa: E402
+from autogame.teach_crop import ROLE_LABEL, _parse_set, roi_advice, run  # noqa: E402
 
 
 def _dw(s: str) -> int:
@@ -114,12 +114,9 @@ def main() -> int:
 
     if report.roi_suggest:
         cur = report.roi_current
-        same = cur and list(cur) == list(report.roi_suggest)
         print(f"建议匹配 ROI：{report.roi_suggest}"
               f"　（现在 profile.yaml 写的是 {cur or '（没写）'}）")
-        if not same:
-            print("　→ 有差别就更新 vision.scene_gate.roi。ROI 太小会把模板自己裁掉一角，"
-                  "分数骤降会被误读成「模板不管用」。")
+        print(f"　→ {roi_advice(report.roi_suggest, cur)}")
 
     if report.warnings:
         print()
