@@ -417,6 +417,46 @@ walk_no_progress / walk_settles`。探索（无目标时点地面）走同一条
 「像光柱但不是」的清单、截图规范见 [docs/游戏术语与参考图.md](docs/游戏术语与参考图.md)，
 换机器接手见 [docs/交接-2026-11-17.md](docs/交接-2026-11-17.md)。
 
+## 换游戏：profiles —— 引擎不动，只换标定
+
+`autogame/` 里的检测、决策、走位、执行**不区分游戏**。区分游戏的只有
+`profiles/<id>/` 里的三样东西：战斗 HUD 长什么样、哪些界面绝不能动手、目标物在屏幕上是什么样。
+
+```
+profiles/
+  README.md            # 三步操作手册（放什么 → 我算什么 → 怎么验）
+  _template/           # 新游戏脚手架，cp -r 改个名就能用
+  generic_1280x720/    # 仓库默认（复用根 templates/ 与 assets/ref/labels.json）
+  tli_phone960/        # 火炬之光手机端 960x432，带完整标定范例
+    profile.yaml       # 元信息 + 对该游戏的 config 覆盖
+    templates/         # gate_pos_*.png 正向锚点 / gate_neg_*.png 反例 / _index.json
+    labels.json        # 本游戏的人工标答台账
+    inbox/  refs/      # 待标定截图 / 已标定截图
+```
+
+```bash
+# 探针：逐张出分数 + 列出所有「像光柱」的色块（带坐标和高宽比）+ 待办清单
+python tools/profile_init.py --profile tli_phone960
+
+# 按台账核对（strict 不符即 exit 1，CI 也在跑）
+python tools/ref_check.py --profile tli_phone960
+
+# 生产
+python run_server.py --config config.yaml --profile tli_phone960
+```
+
+**分工是硬性的**：界面的类别（这是战斗/这是星图/这是背包）由人给，工具不猜；
+"拿哪块像素当证据"由我出候选，但必须过分数裁决——正向模板要在**所有**战斗帧
+≥0.6、所有菜单帧明显更低，反例反过来。过不了就换一块，不调阈值硬凑。
+
+真踩过的三个坑（都写进了测试）：
+
+| 坑 | 现象 | 现在怎么防 |
+|---|---|---|
+| 默认 ROI 是"底部 35% 全宽" | 手机端技能在右下角，不传 `--roi` 分数从 0.99 掉到 0.3，像"模板失效" | `profile.yaml` 显式给 `scene_gate.roi` |
+| 把 `template_base_width` 改成录制分辨率 | 模板是 1280 归一化存储的，改成 960 后反例从 1.00 掉到 0.41，菜单拦不住 | `tests/test_profile.py` 断言它恒为 1280 |
+| 先做正例再做反例 | 门禁反例优先，正例先上等于给菜单发通行证 | `profile_init` 的待办清单把反例排第一 |
+
 ## 快速开始（本机模拟闭环，无需游戏）
 
 ```bash
