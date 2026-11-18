@@ -297,11 +297,17 @@ def test_game_md_block_replaced_not_duplicated(prof):
                           probe=_probe_stub({}))
     kdir = prof.root / "knowledge"
     write_game_md(res, kdir)
+    write_game_md(res, kdir)      # 第一次会把手写文件的尾部空行规整掉，第二拍才是稳态
     first = (kdir / "game.md").read_text(encoding="utf-8")
-    write_game_md(res, kdir)
+    for _ in range(5):
+        write_game_md(res, kdir)
     second = (kdir / "game.md").read_text(encoding="utf-8")
     assert second.count("<!-- teach:begin") == 1
     assert first.count("<!-- teach:begin") == 1
+    # 字节级幂等，不只是"块没重复"：块尾若是 "\n" + tail 直接拼，每跑一次就多
+    # 一个空行，跑十次十个，文件看不出问题但 diff 里全是噪声。
+    assert len(second) == len(first), (
+        f"重跑改变了文件长度（{len(first)} → {len(second)}），尾部空行在累积")
 
 
 def test_game_md_keeps_human_text_outside_block(prof):

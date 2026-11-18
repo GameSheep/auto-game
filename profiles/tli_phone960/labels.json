@@ -21,7 +21,7 @@
         "monsters": 0,
         "commands": 0
       },
-      "note": "整屏关卡选择：左上『‹ 异界』+ 7 个发光地图节点，没有任何掉落光柱。曾被判成战斗并输出『向右下移动接近 auto2 掉落光柱 距离237px』。现由反例模板 gate_neg_nether_map.png（星图标题块）命中 1.00 拦下。"
+      "note": "整屏关卡选择：左上『‹ 异界』+ 7 个发光地图节点，没有任何掉落光柱。曾被判成战斗并输出『向右下移动接近 auto2 掉落光柱 距离237px』。现由反例模板 gate_neg_nether_title.png（星图标题块）命中 1.00 拦下——这块是 tools/teach_crop.py 从手册的『在: 左上角标题块』自动量出来的。"
     },
     {
       "file": "refs/tli_combat_01.jpg",

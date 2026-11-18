@@ -5,8 +5,31 @@
     "rect": [
       640,
       255,
-      900,
-      390
-    ]
+      260,
+      135
+    ],
+    "note": "战斗（异界深处）｜由 tools/teach_crop.py 自动量得"
+  },
+  "gate_pos_boss.png": {
+    "base_width": 1280,
+    "source": "tli_combat_02.jpg",
+    "rect": [
+      600,
+      233,
+      317,
+      199
+    ],
+    "note": "战斗（Boss 光环 + 满屏特效）｜由 tools/teach_crop.py 自动量得"
+  },
+  "gate_neg_nether_title.png": {
+    "base_width": 1280,
+    "source": "tli_nether_map_01.jpg",
+    "rect": [
+      0,
+      0,
+      300,
+      80
+    ],
+    "note": "异界星图（关卡选择）｜由 tools/teach_crop.py 自动量得"
   }
 }

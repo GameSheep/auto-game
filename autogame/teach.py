@@ -96,7 +96,8 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "count": ("数量", "几束", "count"),
     "confusable": ("不是", "别当成", "易混淆", "别认成", "confusable"),
     "note": ("备注", "note", "说明"),
-    "pos": ("位置", "在哪", "pos"),
+    "pos": ("位置", "在哪", "pos", "在", "方位", "方向", "画面位置"),
+    "tpl_name": ("模板名", "文件名", "name", "slug", "tpl"),
 }
 
 # 键位动作 → (decision 下的点路径, 别名)。路径为空 = 配置里没这个概念，单独报。
@@ -518,32 +519,23 @@ def _check_scene(c: Claim, img_path: Path, run: Callable, row: dict) -> dict:
     else:
         row["status"] = "fail"
         if want:
-            row["detail"] = ("你说这是战斗页，程序没认出来 → 缺一块固定 HUD 锚点"
-                             "（用 make_template 裁一块 gate_pos_*.png）")
+            row["detail"] = ("你说这是战斗页，程序没认出来 → 缺一块固定 HUD 锚点。"
+                             "跑 tools/teach_crop.py 会自动从这张图量出 "
+                             "gate_pos_*.png，不用手写坐标")
         else:
             row["detail"] = ("你说这不是战斗页，程序却放行了 → 会在这里乱按键，"
-                             "需要一块反例模板 gate_neg_*.png")
+                             "需要一块反例模板 gate_neg_*.png"
+                             "（tools/teach_crop.py 会挑一张只有这张菜单才有的静态块）")
     return row
 
 
-def _check_object(c: Claim, img_path: Path, cfg: Any, row: dict) -> dict:
-    rect = c.rect
-    img = _read_img(img_path)
-    if img is None:
-        row["status"] = "gap"
-        row["detail"] = f"图读不出来：{img_path.name}"
-        return row
-    if rect is None:
-        row["status"] = "gap"
-        row["detail"] = ("缺框：这是整帧里的一块，得告诉我它在哪。"
-                         "加一行 `- 框: x,y,w,h`（左上角坐标 + 宽高）")
-        return row
+def judge_object(m: dict, cfg: Any) -> list[str]:
+    """拿一块量出来的尺寸/颜色去和生产阈值比，返回不通过的原因。
 
-    m = measure_region(img, rect, cfg)
-    row["evidence"] = (f"{m['w']}x{m['h']}px 高宽比={m['aspect']} "
-                       f"主色={m['color'] or '未知'}({m['color_fill']:.0%}) "
-                       f"亮部={m['bright']:.0%}")
-
+    单独抽出来是因为有两个调用方：`_check_object`（核对手册标的框）和
+    `teach_crop`（从文档自动量出一束光柱后再判一次）。两边必须用同一套阈值
+    和同一句话术，否则"手册说能检出、自动量说检不出"会互相打脸。
+    """
     min_asp = float(getattr(cfg, "pillar_min_aspect", 2.5))
     max_asp = float(getattr(cfg, "pillar_max_aspect", 15.0))
     min_w = int(getattr(cfg, "pillar_min_width", 2))
@@ -562,7 +554,33 @@ def _check_object(c: Claim, img_path: Path, cfg: Any, row: dict) -> dict:
         problems.append(f"面积 {area}px² < 阈值 {min_area}")
     if not m["color"] or m["color_fill"] < 0.08:
         problems.append("色相不落在任何已配置的颜色区间（hsv 里没这个色）")
+    return problems
 
+
+def _check_object(c: Claim, img_path: Path, cfg: Any, row: dict) -> dict:
+    rect = c.rect
+    img = _read_img(img_path)
+    if img is None:
+        row["status"] = "gap"
+        row["detail"] = f"图读不出来：{img_path.name}"
+        return row
+    if rect is None:
+        where = c.get("pos").strip()
+        row["status"] = "gap"
+        if where:
+            row["detail"] = (f"有方位（『{where}』）但没量出框。"
+                             f"跑 tools/teach_crop.py 会自动量，不用手写坐标")
+        else:
+            row["detail"] = ("缺框：这是整帧里的一块，得告诉我它在哪。"
+                             "加一行 `- 在: 右下角`，或者直接给 `- 框: x,y,w,h`")
+        return row
+
+    m = measure_region(img, rect, cfg)
+    row["evidence"] = (f"{m['w']}x{m['h']}px 高宽比={m['aspect']} "
+                       f"主色={m['color'] or '未知'}({m['color_fill']:.0%}) "
+                       f"亮部={m['bright']:.0%}")
+
+    problems = judge_object(m, cfg)
     if problems:
         row["status"] = "fail"
         row["detail"] = "按现在的判据检不出来：" + "；".join(problems)
@@ -572,7 +590,8 @@ def _check_object(c: Claim, img_path: Path, cfg: Any, row: dict) -> dict:
     return row
 
 
-_NON_ACTION_FIELDS = ("file", "verdict", "recognize", "todo", "rect", "note")
+_NON_ACTION_FIELDS = ("file", "verdict", "recognize", "todo", "rect", "note",
+                      "pos", "tpl_name")
 
 
 def _decision_attr(cfg: Any, path: str) -> str:
@@ -687,7 +706,7 @@ def build_md_block(lessons: list[Lesson]) -> str:
         out += ["### 键位", ""]
         for c in keys:
             for k, v in c.fields.items():
-                if k in ("file", "verdict", "recognize", "todo", "rect", "note"):
+                if k in _NON_ACTION_FIELDS:
                     continue
                 out.append(f"- {k}：{v}")
         out.append("")
@@ -815,7 +834,12 @@ def write_game_md(res: TeachResult, knowledge_dir: Path) -> Path:
     if HEAD_BEGIN in old and HEAD_END in old:
         head, rest = old.split(HEAD_BEGIN, 1)
         _, tail = rest.split(HEAD_END, 1)
-        new = head.rstrip() + "\n\n" + block + "\n" + tail
+        # 块尾的空行必须先 normalize 再拼：直接 "\n" + tail 会让每跑一次多一个
+        # 空行，跑十次就是十个——文件看不出来，diff 里全是噪声。
+        tail_body = tail.strip("\n")
+        new = head.rstrip() + "\n\n" + block + "\n"
+        if tail_body.strip():
+            new += "\n" + tail_body.rstrip() + "\n"
     else:
         sep = "\n\n" if old.strip() else ""
         new = old.rstrip() + sep + block + "\n"
@@ -883,7 +907,9 @@ def write_report(res: TeachResult, out_dir: Path, profile_id: str) -> Path:
 
     lines += ["", "---", "",
               "重新编译：`py -3.12 tools/teach.py --profile " + profile_id + "`",
-              "核对一致：`py -3.12 tools/teach.py --profile " + profile_id + " --check`"]
+              "核对一致：`py -3.12 tools/teach.py --profile " + profile_id + " --check`",
+              "把「界面」段变成模板（不用手写坐标，出 preview.html 供核对）："
+              "`py -3.12 tools/teach_crop.py --profile " + profile_id + "`"]
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return p
 
