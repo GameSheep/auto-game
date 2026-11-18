@@ -1,0 +1,7 @@
+version: 1
+howto:
+- 这是二次进化产出的一代配方。改了要重跑 tools/evolve.py --build 才生效。
+- when 里的事实字段只能是 autogame/evolve.py 的 FACTS 里那几个；动作只能是动作注册表里有的。写错会被整份拒绝，不是静默跳过。
+- 顺序即优先级：第一条命中的规则生效。
+- 没有标答的材料不会进这里，只进 knowledge/ 的文字。
+rules: []

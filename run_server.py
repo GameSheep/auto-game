@@ -137,7 +137,8 @@ def main() -> None:
     pipeline = VisionPipeline(cfg.vision)
     hub = Hub(cfg, executor, pipeline)
 
-    app = create_app(cfg, hub, _load_dashboard(), config_path=str(args.config))
+    app = create_app(cfg, hub, _load_dashboard(), config_path=str(args.config),
+                     profile=prof)
 
     # 端口占用检查：先自己探测再启动，否则 uvicorn 在后台报错、前台仍打印
     # "服务端已启动"，用户会以为启动成功（真实踩过的坑：旧进程占着 8765）。

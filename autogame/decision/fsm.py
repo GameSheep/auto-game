@@ -415,6 +415,12 @@ class DecisionEngine:
         p = self._sup_probe(scene)
         p.update({
             "gate_reason": str(getattr(scene, "gate_reason", "") or ""),
+            # 这三个是二次进化的规则要用的。必须在这里显式给：规则引用的事实
+            # 若在 probe 里不存在，会求值成 unknown 然后静默不生效，人只会看到
+            # "我写的规则没反应"，而原因藏在这一层。
+            "in_game": bool(scene.in_game),
+            "aframe": scene.aframe is not None,
+            "ground_labels": len(scene.ground_labels or []),
             "pillars": len(scene.pillars or []),
             "monsters": len(scene.monsters or []),
             "w": scene.w, "h": scene.h,

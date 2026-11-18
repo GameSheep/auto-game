@@ -72,6 +72,7 @@ _PLANNER_SYSTEM = (
 
 class Stage(str, Enum):
     KNOWLEDGE = "l0_knowledge"   # 经验直出
+    RULE = "l05_rule"            # 本代规则命中（二次进化的产物）
     LAYA = "l1_laya"             # 小模型从清单里选
     PLANNER = "l2_planner"       # 大模型自由规划
     KEEPALIVE = "keepalive"      # 等答案期间的保命动作
@@ -119,6 +120,11 @@ class Arbiter:
         self._root = Path(root) if root else Path.cwd()
         self._caller = caller  # 测试注入；默认走 llm_client.chat
 
+        # 二次进化产出的规则。加载失败只会得到空集（并大声报错），不会抛 ——
+        # 规则坏了不该把整个决策链拖down，退化成"只用经验 + 模型"照样能跑。
+        from ..evolve import RuleSet
+        self.rules = RuleSet.load(getattr(cfg, "rules_path", "") or "")
+
         self._busy = False
         self._queue: list[Call] = []
         self._pending: list[_Pending] = []
@@ -136,7 +142,7 @@ class Arbiter:
             "asks": 0, "l1_hits": 0, "l1_others": 0, "l2_plans": 0,
             "l2_rejected": 0, "executed": 0, "verified_hit": 0,
             "verified_miss": 0, "keepalive": 0, "shadow_would_run": 0,
-            "expired": 0, "fail": 0, "tripped": 0,
+            "expired": 0, "fail": 0, "tripped": 0, "rule_hits": 0,
         }
 
     # ---------------- 主入口（每帧，非阻塞） ----------------
@@ -161,6 +167,25 @@ class Arbiter:
                 if call is not None:
                     return self._may_return(call)
 
+        # L0.5：这一代进化出来的规则。**放在问模型之前**，因为它零成本：
+        # 规则是本地求值，不花一次推理。门槛也故意低得多（1.5s vs 8s）——
+        # "FSM 停手 1.5 秒"通常意味着它没主意了，这时候一条写好的策略比
+        # 等模型 8 秒有用得多。
+        #
+        # 为什么不无条件优先于 FSM：规则写错会让整个角色行为跑偏，而 FSM 的
+        # 启发式是跑过大量回归的。让规则只在 FSM 停手时接上，是"补位"不是"夺权"。
+        #
+        # 规则也不受 cooldown_s / _open_until 限制：那两个是保护模型带宽的，
+        # 而规则不占带宽。用它们卡规则只会让"我刚写的规则怎么没反应"更难解释。
+        if self.rules and idle_s >= float(getattr(self.cfg, "rule_idle_s", 1.5)):
+            hit = self.rules.decide(probe)
+            if hit is not None:
+                with self._lock:
+                    self.stats["rule_hits"] += 1
+                return self._may_return(self._emit(
+                    hit["action"], hit["params"], Stage.RULE, "",
+                    f"规则 {hit['rule_id']}（FSM 停手 {idle_s:.1f}s）", now))
+
         trigger = self._need_help(probe, idle_s, now)
         if not trigger:
             return None
@@ -173,6 +198,9 @@ class Arbiter:
                 exp.action_id, params, Stage.KNOWLEDGE, exp.id,
                 f"已验证经验（hit {exp.hits}/miss {exp.misses}）", now))
 
+        # 规则命中的动作不进对账队列：对账验的是"这条经验在这个情境下对不对"，
+        # 规则没有 exp_id 可归因。它的效果靠 supervisor 的 hold/miss 统计体现，
+        # 复盘时看 audit 里 stage=l05_rule 那批。
         self._ask(fp, probe, now, trigger, idle_s, intent)
         return self._may_return(self._keep_alive(probe, now))
 

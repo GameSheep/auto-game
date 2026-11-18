@@ -463,6 +463,16 @@ class ArbiterConfig(BaseModel):
     # 经验库位置：空 → profiles/<当前 profile>/knowledge（和人写的 game.md 同目录）
     knowledge_dir: str = ""
 
+    # 规则接管的门槛：FSM 停手多少秒后允许本代规则介入。
+    # 故意远小于 idle_trigger_s（8s）：规则不花推理，等 8 秒才用毫无意义。
+    # 也不能接近 0 —— 那会变成规则跟 FSM 抢每一帧，写错一条就整体跑偏。
+    rule_idle_s: float = 1.5
+
+    # 当前生效那代的可执行规则（profiles/<id>/evolve/gen-XXX/rules.yaml）。
+    # 空 = 没有进化过，只用经验 + 模型。这里由 profile 注入，不要手写死路径：
+    # 换 profile 时手写路径会指向上一款游戏的规则，那比没有规则更糟。
+    rules_path: str = ""
+
     # 什么时候才允许打扰模型（都不满足就一声不吭，规则自己跑）
     cooldown_s: float = Field(20.0, ge=1.0, description="两次裁决最小间隔")
     idle_trigger_s: float = Field(8.0, ge=2.0, description="无事可做多少秒后求助")
@@ -1011,6 +1021,16 @@ def load_config(path: str | os.PathLike | None = None,
             # knowledge_dir: ""（表示"跟着 profile 走"），setdefault 会当成已有值跳过。
             if isinstance(arb, dict) and not str(arb.get("knowledge_dir") or "").strip():
                 arb["knowledge_dir"] = str(prof.root / "knowledge")
+            # 规则同样跟着 profile 走：指向 active 指针那代的 rules.yaml。
+            # 没有 active（还没进化过）就留空，RuleSet.load 会返回空集。
+            if isinstance(arb, dict) and not str(arb.get("rules_path") or "").strip():
+                ptr = prof.root / "evolve" / "active"
+                if ptr.exists():
+                    gid = ptr.read_text(encoding="utf-8").strip()
+                    if gid:
+                        rp = prof.root / "evolve" / gid / "rules.yaml"
+                        if rp.exists():
+                            arb["rules_path"] = str(rp)
     if path:
         p = Path(path)
         overlay = runtime_overlay_path(p)

@@ -173,6 +173,21 @@ td.num{width:64px} td.ck{width:28px;text-align:center}
 .hist li .t{color:var(--muted);flex:none;font-variant-numeric:tabular-nums}
 .hist li .m{margin-left:auto;color:var(--muted);font-size:11px;flex:none}
 
+/* ---------- 进化页 ---------- */
+/* 这里的列表项要竖排（条目 + 原因 + 补法三行），不能沿用 .hist li 的横排 flex。
+   混用会变成"为什么"和"怎么补"挤在同一行右侧，读起来像一串注释。 */
+#page-evolve .hist{max-height:none}
+#page-evolve .hist li{display:block;line-height:1.55}
+#page-evolve .hist li .m{float:right;margin-left:10px}
+.badge{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:4px;
+  background:var(--soft);color:var(--muted);margin-right:6px;vertical-align:1px}
+.badge.ok{background:rgba(22,163,74,.12);color:#15803d}
+.badge.bad{background:rgba(220,38,38,.12);color:var(--bad)}
+.sub{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.6}
+.sub.fix{color:var(--accent)}
+#page-evolve code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--soft);
+  border-radius:3px;padding:0 4px;font-size:11.5px}
+
 /* switch */
 .switch{position:relative;display:inline-flex;align-items:center;cursor:pointer;flex:none}
 .switch input{position:absolute;opacity:0;width:0;height:0}
@@ -197,6 +212,7 @@ td.num{width:64px} td.ck{width:28px;text-align:center}
     <button data-page="params" class="on">参数</button>
     <button data-page="camera">摄像头</button>
     <button data-page="alert">告警</button>
+    <button data-page="evolve">进化</button>
   </nav>
   <div class="spacer"></div>
   <div class="save-state"><span class="dot" id="dot"></span><span id="saveTxt">已就绪</span></div>
@@ -296,6 +312,35 @@ td.num{width:64px} td.ck{width:28px;text-align:center}
   <div class="card">
     <div class="sec-hd">最近告警</div>
     <ul class="hist" id="hist"><li class="muted">暂无记录</li></ul>
+  </div>
+</section>
+
+<!-- ============ 进化 ============ -->
+<section class="page" id="page-evolve">
+  <div class="card">
+    <div class="sec-hd">当前这一代</div>
+    <div class="rowbar" style="margin-bottom:10px">
+      <span class="lbl" id="evGen">—</span>
+      <div style="flex:1"></div>
+      <button class="btn" id="evRefresh">刷新</button>
+      <button class="btn" id="evRollback" title="设备上没有 git，学坏了就靠这个回到上一版">退回上一代</button>
+      <button class="btn primary" id="evRun">学一遍</button>
+    </div>
+    <p class="hint" style="margin:0 0 10px">
+      改了截图或玩法描述之后点「学一遍」：先体检材料，再编手册、出规则、跑回归，
+      全部通过才换到新的一代。不通过就停在原地，并告诉你哪一条退化了。
+    </p>
+    <div id="evNeeds"></div>
+  </div>
+
+  <div class="card">
+    <div class="sec-hd">它认为还缺什么</div>
+    <ul class="hist" id="evWanted"><li class="muted">暂无信号（说明还没跑够，或日志里没有异常）</li></ul>
+  </div>
+
+  <div class="card">
+    <div class="sec-hd">代数记录</div>
+    <ul class="hist" id="evGens"><li class="muted">还没有任何一代</li></ul>
   </div>
 </section>
 </main>
@@ -864,6 +909,106 @@ function refreshAlerts(){
   }).catch(()=>{});
 }
 
+
+/* ============ 二次进化 ============ */
+/* 这一页回答三个问题：我现在是第几代、材料够不够学、学坏了怎么退。
+   刻意不在这里放"手改阈值"——那是参数页的事。这里的动作只有两个：
+   把我给的材料学一遍（过回归才生效），或者退回去。 */
+let EV=null;
+
+function evNeeds(audit){
+  const rows=(audit.needs||[]).map(n=>{
+    const ok=n.ok;
+    const tag=ok?'<span class="badge ok">够</span>'
+      :(n.blocking?'<span class="badge bad">缺</span>':'<span class="badge">可选</span>');
+    return `<li>${tag} <b>${esc(n.what)}</b>
+      <span class="m">有 ${n.have} / 需 ${n.need}</span>
+      ${ok?'':`<div class="sub">${esc(n.why)}</div><div class="sub fix">→ ${esc(n.fix)}</div>`}</li>`;
+  }).join("");
+  let extra="";
+  if((audit.unused_images||[]).length){
+    extra+=`<li><span class="badge">注意</span> <b>有 ${audit.unused_images.length} 张图手册没引用</b>
+      <div class="sub">这些图程序不会看。在手册里写 <code>- 图: refs/名字</code> 并给判定，才会进教学范围。</div>
+      <div class="sub">${audit.unused_images.slice(0,6).map(esc).join("、")}${audit.unused_images.length>6?" …":""}</div></li>`;
+  }
+  if((audit.duplicates||[]).length){
+    extra+=`<li><span class="badge">注意</span> <b>${audit.duplicates.length} 组图看起来重复</b>
+      <div class="sub">${audit.duplicates.slice(0,3).map(esc).join("；")}</div>
+      <div class="sub">同一帧截两次不算"两张不同样本"。</div></li>`;
+  }
+  $("evNeeds").innerHTML=`<ul class="hist">${rows}${extra}</ul>`;
+}
+
+function refreshEvolve(){
+  $("evGen").textContent="读取中…";
+  api("/api/evolve").then(d=>{
+    if(!d.ok){ $("evGen").textContent="不可用"; toast(d.error||"没有绑定 profile",true); return; }
+    EV=d;
+    const cur=(d.generations||[]).find(g=>g.status==="active");
+    const same=!!(cur&&cur.digest&&cur.digest===d.audit.digest);
+    $("evGen").innerHTML=(d.active
+      ? `当前 <b>${esc(d.active)}</b>　·　${esc(d.audit_summary)}`
+      : `还没进化过　·　${esc(d.audit_summary)}`)
+      + (same?`　<span style="color:var(--muted)">· 材料和这一代一致，改了再学</span>`:"");
+    evNeeds(d.audit||{});
+    // 材料没变就别让人白点一次：指纹一样必然出不了新代，按钮直接说明。
+    $("evRun").disabled=!(d.audit&&d.audit.ready)||same;
+    $("evRun").title=!d.audit||!d.audit.ready?"材料还不够，先按上面的提示补齐"
+      :(same?"材料指纹和当前这代一样，改了截图或手册再来":"");
+    if(same) $("evGen").innerHTML+="";
+    $("evRollback").disabled=!(d.generations||[]).some(g=>g.status==="active"&&g.parent);
+
+    $("evWanted").innerHTML=(d.wanted&&d.wanted.length)
+      ? d.wanted.map(x=>`<li><span class="m">建议</span> <span>${esc(x)}</span></li>`).join("")
+      : '<li class="muted">暂无信号（说明还没跑够，或日志里没有异常）</li>';
+
+    $("evGens").innerHTML=(d.generations||[]).length
+      ? d.generations.slice().reverse().map(g=>{
+          const sc=g.score||{};
+          const frac=sc.strict_total?`${sc.strict_pass}/${sc.strict_total}`:"未验证";
+          const st={active:"在用",rejected:"被拒",retired:"已退役",candidate:"待验证",baseline:"基线"}[g.status]||g.status;
+          return `<li><span class="t">${esc(g.id)}</span>
+            <span><b>${esc(st)}</b>　台账 ${esc(frac)}${g.rules_source==="model"?"　· 有规则":""}</span>
+            <span class="m">${esc((g.note||"").slice(0,60))}</span></li>`;
+        }).join("")
+      : '<li class="muted">还没有任何一代</li>';
+  }).catch(e=>{ $("evGen").textContent="读不到"; toast(e.message,true); });
+}
+
+function evBusy(on,text){
+  const b=$("evRun"); b.disabled=on; b.textContent=on?(text||"正在学…"):"学一遍";
+}
+
+$("evRefresh").onclick=refreshEvolve;
+
+$("evRun").onclick=()=>{
+  evBusy(true,"体检 + 回归中…（几十秒）");
+  saveState("","正在跑回归");
+  post("/api/evolve/run",{}).then(r=>{
+    if(r.stage && r.stage!=="promote"){
+      toast(r.message||"没出代",true);
+    }else{
+      const sc=r.score||{};
+      const line=`台账 ${sc.strict_pass}/${sc.strict_total}`;
+      toast((r.promoted?("已上线："+line):("未上线："+(r.message||line))),!r.promoted);
+    }
+    if((r.fail||[]).length){
+      console.warn("回归失败项",r.fail);
+    }
+    saveState(r.promoted?"ok":"warn", r.promoted?"已换到新的一代":"停在原地");
+    refreshEvolve();
+  }).catch(e=>{ toast(e.message,true); saveState("err","失败"); })
+    .finally(()=>evBusy(false));
+};
+
+$("evRollback").onclick=()=>{
+  if(!confirm("退回上一代？上一代的规则和模板会立刻接管，运行中的程序不用重启。")) return;
+  post("/api/evolve/rollback",{}).then(r=>{
+    toast(r.message||(r.ok?"已退回":"退回失败"),!r.ok);
+    refreshEvolve();
+  }).catch(e=>toast(e.message,true));
+};
+
 /* ============ 页面切换 / 启动 ============ */
 function switchPage(p){
   $$("#nav button").forEach(x=>x.classList.toggle("on",x.dataset.page===p));
@@ -871,6 +1016,7 @@ function switchPage(p){
   const el=$("page-"+p); if(el)el.classList.add("on");
   if(p==="camera"){startStream();refreshCalib();}
   if(p==="alert")refreshAlerts();
+  if(p==="evolve")refreshEvolve();
   if(location.hash!=="#"+p) history.replaceState(null,"","#"+p);
 }
 $$("#nav button").forEach(b=>b.onclick=()=>switchPage(b.dataset.page));

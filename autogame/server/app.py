@@ -13,6 +13,7 @@ import json
 import logging
 import time
 from pathlib import Path as _Path
+from typing import Any
 
 import cv2
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -38,7 +39,7 @@ _CFG: AppConfig | None = None
 
 
 def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
-               config_path: str = "") -> FastAPI:
+               config_path: str = "", profile: Any = None) -> FastAPI:
     global _HUB, _CFG
     _HUB = hub
     _CFG = cfg
@@ -303,6 +304,62 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
             log.info("配置已更新 %d 项: %s", len(res["changed"]),
                      ", ".join(res["changed"][:8]))
         return JSONResponse({"ok": True, "saved": saved, **res})
+
+    # ---------------- 二次进化 ----------------
+
+    @app.get("/api/evolve")
+    async def evolve_state(request: Request) -> JSONResponse:
+        """当前代数、材料体检、它认为缺什么。页面刷新用。"""
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile（单游戏模式）"})
+        from .. import evolve as ev
+
+        audit = await asyncio.to_thread(ev.audit_materials, profile)
+        wanted_path = ev.evolve_root(profile) / "wanted.json"
+        wanted = {}
+        if wanted_path.exists():
+            try:
+                wanted = json.loads(wanted_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                wanted = {}
+        return JSONResponse({
+            "ok": True,
+            "profile": profile.id,
+            "active": ev.active_id(profile),
+            "generations": [g.to_dict() for g in ev.list_generations(profile)],
+            "audit": audit.to_dict(),
+            "audit_summary": audit.summary(),
+            "wanted": wanted.get("asks") or [],
+            "history": ev.history(profile, limit=8),
+        })
+
+    @app.post("/api/evolve/run")
+    async def evolve_run(request: Request) -> JSONResponse:
+        """吃材料出一代并过回归。跑在后台线程：回归要动检测器和 FSM，几十秒。"""
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import evolve as ev
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        use_model = bool(body.get("use_model", True))
+        res = await asyncio.to_thread(ev.evolve, profile, cfg,
+                                     force=bool(body.get("force")), use_model=use_model)
+        return JSONResponse({"ok": bool(res.get("ok")), **res})
+
+    @app.post("/api/evolve/rollback")
+    async def evolve_rollback(request: Request) -> JSONResponse:
+        """退回上一代。事故现场的第一动作，所以它必须比"重新进化"更快。"""
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import evolve as ev
+
+        ok, msg = await asyncio.to_thread(ev.rollback, profile)
+        return JSONResponse({"ok": ok, "message": msg, "active": ev.active_id(profile)})
 
     @app.post("/api/preset/{name}")
     async def apply_named_preset(name: str, request: Request) -> JSONResponse:

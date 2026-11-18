@@ -60,3 +60,10 @@ assets/aframe_template_check.png
 
 # 教学编译产物（teach.py 每次重跑都会重写，源头是 lessons/*.md）
 profiles/*/teach/
+
+# 自我纠正信号（每次扫日志都重写，不承载状态）
+profiles/*/evolve/wanted.json
+# 注意：profiles/*/evolve/gen-*/ **要**入库。那不是缓存，是"当前装的是哪一代配方"。
+# 回滚靠的就是这些目录 + active 指针；删了它们，设备上学坏之后无处可退。
+# 里的 knowledge/ 也要留：那一代的知识快照是行为的一部分，而 lessons/*.md
+# 已经改过了，事后无法重建出当时那份。
