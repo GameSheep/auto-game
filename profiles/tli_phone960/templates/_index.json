@@ -1,0 +1,12 @@
+{
+  "gate_pos_skillwheel.png": {
+    "base_width": 1280,
+    "source": "tli_combat_01.jpg",
+    "rect": [
+      640,
+      255,
+      900,
+      390
+    ]
+  }
+}

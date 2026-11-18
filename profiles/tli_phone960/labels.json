@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "updated": "2026-11-18",
+  "howto": [
+    "火炬之光：无限 手机端录屏（960x432）的标答台账。file 相对本 profile 目录解析。",
+    "strict=true 必须完全对上，不符就是回归失败（tools/ref_check.py --profile tli_phone960 退出码 1）。",
+    "strict=false 是已知缺口，只打印差异不拦——缺口要看得见，不要为了让测试变绿改成 true。",
+    "补界面类型：背包/角色面板/结算各截 1~2 张丢进 inbox/，把反例裁出来再加一条 strict。"
+  ],
+  "items": [
+    {
+      "file": "refs/tli_nether_map_01.jpg",
+      "game": "火炬之光：无限（手机端 960x432）",
+      "scene": "异界 · 关卡选择（星图）",
+      "strict": true,
+      "expect": {
+        "in_game": false,
+        "pillars": 0,
+        "aframe": false,
+        "ground_labels": 0,
+        "monsters": 0,
+        "commands": 0
+      },
+      "note": "整屏关卡选择：左上『‹ 异界』+ 7 个发光地图节点，没有任何掉落光柱。曾被判成战斗并输出『向右下移动接近 auto2 掉落光柱 距离237px』。现由反例模板 gate_neg_nether_map.png（星图标题块）命中 1.00 拦下。"
+    },
+    {
+      "file": "refs/tli_combat_01.jpg",
+      "game": "火炬之光：无限（手机端 960x432）",
+      "scene": "战斗 · 异界深处（右下技能轮盘 + 左下摇杆）",
+      "strict": true,
+      "expect": {
+        "in_game": true,
+        "pillars": null,
+        "commands": 2
+      },
+      "note": "战斗：右下技能轮盘 + 左下摇杆。正例锚点 gate_pos_skillwheel.png 来自本帧 (640,255)-(900,390)，在 ROI [600,235,360,197] 内自匹配 0.99、另一张战斗帧 0.88、星图 0.28。"
+    },
+    {
+      "file": "refs/tli_combat_02.jpg",
+      "game": "火炬之光：无限（手机端 960x432）",
+      "scene": "战斗 · Boss 光环 + 满屏技能特效",
+      "strict": true,
+      "expect": {
+        "in_game": true,
+        "pillars": null,
+        "commands": 2
+      },
+      "note": "战斗：Boss 光环 + 满屏技能特效。正例 0.88 放行；同时是『技能特效当光柱』的压力样本——粉色光环若被确认为光柱就是误报，当前检出 1 个 pink 光柱需人工确认是否是特效。"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+# 新游戏脚手架：复制整个目录改名为 profiles/<你的游戏id>，再改下面几行。
+#
+#   cp -r profiles/_template profiles/my_game
+#
+# 然后：截图丢进 inbox/，在 deliveries.md 里写"每张该判成什么"，
+# 再跑 `py -3.12 tools/profile_init.py --profile my_game` 出分数表。
+
+id: _template
+name: 在这里写游戏名（例如：某游戏 · PC 模拟器）
+game: ""
+status: uncalibrated          # uncalibrated / partial / calibrated
+
+# 你截图的原始宽高。所有像素坐标（HUD 排除区、各 ROI）都按这个尺寸书写，
+# 运行时按实际帧等比换算——所以同一份 profile 在别的分辨率上也大致可用。
+reference_resolution: [1920, 1080]
+
+# 相对本目录的路径覆盖。留空 = 用 ./templates 和 ./labels.json。
+# templates_dir: ../../templates
+# labels: ../../assets/ref/labels.json
+
+# 对这个游戏的 config 覆盖（与仓库根 config.yaml 同构，只写和默认不一样的部分）。
+config:
+  vision:
+    # 哪些矩形区域不可能是地面掉落物（小地图/技能栏/聊天/血条）。[x, y, w, h]
+    # 坐标按上面的 reference_resolution 书写。
+    hud_exclusions:
+      - [0, 0, 300, 260]        # 左上：小地图 + 任务追踪
+      - [0, 900, 700, 180]      # 左下：聊天/输入
+      - [1560, 640, 360, 440]   # 右下：技能栏
+      - [1500, 0, 420, 100]     # 右上：Buff/功能栏
+    # 光柱颜色（HSV，OpenCV 口径 H:0-179 S/V:0-255）。金色品质掉落：
+    # hsv:
+    #   gold: [[18, 120, 180], [35, 255, 255]]
+    # 只捡这些颜色（对应上面 hsv 的键），空 = 全捡：
+    # whitelist_colors: [gold]

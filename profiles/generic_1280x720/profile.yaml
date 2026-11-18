@@ -1,0 +1,15 @@
+# 仓库自带默认 profile：PC 模拟器 1280x720。
+# 复用仓库根的 templates/ 与 assets/ref/labels.json，所以这里没有自己的素材。
+# 换游戏请不要改这里，复制 _template 新建一个。
+
+id: generic_1280x720
+name: 通用 PC 模拟器 1280x720（仓库自带默认）
+game: ""
+status: calibrated
+reference_resolution: [1280, 720]
+
+templates_dir: ../../templates
+labels: ../../assets/ref/labels.json
+
+# 不覆盖任何配置：等同直接 `python run_server.py --config config.yaml`。
+config: {}

@@ -55,7 +55,8 @@ def measure(frame, det: Detector, engine: DecisionEngine, tick_hz: float) -> dic
     }
 
 
-def run(labels_path: Path, only: str = "", verbose: bool = False) -> int:
+def run(labels_path: Path, only: str = "", verbose: bool = False,
+        profile_id: str | None = None) -> int:
     """核对整本台账，返回 strict 不符条数（0 = 全对）。"""
     if not labels_path.exists():
         raise SystemExit(f"没有台账: {labels_path}")
@@ -63,13 +64,26 @@ def run(labels_path: Path, only: str = "", verbose: bool = False) -> int:
     items = [it for it in data.get("items", [])
              if only in it.get("file", "")]
 
-    cfg = load_config(str(ROOT / "config.yaml")).vision
+    prof = None
+    if profile_id:
+        from autogame.profile import load_profile
+        prof = load_profile(profile_id)
+
+    cfg = load_config(str(ROOT / "config.yaml"), profile=prof).vision
+    tdir = prof.templates_dir if prof else (ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
     tick_hz = 2.0
     strict_fail = 0
     strict_total = 0
 
+    def _resolve(rel: str) -> Path:
+        """先按仓库根解析，再按台账所在目录解析（profile 台账里写 refs/xxx.jpg）。"""
+        p = ROOT / rel
+        if p.exists():
+            return p
+        return labels_path.parent / rel
+
     for it in items:
-        path = ROOT / it["file"]
+        path = _resolve(it["file"])
         frame = cv2.imread(str(path))
         if frame is None:
             print(f"[缺图] {it['file']}")
@@ -77,7 +91,7 @@ def run(labels_path: Path, only: str = "", verbose: bool = False) -> int:
             strict_total += 1 if it.get("strict") else 0
             continue
 
-        det = Detector(cfg, ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
+        det = Detector(cfg, tdir)
         ex = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000))
         eng = DecisionEngine(DecisionConfig(tick_hz=tick_hz), ex)
         eng.start()
@@ -116,11 +130,21 @@ def run(labels_path: Path, only: str = "", verbose: bool = False) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="参考图台账核对")
-    ap.add_argument("--labels", default=str(LABELS))
+    ap.add_argument("--labels", default="", help="台账路径（默认仓库 assets/ref/labels.json）")
+    ap.add_argument("--profile", default="",
+                    help="按 profiles/<id>/ 跑：用它的台账与模板目录")
     ap.add_argument("--only", default="", help="只跑文件名包含该子串的条目")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
-    return 1 if run(Path(args.labels), args.only, args.verbose) else 0
+
+    labels = Path(args.labels) if args.labels else LABELS
+    if args.profile:
+        from autogame.profile import load_profile
+        prof = load_profile(args.profile)
+        if not args.labels:
+            labels = prof.labels_path
+        print(f"profile: {prof.id}  台账 {labels}  模板 {prof.templates_dir}")
+    return 1 if run(labels, args.only, args.verbose, args.profile or None) else 0
 
 
 if __name__ == "__main__":

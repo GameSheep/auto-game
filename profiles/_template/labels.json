@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "updated": "2026-11-18",
+  "howto": [
+    "这是本 profile 的人工标答台账：截图是你给的、答案是你说对的，程序跑出什么就打印什么，逐字段对比。",
+    "加一帧：截图放进 refs/（或直接引用仓库相对路径），在 items 里加一条；expect 只写你能确定的字段，其余用 null = 不检查。",
+    "strict=true：必须完全对上，不符就是回归失败（tools/ref_check.py --profile <id> 退出码 1）。",
+    "strict=false：已知缺口，只打印差异不拦。**不要为了让测试变绿把它改成 true。**",
+    "字段：in_game=是否战斗界面；pillars=掉落光柱个数；aframe=是否有拾取提示框；ground_labels=地面掉落文字标签数；monsters=可打怪数；commands=2 个决策节拍内产生的指令条数。",
+    "生成骨架：py -3.12 tools/profile_init.py --profile <id>（会把 inbox 里的图逐张跑一遍探针，expect 留 null 等你填）。"
+  ],
+  "items": []
+}
