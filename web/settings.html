@@ -626,7 +626,7 @@ const GROUPS=[
    ]},
 
   {key:"ai", title:"AI 顾问",
-   desc:"卡住时让模型看一眼画面、决定下一步",
+   desc:"卡住时看一眼画面；平时盯着结果有没有变好",
    sections:[
     {title:"视觉模型 VLM · 看图", fields:[
       {p:"decision.vlm.enabled", label:"启用视觉模型", type:"bool", help:"卡住时截图发给模型"},
@@ -653,6 +653,27 @@ const GROUPS=[
       {p:"decision.llm.trigger_abandons", label:"触发阈值", type:"num", min:1,max:20,step:1, unit:"次",
        help:"连续放弃多少次后咨询模型"},
       {p:"decision.llm.cooldown_s", label:"冷却时间", type:"num", min:0.5,max:600,step:1, unit:"s"},
+    ]},
+    {title:"监督层 · 判断结果", fields:[
+      {p:"decision.supervisor.mode", label:"工作方式", type:"select",
+       options:[["off","关闭"],["shadow","只观察（不拦）"],["enforce","真的拦"]],
+       help:"必须从「只观察」开始：先跑几小时看它想拦什么，确认每条都对再放开。直接开「真的拦」等于让一个没验证过的模型管你的号"},
+      {p:"decision.supervisor.base_url", label:"服务地址", type:"text", wide:true,
+       help:"纯文本模型就够（喂的是数字对账，不是截图），可以和上面共用同一个 Ollama"},
+      {p:"decision.supervisor.model", label:"模型名", type:"text", wide:true,
+       help:"qwen2.5:7b / llama3.1:8b"},
+      {p:"decision.supervisor.check_interval_s", label:"体检节拍", type:"num", min:1,max:60,step:1, unit:"s",
+       help:"多久对一次账（纯本地、不花钱）。发现问题才去问模型"},
+      {p:"decision.supervisor.miss_streak_trigger", label:"落空几次就问", type:"num", min:2,max:20,step:1, unit:"次",
+       help:"走位没走近、按了没捡到，连续几次算不正常"},
+      {p:"decision.supervisor.no_progress_trigger_s", label:"空转多久就问", type:"num", min:10,max:600,step:10, unit:"s",
+       help:"一直在动但这么久没捡到东西 —— 最危险的假动作"},
+      {p:"decision.supervisor.takeover_min_confidence", label:"接管要多大把握", type:"num", min:0.5,max:1,step:0.05,
+       help:"低于这个数只能降速/暂停，不许替你按 ESC 或重开关卡"},
+      {p:"decision.supervisor.hold_max_s", label:"单次暂停上限", type:"num", min:1,max:60,step:1, unit:"s",
+       help:"到点自动放行。防止模型误判一次就把你卡死"},
+      {p:"decision.supervisor.min_interval_s", label:"最小调用间隔", type:"num", min:1,max:300,step:1, unit:"s"},
+      {p:"decision.supervisor.max_calls_per_min", label:"每分钟上限", type:"num", min:1,max:30,step:1, unit:"次"},
     ]},
    ]},
 ];
