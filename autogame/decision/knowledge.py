@@ -121,6 +121,7 @@ class KnowledgeBase:
         self._lock = threading.RLock()
         self._items: dict[str, Experience] = {}
         self._game_cache: tuple[float, str] | None = None
+        self._glossary_cache: tuple[float, dict] | None = None
         self._loaded = False
         self.stats = {"recalls": 0, "hits": 0, "remembered": 0, "confirmed": 0,
                       "rejected": 0, "verified": 0}
@@ -151,8 +152,12 @@ class KnowledgeBase:
 
     # ---------------- 人写的部分 ----------------
 
-    def read_game_notes(self, max_chars: int = 2000) -> str:
-        """读 game.md。人写的东西优先于任何模型输出 —— 这是"百分百正确的参考"。"""
+    def read_game_notes(self, max_chars: int = 4000) -> str:
+        """读 game.md。人写的东西优先于任何模型输出 —— 这是"百分百正确的参考"。
+
+        4000 字够放"这个游戏是什么 + 界面表 + 禁忌"。教学编译会往里面塞结构化块，
+        上限太小会让禁忌那段被截掉——而禁忌恰恰是最不能丢的。
+        """
         if not self.game_md.exists():
             return ""
         try:
@@ -166,6 +171,37 @@ class KnowledgeBase:
             return ""
         text = text.strip()
         return text[:max_chars]
+
+    def read_glossary(self) -> dict[str, dict]:
+        """读术语表（tools/teach.py 从教学手册编译出来的黑话对照）。
+
+        为什么要给模型看：用户说"星图""搬砖""A框"，模型对这些词有自己的理解，
+        而用户的理解才是对的。不给对照表，模型就会用通用含义去解释专有黑话，
+        然后给出一个"听起来对但指的不是那个东西"的答案。
+        """
+        p = self.knowledge_dir / "glossary.json"
+        if not p.exists():
+            return {}
+        try:
+            mtime = p.stat().st_mtime
+            if self._glossary_cache and self._glossary_cache[0] == mtime:
+                return self._glossary_cache[1]
+            data = json.loads(p.read_text(encoding="utf-8"))
+            terms = data.get("terms") or {}
+            self._glossary_cache = (mtime, terms)
+            return terms
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def terms_block(self, limit: int = 30) -> str:
+        terms = self.read_glossary()
+        if not terms:
+            return ""
+        lines = [f"- {alias} = {t.get('canonical', '')}"
+                 + (f"（{t['note']}）" if t.get("note") else "")
+                 for alias, t in list(terms.items())[:limit]]
+        return ("## 用户的黑话对照（用户说这些词时，指的是下面的意思）\n"
+                + "\n".join(lines))
 
     # ---------------- 检索 ----------------
 
@@ -283,6 +319,9 @@ class KnowledgeBase:
         notes = self.read_game_notes()
         if notes:
             parts.append("## 人类提供的游戏说明（最高优先级，与之冲突以它为准）\n" + notes)
+        terms = self.terms_block()
+        if terms:
+            parts.append(terms)
         exp = self.recall(fp, limit)
         # 失败的经验单独补进来：它在 recall 里被排除（不许直出），但"这么做没用"
         # 对模型是有价值的约束 —— 否则它会建议一个已经证明无效的做法。
@@ -306,6 +345,7 @@ class KnowledgeBase:
             return {
                 "path": str(self.knowledge_dir),
                 "has_game_notes": self.game_md.exists(),
+                "glossary_terms": len(self.read_glossary()),
                 "total": len(items),
                 "confirmed": sum(1 for e in items if e.status == STATUS_CONFIRMED),
                 "candidate": sum(1 for e in items if e.status == STATUS_CANDIDATE),
