@@ -25,6 +25,8 @@ from autogame.server.app import create_app
 from autogame.server.hub import Hub
 from autogame.vision.pipeline import VisionPipeline
 
+log = logging.getLogger(__name__)
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -100,6 +102,9 @@ def _ensure_port_free(host: str, port: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="autogame 服务端")
     parser.add_argument("--config", default=str(ROOT / "config.yaml"))
+    parser.add_argument("--profile", default="",
+                        help="游戏适配包 id（profiles/<id>/）：决定门禁模板、标答台账、"
+                             "坐标基准。换游戏必须带这个，否则会用错 HUD 模板。")
     parser.add_argument("--sim", action="store_true", help="内置模拟器代理，快速闭环联调")
     parser.add_argument("--nav", action="store_true", help="启用小地图导航（模拟器目标点走位）")
     parser.add_argument("--host", default=None)
@@ -108,7 +113,17 @@ def main() -> None:
     args = parser.parse_args()
 
     _setup_logging()
-    cfg = load_config(args.config)
+    prof = None
+    if args.profile:
+        from autogame.profile import load_profile
+        prof = load_profile(args.profile)
+        log.info("使用 profile: %s  基准 %dx%d  状态 %s  模板 %s",
+                 prof.id, prof.reference_resolution[0], prof.reference_resolution[1],
+                 prof.status, prof.templates_dir)
+        if not prof.is_calibrated:
+            log.warning("profile %s 状态为 %s：门禁可能拦下全部画面（fail_closed）。"
+                        "补齐方式见 profiles/README.md", prof.id, prof.status)
+    cfg = load_config(args.config, profile=prof)
     if args.host:
         cfg.server.host = args.host
     if args.port:

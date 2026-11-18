@@ -47,8 +47,22 @@ class CaptureConfig(BaseModel):
 class VisionConfig(BaseModel):
     """视觉检测配置（服务端）。"""
 
+    # 像素坐标的书写基准：hud_exclusions / 各 ROI / template_base_width 都按它定义，
+    # 运行时按「实际帧尺寸 / 本值」等比换算，于是一份 profile 能覆盖不同分辨率。
+    reference_resolution: list[int] = Field(
+        default_factory=lambda: [1280, 720],
+        description="坐标基准分辨率 [w, h]。换游戏/换录屏分辨率时改这一处，"
+                    "其余坐标仍按习惯的像素值书写。",
+    )
+
     # 角色固定在屏幕中心（ARPG 通用设定，来自对话）
     character_at_center: bool = True
+
+    # 模板目录（门禁锚点/反例/A框）。None = 仓库根 templates/。
+    # 由 profile 自动注入到该游戏的 templates/ —— 换游戏就不该共用一套 HUD 模板。
+    templates_dir: str | None = Field(
+        None, description="视觉模板目录；None=仓库根 templates/（profile 会覆盖它）"
+    )
 
     # 光柱颜色 HSV 阈值（OpenCV H: 0-179, S/V: 0-255）
     hsv: dict[str, list[list[int]]] = Field(
@@ -140,25 +154,39 @@ class SceneGateConfig(BaseModel):
 
     判定顺序（顺序即优先级，negative_templates 命中直接判非战斗）：
       1. 反例模板（整屏 UI：关卡选择/背包/结算/装备面板）任一命中 → in_game=False
-      2. 技能栏模板（skillbar*.png）任一命中 → in_game=True
-      3. 红色生命球结构锚点 → in_game=True
-      4. 一个都没命中 → fail_closed=True 时判 False（未标定的游戏必须拦住）
+      2. 正向锚点模板（gate_pos_*.png，旧名 skillbar*.png）任一命中 → in_game=True
+      3. 一个都没命中 → fail_closed=True 时判 False（未标定的游戏必须拦住）
+
+    只保留"结构类"锚点。历史上试过"技能栏角落有个 Q 字"（q_letter.png）和
+    "红色血球色斑"，两者都在真实画面上大面积误命中，已删除——没有形状判据能
+    分开星图和战斗，只能靠人给的样本。
 
     threshold 0.6 对应半分辨率匹配（实测：战斗帧 ≥0.668，UI 帧 ≤0.26，间隔充足）。
     """
 
     enabled: bool = True
-    template: str = Field("skillbar.png", description="技能栏模板（templates/ 目录）")
+    template: str = Field("skillbar.png", description="单个正向锚点模板（兼容老配置）")
+    positive_glob: str = Field(
+        "gate_pos_*.png",
+        description="正向锚点模板通配（相对模板目录）。命中任一张即放行。",
+    )
     threshold: float = Field(0.6, ge=0.4, le=0.99)
     roi: Optional[list[int]] = Field(
         None, description="匹配区域 [x,y,w,h]（原分辨率）；None=底部 35% 全宽"
     )
-    # 反例（负样本）：整屏 UI 的静态裁块。空 → 自动加载 templates/neg_*.png
+    # 反例（负样本）：整屏 UI 的静态裁块。空 → 自动加载 neg_*.png / gate_neg_*.png
     negative_templates: list[str] = Field(
         default_factory=list,
-        description="反例模板路径（templates/ 目录名或绝对路径）；命中即判非战斗",
+        description="反例模板路径（模板目录名或绝对路径）；命中即判非战斗",
     )
     negative_threshold: float = Field(0.80, ge=0.4, le=0.99)
+    template_base_width: int = Field(
+        1280,
+        ge=320,
+        description="模板裁制时的基准帧宽。模板从 960 宽的录屏裁出来就写 960——"
+                    "匹配时按 实际帧宽/此值 缩放模板，写错会让门禁整体失灵。"
+                    "单张模板可在 templates/_index.json 里覆盖。",
+    )
     fail_closed: bool = Field(
         True, description="无任何正向锚点命中时是否拦下（未标定游戏必须拦，防盲操作）"
     )
@@ -823,23 +851,50 @@ def runtime_overlay_path(path: str | os.PathLike) -> Path:
     return p.with_name(f"{p.stem}.runtime{p.suffix}")
 
 
-def load_config(path: str | os.PathLike | None = None) -> AppConfig:
-    """加载配置：YAML 文件（可选）+ 运行时覆盖 + 环境变量覆盖。"""
+def load_config(path: str | os.PathLike | None = None,
+                profile: "Profile | str | None" = None) -> AppConfig:
+    """加载配置。
+
+    叠加顺序（后者覆盖前者）：
+        config.py 默认值 → config.yaml → profile 的 config 段 → config.runtime.yaml
+
+    为什么 profile 排在 config.yaml 之后：config.yaml 是仓库级通用设置
+    （服务/告警/看门狗），profile 是"这个游戏长什么样"，后者必须能盖前者。
+    """
+    from .profile import Profile, load_profile as _load_profile
+
+    prof: Profile | None = None
+    if profile is not None:
+        prof = profile if isinstance(profile, Profile) else _load_profile(profile)
+
     data: dict = {}
     if path:
         p = Path(path)
         if p.exists():
             data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-            overlay = runtime_overlay_path(p)
-            if overlay.exists():
-                try:
-                    ov = yaml.safe_load(overlay.read_text(encoding="utf-8")) or {}
-                    data = _deep_merge(data, ov)
-                except Exception:  # noqa: BLE001
-                    import logging
+    if prof is not None:
+        data = _deep_merge(data, prof.config)
+        # profile 的基准分辨率是"唯一真相"：自动注入 vision，避免两处写不一致
+        # （写不一致的后果很隐蔽——排除区整体错位，HUD 图标会被当成掉落物）
+        # 注意**不要**顺手把 template_base_width 也设成它：模板经 make_template
+        # 统一归一化存成 1280 宽，基准恒为 1280，与画面尺寸无关。
+        # 手工裁的原生尺寸模板请在 templates/_index.json 里逐张声明 base_width。
+        vision = data.setdefault("vision", {})
+        if isinstance(vision, dict):
+            vision.setdefault("reference_resolution", list(prof.reference_resolution))
+            vision.setdefault("templates_dir", str(prof.templates_dir))
+    if path:
+        p = Path(path)
+        overlay = runtime_overlay_path(p)
+        if p.exists() and overlay.exists():
+            try:
+                ov = yaml.safe_load(overlay.read_text(encoding="utf-8")) or {}
+                data = _deep_merge(data, ov)
+            except Exception:  # noqa: BLE001
+                import logging
 
-                    logging.getLogger(__name__).warning(
-                        "运行时覆盖文件解析失败（已忽略）：%s", overlay, exc_info=True)
+                logging.getLogger(__name__).warning(
+                    "运行时覆盖文件解析失败（已忽略）：%s", overlay, exc_info=True)
     cfg = AppConfig.model_validate(data)
 
     # token 解析优先级：环境变量 > 配置文件 > 自动生成持久化

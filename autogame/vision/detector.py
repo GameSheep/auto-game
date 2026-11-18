@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import glob as _glob
+import json
 import logging
 import time
 from pathlib import Path
@@ -61,9 +63,11 @@ class Detector:
         self._template: np.ndarray | None = None
         self._template_name: str | None = None
         self._rechallenge_template: np.ndarray | None = None
-        self._skillbar_templates: list[np.ndarray] = []
-        # 反例模板（整屏 UI 的静态裁块）：[(名字, 图像)]
-        self._neg_templates: list[tuple[str, np.ndarray]] = []
+        # 正向锚点模板：[(文件名, 图像, 裁制基准帧宽)]
+        self._skillbar_templates: list[tuple[str, np.ndarray, int]] = []
+        # 反例模板（整屏 UI 的静态裁块）：[(名字, 图像, 裁制基准帧宽)]
+        self._neg_templates: list[tuple[str, np.ndarray, int]] = []
+        self._tpl_index: dict[str, dict] = {}
         self._gate_cache_until: float = 0.0
         self._gate_cache_value: bool = True
         # 标定诊断：最近一次检测的关键分数（页面"相机标定"用来给反馈，不参与决策）
@@ -72,20 +76,80 @@ class Detector:
         self._diag_gate_best: float = 0.0
         self._diag_gate_neg_best: float = 0.0
         self._diag_gate_neg_name: str = ""
+        self._diag_gate_pos_name: str = ""
         self._diag_gate_reason: str = ""
         self._last_gray: np.ndarray | None = None
         # 光柱时域跟踪: [(cx, cy, 剩余寿命, 连续可见帧数)]
         self._beam_track: list[tuple[int, int, int, int]] = []
         # 怪物时域确认: [(x, y, w, h, 命中次数)] —— 静态 HUD 图标/漂浮文字永不累加
         self._monster_track: list[tuple[int, int, int, int, int]] = []
-        self._templates_dir = templates_dir
-        self._load_template(templates_dir)
-        self._load_rechallenge_template(templates_dir)
-        self._load_skillbar_template(templates_dir)
-        self._load_negative_templates(templates_dir)
+        # 模板目录优先级：显式传参 > 配置里的 vision.templates_dir（profile 注入）
+        # > 仓库根 templates/。换游戏必须换目录，否则会拿另一款游戏的 HUD 当锚点。
+        if templates_dir is not None:
+            self._templates_dir: Path | None = Path(templates_dir)
+        elif getattr(cfg, "templates_dir", None):
+            self._templates_dir = Path(cfg.templates_dir)
+        else:
+            self._templates_dir = None
+        tdir = self._templates_dir
+        self._tpl_index = self._load_template_index(tdir)
+        self._load_template(tdir)
+        self._load_rechallenge_template(tdir)
+        self._load_skillbar_template(tdir)
+        self._load_negative_templates(tdir)
 
     # ---------------- 模板加载 ----------------
 
+    def _load_template_index(self, templates_dir: Path | None) -> dict[str, dict]:
+        """读模板目录下的 _index.json：记录每张模板"是按多宽的帧裁的"。
+
+        默认路径（tools/make_template.py）会把裁块统一缩放存成 1280 宽，此时
+        base_width 恒为 1280，这里有没有记录都一样。之所以还要支持逐张覆盖：
+        手工裁的原生尺寸模板（比如直接从 960 录屏截一块没缩放）必须声明真实基准，
+        否则会被按 1280 反推缩放，分数直接掉到噪声水平。
+
+        注意区分两件事——**跨分辨率不通用**和**跨游戏不通用**是两回事：
+        模板按 1280 归一化后，同一游戏换分辨率基本还能用（0.9→0.7 量级）；
+        换游戏则经常 0.25 分，那不是缩放错了，是两块 HUD 本来就长得不一样。
+        """
+        base = templates_dir or (ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
+        if not base:
+            return {}
+        p = Path(base) / "_index.json"
+        if not p.exists():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            log.warning("模板索引解析失败（已忽略）：%s", p, exc_info=True)
+            return {}
+        out: dict[str, dict] = {}
+        for k, v in (data or {}).items():
+            if isinstance(v, dict):
+                out[Path(k).name] = v
+            elif isinstance(v, (int, float)):
+                out[Path(k).name] = {"base_width": int(v)}
+        return out
+
+    def _base_width(self, name: str) -> int:
+        """该模板的裁制基准帧宽：单张覆盖 > 配置默认。"""
+        entry = self._tpl_index.get(Path(name).name) or {}
+        try:
+            w = int(entry.get("base_width") or 0)
+        except (TypeError, ValueError):
+            w = 0
+        return w if w >= 320 else int(self.cfg.scene_gate.template_base_width)
+
+    def _collect_templates(self, templates_dir: Path | None,
+                           pattern: str, legacy: str = "") -> list[Path]:
+        """按通配收集模板；pattern 无命中时回退 legacy 通配（兼容老命名）。"""
+        base = templates_dir or (ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
+        if not base:
+            return []
+        found = sorted(Path(p) for p in _glob.glob(str(Path(base) / pattern)))
+        if not found and legacy:
+            found = sorted(Path(p) for p in _glob.glob(str(Path(base) / legacy)))
+        return found
     def _load_template(self, templates_dir: Path | None) -> None:
         name = self.cfg.aframe.template
         if not name:
@@ -106,9 +170,15 @@ class Detector:
 
     def _read_template_img(self, name: str, templates_dir: Path | None
                            ) -> np.ndarray | None:
-        candidates = [Path(name)]
+        # 先判存在再读：cv2.imread 对不存在的路径会往 stderr 打 WARN，搅乱日志
+        candidates: list[Path] = []
+        p0 = Path(name)
+        if p0.is_file():
+            candidates.append(p0)
         if templates_dir:
-            candidates.append(templates_dir / name)
+            p1 = Path(templates_dir) / name
+            if p1.is_file() and (not p0.is_file() or p1.resolve() != p0.resolve()):
+                candidates.append(p1)
         for p in candidates:
             try:
                 img = cv2.imread(str(p), cv2.IMREAD_COLOR)
@@ -122,23 +192,37 @@ class Detector:
     def _load_skillbar_template(self, templates_dir: Path | None) -> None:
         if not self.cfg.scene_gate.enabled:
             return
-        # 多模板锚点：skillbar*.png 全部加载（不同职业/画质 HUD 外观不同，任意命中即通过）
-        import glob as _glob
-
-        paths: list[Path] = []
-        base = templates_dir or (ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
-        if base:
-            for p in sorted(_glob.glob(str(Path(base) / "skillbar*.png"))):
-                paths.append(Path(p))
-        if not paths:
-            log.warning("场景门模板缺失(skillbar*.png) → 门禁停用，in_game 恒为 True")
+        g = self.cfg.scene_gate
+        # 多锚点：不同游戏/职业/画质 HUD 外观不同，任意一张命中即放行。
+        # gate_pos_*.png 是标准名；skillbar*.png 是历史命名，继续认。
+        paths = self._collect_templates(templates_dir, g.positive_glob, "skillbar*.png")
+        entries: list[tuple[str, Path | None]] = [(p.name, p) for p in paths]
+        # 老配置里显式指定的单张模板也要算进去（不存在就静默跳过：
+        # 默认值 skillbar.png 指的是仓库根 templates/，profile 目录里没有它很正常）
+        if g.template and Path(g.template).name not in {n for n, _ in entries}:
+            exists = Path(g.template).is_file() or (
+                templates_dir is not None and (Path(templates_dir) / g.template).is_file())
+            if exists:
+                entries.append((Path(g.template).name, None))
+        if not entries:
+            log.warning("场景门正向模板缺失（%s）→ 未标定，按 scene_gate.fail_closed=%s 处理"
+                        "（True=全部拦下，生产 0 指令；这是安全默认）",
+                        g.positive_glob, g.fail_closed)
             return
         self._skillbar_templates = []
-        for p in paths:
-            img = cv2.imread(str(p), cv2.IMREAD_COLOR)
-            if img is not None:
-                self._skillbar_templates.append(img)
-        log.info("场景门模板已加载 %d 张", len(self._skillbar_templates))
+        for name, p in entries:
+            img = cv2.imread(str(p), cv2.IMREAD_COLOR) if p is not None else None
+            if img is None:
+                img = self._read_template_img(name, templates_dir)
+            if img is None:
+                log.warning("正向模板缺失: %s", name)
+                continue
+            if not _tpl_usable(img):
+                log.warning("正向模板方差过低已跳过（NCC 无意义）: %s", name)
+                continue
+            self._skillbar_templates.append((name, img, self._base_width(name)))
+        log.info("场景门正向模板已加载 %d 张: %s", len(self._skillbar_templates),
+                 ", ".join(f"{n}(base {b})" for n, _, b in self._skillbar_templates))
 
     # ---------------- 主入口 ----------------
 
@@ -236,6 +320,8 @@ class Detector:
             "gate_reason": self._diag_gate_reason,
             "gate_neg_best": self._diag_gate_neg_best,
             "gate_neg_name": self._diag_gate_neg_name,
+            "gate_pos_name": self._diag_gate_pos_name,
+            "gate_neg_threshold": float(self.cfg.scene_gate.negative_threshold),
             "scale": round(float(scale), 3),
             "detect_w": int(w0),
             "detect_h": int(h0),
@@ -311,12 +397,24 @@ class Detector:
 
     # ---------------- HUD 排除 / 场景门 ----------------
 
+    def _ref_scale(self, w0: int, h0: int) -> tuple[float, float]:
+        """基准分辨率 → 实际帧的缩放系数（坐标统一按配置的基准书写）。
+
+        换游戏/换录屏分辨率时只改 vision.reference_resolution 一处，不用把
+        hud_exclusions、各 ROI 全部重算一遍——重算过一次，漏掉一个框就会把
+        HUD 里的图标当掉落物。
+        """
+        ref = self.cfg.reference_resolution or [1280, 720]
+        rw = float(ref[0]) if len(ref) > 0 and ref[0] else 1280.0
+        rh = float(ref[1]) if len(ref) > 1 and ref[1] else 720.0
+        return w0 / rw, h0 / rh
+
     def _apply_hud_exclusions(self, work: np.ndarray, w0: int, h0: int,
                               scale: float) -> np.ndarray:
         # 不能原地修改调用方的帧（同一帧会被多次处理）
         work = work.copy()
-        # 排除区坐标按 1280x720 基准定义，任意分辨率归一化
-        fx, fy = w0 / 1280.0, h0 / 720.0
+        # 排除区坐标按 reference_resolution 基准定义，按实际帧等比换算
+        fx, fy = self._ref_scale(w0, h0)
         for ex in self.cfg.hud_exclusions:
             x, y, w, h = ex
             x0, y0 = int(x * fx * scale), int(y * fy * scale)
@@ -347,11 +445,17 @@ class Detector:
 
         templates = self._skillbar_templates
         if not templates:
+            # 一张正向模板都没有 = 这个游戏没标定过。此时"放行"等于盲操作：
+            # 菜单里任何一次点击都可能卖装备/洗点。所以和"没匹配上"一样处理，
+            # 由 fail_closed 决定拦不拦。想临时放行就把 fail_closed 关掉。
             self._diag_gate_reason = "no_template"
-            return True
+            return not g.fail_closed
         wh, ww = work.shape[:2]
+        rf = self._ref_scale(w0, h0)
         if g.roi:
-            rx, ry, rw, rh = (int(v * scale) for v in g.roi)
+            rf_x, rf_y = rf
+            rx, ry, rw, rh = (int(g.roi[0] * rf_x * scale), int(g.roi[1] * rf_y * scale),
+                              int(g.roi[2] * rf_x * scale), int(g.roi[3] * rf_y * scale))
         else:
             ry, rh = int(wh * 0.65), wh - int(wh * 0.65)
             rx, rw = 0, ww
@@ -363,11 +467,11 @@ class Detector:
         roi = cv2.resize(work[ry : ry + rh, rx : rx + rw], None, fx=0.5, fy=0.5,
                          interpolation=cv2.INTER_AREA)
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)  # 结构锚点用灰度（1/3 计算）
-        # 模板按 1280 宽基准制作，任意分辨率视频按宽度比例缩放后再半分辨率匹配
-        norm = (w0 / 1280.0) * scale * 0.5
-        for tpl in templates:
+        # 模板按各自裁制时的基准帧宽缩放：实际帧宽 / 模板基准宽，再乘 work 缩放与降采样
+        for tpl_name, tpl, base_w in templates:
+            norm = (w0 / float(base_w)) * scale * 0.5
             th, tw = tpl.shape[:2]
-            tw_s, th_s = max(2, int(tw * norm)), max(2, int(th * norm))
+            tw_s, th_s = max(2, int(round(tw * norm))), max(2, int(round(th * norm)))
             if th_s >= roi.shape[0] or tw_s >= roi.shape[1]:
                 continue
             tpl_s = cv2.resize(tpl, (tw_s, th_s), interpolation=cv2.INTER_AREA)
@@ -377,6 +481,7 @@ class Detector:
             self._diag_gate_best = round(float(max_v), 3)
             if max_v >= g.threshold:
                 self._diag_gate_reason = "skillbar"
+                self._diag_gate_pos_name = tpl_name
                 return True
         # 一个锚点都没命中：未标定的游戏/未知界面 —— 默认拦下（宁可不动手）
         self._diag_gate_reason = "unmatched"
@@ -387,19 +492,19 @@ class Detector:
     def _load_negative_templates(self, templates_dir: Path | None) -> None:
         """加载反例模板（整屏 UI 的静态裁块）。
 
-        空配置 → 自动加载 templates/neg_*.png。低方差模板直接跳过：TM_CCOEFF_NORMED
-        在近乎纯色/无结构的模板上会给出无意义的高分（历史教训：q_letter.png 实际是
-        技能图标的一个角落，对全部画面都给 0.87~0.88，把场景门变成了常开）。
+        空配置 → 自动加载 gate_neg_*.png，再回退历史命名 neg_*.png。低方差模板直接
+        跳过：TM_CCOEFF_NORMED 在近乎纯色/无结构的模板上会给出无意义的高分
+        （历史教训：q_letter.png 实际是技能图标的一个角落，对全部画面都给
+        0.87~0.88，把场景门变成了常开）。
         """
         g = self.cfg.scene_gate
         if not g.enabled:
             return
-        import glob as _glob
-
         base = templates_dir or (ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
         names: list[str] = list(g.negative_templates)
         if not names and base:
-            names = sorted(_glob.glob(str(Path(base) / "neg_*.png")))
+            paths = self._collect_templates(templates_dir, "gate_neg_*.png", "neg_*.png")
+            names = [str(p) for p in paths]
         for name in names:
             img = self._read_template_img(name, templates_dir)
             if img is None:
@@ -408,10 +513,11 @@ class Detector:
             if not _tpl_usable(img):
                 log.warning("反例模板方差过低已跳过（NCC 无意义）: %s", name)
                 continue
-            self._neg_templates.append((Path(name).name, img))
+            self._neg_templates.append(
+                (Path(name).name, img, self._base_width(Path(name).name)))
         if self._neg_templates:
             log.info("反例模板已加载 %d 张: %s", len(self._neg_templates),
-                     ", ".join(n for n, _ in self._neg_templates))
+                     ", ".join(f"{n}(base {b})" for n, _, b in self._neg_templates))
 
     def _check_negative_ui(self, work: np.ndarray, w0: int) -> str | None:
         """整屏反例匹配：任一命中即返回模板名（命中=这是菜单/面板，不是战斗）。"""
@@ -422,11 +528,11 @@ class Detector:
         if min(full.shape[:2]) < 12:
             return None
         gray = cv2.cvtColor(full, cv2.COLOR_BGR2GRAY)
-        norm = (w0 / 1280.0) * 0.5
         best, best_name = -1.0, ""
-        for name, tpl in self._neg_templates:
+        for name, tpl, base_w in self._neg_templates:
+            norm = (w0 / float(base_w)) * 0.5
             th, tw = tpl.shape[:2]
-            tw_s, th_s = max(2, int(tw * norm)), max(2, int(th * norm))
+            tw_s, th_s = max(2, int(round(tw * norm))), max(2, int(round(th * norm)))
             if th_s >= gray.shape[0] or tw_s >= gray.shape[1]:
                 continue
             t = cv2.resize(tpl, (tw_s, th_s), interpolation=cv2.INTER_AREA)
