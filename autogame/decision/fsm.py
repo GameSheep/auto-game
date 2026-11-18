@@ -20,19 +20,24 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 import random
 import time
+from pathlib import Path
 from typing import Callable
 
 from ..config import DecisionConfig
 from ..decision.llm_advisor import LLMAdvisor
 from ..decision.recovery import ProgressMonitor, RecoveryLadder, StallSignals
+from ..decision.supervisor import Supervisor, Verdict
 from ..decision.vlm import VisionAdvisor
 from ..executor import BaseExecutor
 from ..humanize import Humanizer, softmax_choice
 from ..protocol import Command, Pillar, SceneState
 
 log = logging.getLogger(__name__)
+
+_ROOT = Path(__file__).resolve().parents[2]
 
 # 目标匹配容差 & 拉黑半径（像素）
 TARGET_MATCH_TOL_PX = 70
@@ -56,7 +61,8 @@ class DecisionEngine:
     def __init__(self, cfg: DecisionConfig, executor: BaseExecutor,
                  advisor: LLMAdvisor | None = None,
                  on_event: Callable[[dict], None] | None = None,
-                 vlm: VisionAdvisor | None = None) -> None:
+                 vlm: VisionAdvisor | None = None,
+                 supervisor: Supervisor | None = None) -> None:
         self.cfg = cfg
         self.exec = executor
         self.advisor = advisor or LLMAdvisor(cfg.llm)
@@ -87,6 +93,9 @@ class DecisionEngine:
             "walk_settles": 0,          # 人物提前停下（等待 A框的宽限触发）
             "targets_ignored": 0,       # 选择性无视（懒得捡）次数
             "off_pick": 0,              # 选了非首个候选的次数（偏好证据）
+            "supervisor_blocks": 0,     # 被监督层拦下的命令数（shadow 下恒 0）
+            "supervisor_takeovers": 0,  # 监督层接管次数（esc/reset_stage）
+            "supervisor_panics": 0,     # 监督层停车次数
         }
         # 自主性：看门狗 + 恢复阶梯 + 视觉顾问
         self.monitor = ProgressMonitor(cfg.autonomy)
@@ -95,6 +104,8 @@ class DecisionEngine:
         self.vlm = vlm or VisionAdvisor(cfg.vlm)
         self.frame_source: Callable[[], bytes | None] | None = None
         self.vlm.frame_source = self._current_frame
+        # LLM 监督层：对账"动作有没有用"，有权踩刹车（默认 shadow，不真的拦）
+        self.supervisor = supervisor or Supervisor(cfg.supervisor, root=_ROOT)
         self.recovery = RecoveryLadder(
             cfg.autonomy, self.vlm, self.advisor,
             forbidden_keys={cfg.pickup_key},  # 铁律：恢复动作永不按拾取键
@@ -187,6 +198,9 @@ class DecisionEngine:
         self.exec.reset()
         if self.state == State.PANIC:
             self.state = State.SCANNING
+        # 人工复位时一并清掉监督层结论：否则那条 panic 会挂到 ttl 到期，
+        # 复位后每帧又被拦，看起来像"复位没用"。
+        self.supervisor.reset()
         self._emit_event("panic_reset")
 
     # ------------- 主 tick -------------
@@ -205,6 +219,14 @@ class DecisionEngine:
             self.monitor.reset(now)
             self._need_monitor_reset = False
         signals = self.monitor.update(scene, now, self.stats["picks"])
+
+        # ---- LLM 监督层：每帧本地对账（零成本），异常才异步叫模型 ----
+        # 它只能踩刹车（hold/takeover/panic），不能指定去哪——目标仍由像素证据裁决。
+        if self.supervisor.cfg.mode != "off":
+            self.supervisor.note_frame(scene, self.last_intent, now,
+                                       self._sup_probe(scene))
+            if self._sup_maybe_act(scene, now):
+                return
 
         # ---- 拟人化：状态推进 + 疲劳休息（累了就停手，真人不连轴转） ----
         self.human.tick(now)
@@ -289,6 +311,63 @@ class DecisionEngine:
             log.debug("取帧失败（VLM 跳过）", exc_info=True)
             return None
 
+    # ------------- LLM 监督层 -------------
+
+    def _sup_probe(self, scene: SceneState) -> dict:
+        """当前帧的实测值（给监督层对账用）。
+
+        距离必须**现算**：self._target 是上一帧的对象，它的 .distance 只在检测时
+        算过一次。拿旧距离去做"有没有走近"的对账，永远得到 hit —— 那等于没对账。
+        """
+        tgt = self._target
+        dist = None
+        if tgt is not None:
+            dist = math.hypot(tgt.cx - scene.character[0],
+                              tgt.y - scene.character[1])
+        return {
+            "dist": dist,
+            "aframe": scene.aframe is not None,
+            "picks": self.stats["picks"],
+            "in_game": scene.in_game,
+        }
+
+    def _sup_maybe_act(self, scene: SceneState, now: float) -> bool:
+        """监督层生效：停车 / 接管一次。返回 True = 本帧已处理，不要再决策。
+
+        shadow 模式下 should_panic / take_takeover 都返回 False —— 只记账不动手。
+        """
+        sup = self.supervisor
+        if sup.should_panic(now):
+            snap = sup.snapshot()
+            self.stats["supervisor_panics"] += 1
+            self._emit_event("supervisor_panic",
+                             diagnosis=snap.get("diagnosis", ""),
+                             evidence=snap.get("evidence", ""))
+            self._intent(f"监督层判定异常，停车交人工：{snap.get('diagnosis', '')}")
+            self.panic()
+            return True
+
+        act = sup.take_takeover(now)
+        if not act:
+            return False
+        op = str(act.get("op", ""))
+        reason = str(act.get("reason", ""))
+        self.stats["supervisor_takeovers"] += 1
+        self._emit_event("supervisor_takeover", op=op, reason=reason)
+        if op == "esc":
+            self._intent(f"监督层接管：按 ESC 关闭可疑界面（{reason or '界面可疑'}）")
+            self._act(Command(op="key_tap", key=self.cfg.autonomy.escape_key, hold_ms=60))
+        elif op == "reset_stage":
+            btn = self._last_rechallenge
+            if btn is not None:
+                self._intent("监督层接管：点『再次挑战』重开当前关卡")
+                self._act(Command(op="mouse_click", button="left", x=btn[0], y=btn[1]))
+            else:
+                self._intent("监督层要重开，但画面没有『再次挑战』，改为观察")
+        else:
+            self._intent(f"监督层接管：暂停观察（{reason or '等一帧'}）")
+        return True
+
     def _tick_gated(self, scene: SceneState, now: float, signals: StallSignals) -> None:
         """不在战斗界面：短时间等待；长时间（弹窗/菜单/结算）按 ESC 自救。
 
@@ -326,6 +405,10 @@ class DecisionEngine:
         self._intent("长时间不在战斗界面，按 ESC 关闭弹窗/菜单自救")
         self._emit_event("gate_escape", attempt=self.stats["gate_escapes"],
                          gate_for=round(signals.gate_for, 1))
+        # 登记预期：按完 ESC 该回到战斗界面。没回去说明按错了界面（或这根本不是弹窗），
+        # 连续几次就说明"按 ESC 自救"这条路在这个画面上是错的。
+        self.supervisor.predict("escape", "ESC 后应回到战斗界面", base=0.0,
+                                now=now, horizon_s=4.0)
 
     def _enter_recovery(self, scene: SceneState, now: float, signals: StallSignals) -> None:
         self.state = State.RECOVERING
@@ -792,11 +875,20 @@ class DecisionEngine:
     # ------------- 走位安全闸门 -------------
 
     def _act(self, cmd: Command) -> bool:
-        """执行一条命令并登记"我确实动过"（看门狗据此区分"卡住"与"没事干"）。"""
+        """执行一条命令并登记"我确实动过"（看门狗据此区分"卡住"与"没事干"）。
+
+        所有命令的唯一出口 —— 监督层的 hold 闸门就架在这里。它只能否决，
+        不会改写命令：被拦下就是这帧不动，而不是"改成去别处"。
+        """
+        if not self.supervisor.gate(cmd, self._now):
+            self.stats["supervisor_blocks"] += 1
+            log.debug("监督层拦下命令: %s", cmd.op)
+            return False
         ok = self.exec.execute(cmd)
         if ok and cmd.op != "stop_all":
             self.monitor.note_action(self._now)
             self.human.note_action(self._now)
+            self.supervisor.note_command(self._now)
         return ok
 
     def _emit_move_keys(self, keys: list[str], hold_ms: int) -> int:
@@ -973,6 +1065,12 @@ class DecisionEngine:
         self._walk_still = 0
         self._walk_settled_at = None
         self.stats["walk_starts"] += 1
+        # 登记预期：这次走位到期时距离该缩短。监督层用它判断"走位是不是假动作"
+        # （点了地面、命令发出去了、人物其实没动——这是规则层最难自证的一类故障）。
+        if target is not None:
+            self.supervisor.predict(
+                "walk", f"走位后距离应缩短（当前 {target.distance:.0f}px）",
+                base=float(target.distance), now=now, horizon_s=budget + 1.0)
 
     def _end_walk(self, now: float, reason: str, gained: float | None = None) -> None:
         if not self._walking:
@@ -1031,9 +1129,14 @@ class DecisionEngine:
     # ------------- 走位动作 -------------
 
     def _move_interval_s(self, now: float) -> float:
-        """两次走位动作的间隔：基准节拍 × 抖动 × 疲劳倍数（越累越慢）。"""
+        """两次走位动作的间隔：基准节拍 × 抖动 × 疲劳倍数 × 监督层降速。
+
+        监督层判 throttle 时这里会变慢——降速是它能做的三种干预里最轻的一种，
+        好处是即使判错也只是慢一点，不会让机器人做错事。
+        """
         base = 1.0 / max(0.5, self.cfg.tick_hz)
-        return base * random.uniform(0.9, 1.1) * self.human.latency_scale(now)
+        return (base * random.uniform(0.9, 1.1) * self.human.latency_scale(now)
+                * self.supervisor.pace_factor(now))
 
     def _move_toward(self, scene: SceneState, target: Pillar, now: float, first: bool) -> None:
         self._last_click_ts = now
@@ -1123,6 +1226,11 @@ class DecisionEngine:
         hold = _jitter_ms(70, self.human.jitter_ratio(now, self.cfg.jitter_ratio))
         self._act(Command(op="key_tap", key=self.cfg.pickup_key, hold_ms=hold))
         self._last_tap_ts = now
+        # 登记预期：按完这一下，A框该消失（或拾取数该涨）。连续落空= 在捡空气，
+        # 这正是"结果是否正向"最直接的证据。
+        self.supervisor.predict(
+            "pick", "按拾取键后 A框应消失", base=float(self.stats["picks"]),
+            now=now, horizon_s=max(1.0, self.cfg.tap_recheck_ms / 1000.0 + 1.0))
         # 复核冷却：给游戏拾取动画+视觉确认留时间，期间不得再按
         self._tap_block_until_ms = now * 1000.0 + self.cfg.tap_recheck_ms
         self._emit_event("pickup_tap", tap=self._taps_this_target)
@@ -1252,6 +1360,7 @@ class DecisionEngine:
                 "steps_done": self.recovery.steps_done,
             },
             "vlm": self.vlm.snapshot(),
+            "supervisor": self.supervisor.snapshot(),
             "humanize": self.human.snapshot(),
             "llm": {
                 "enabled": self.cfg.llm.enabled,

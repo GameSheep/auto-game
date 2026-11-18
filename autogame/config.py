@@ -370,6 +370,60 @@ class VLMConfig(BaseModel):
     allowed_keys: list[str] = Field(["w", "a", "s", "d", "space", "esc", "enter", "tab"])
 
 
+class SupervisorConfig(BaseModel):
+    """LLM 监督层配置 —— 判断"结果是否正向"、处理突发局面。
+
+    与另外两个模型层的分工（别混）：
+      - LLMAdvisor：连续放弃 N 次后看**摘要**给策略建议，低频、被动；
+      - VLM：卡壳时看**截图**给"我在哪/往哪走"，贵、省着用；
+      - Supervisor（本类）：看**预测-实测对账**判断"这串动作有没有用"，
+        有踩刹车的权力（throttle/hold/takeover/panic），但**没有打方向的权力**。
+
+    mode 三档，默认 shadow：
+      off     完全关闭（零开销）
+      shadow  照常判断、照常记账、照常出结论，但**不执行**——先看它想拦什么
+      enforce 结论真的生效
+
+    为什么默认不是 enforce：这个层是新的故障源。先跑几小时，确认它拦的每一条
+    都站得住，再放开。没有影子期的监督层不该上线。
+    """
+
+    mode: Literal["off", "shadow", "enforce"] = "shadow"
+    provider: Literal["ollama", "openai"] = "ollama"
+    base_url: str = "http://127.0.0.1:11434"
+    model: str = "qwen2.5:7b"
+    api_key: Optional[str] = None
+    api_key_env: str = "AUTOGAME_SUPERVISOR_KEY"
+    timeout_s: float = Field(12.0, ge=2.0, le=120.0)
+
+    # 本地体检节拍：每帧都跑（零成本），按这个间隔出一次健康报告
+    check_interval_s: float = Field(5.0, ge=1.0, le=60.0)
+
+    # 预算（模型调用不能失控）
+    max_calls_per_min: int = Field(3, ge=1, le=30)
+    min_interval_s: float = Field(20.0, ge=1.0)
+    failure_threshold: int = Field(3, ge=1)
+    cooldown_after_failure_s: float = Field(300.0, ge=10.0)
+
+    # 触发阈值（任一条命中才叫模型）
+    miss_streak_trigger: int = Field(3, ge=2, description="预测连续落空 N 次")
+    no_progress_trigger_s: float = Field(60.0, ge=10.0, description="在动但 N 秒无拾取进展")
+    unmatched_trigger_s: float = Field(45.0, ge=10.0, description="未识别画面持续 N 秒")
+    churn_trigger: int = Field(6, ge=2, description="每分钟意图切换超过 N 次视为抖动")
+
+    # 效力与安全
+    min_confidence: float = Field(0.60, ge=0.0, le=1.0)
+    takeover_min_confidence: float = Field(0.80, ge=0.5, le=1.0,
+                                           description="接管/停车需要更高置信度")
+    hold_max_s: float = Field(6.0, ge=1.0, le=60.0, description="单次 hold 上限，过期自动放行")
+    throttle_pace: float = Field(2.0, ge=1.1, le=5.0, description="throttle 时动作间隔倍率")
+    verdict_ttl_s: float = Field(15.0, ge=2.0, le=120.0, description="结论有效期")
+    panic_confirm: int = Field(2, ge=1, le=5, description="panic 需连续 N 次一致（防单次幻觉停车）")
+
+    audit_path: str = Field("logs/supervisor.jsonl",
+                            description="每条裁决落盘（把模型输出变成回归用例的原料）")
+
+
 class AutonomyConfig(BaseModel):
     """自主性配置 —— 进度看门狗 + 分级恢复阶梯 + 空闲策略。
 
@@ -633,6 +687,8 @@ class DecisionConfig(BaseModel):
     autonomy: "AutonomyConfig" = Field(default_factory=lambda: AutonomyConfig())
     # 视觉模型顾问（可选）：卡壳时截图问多模态模型"我现在在哪、该往哪走"
     vlm: "VLMConfig" = Field(default_factory=lambda: VLMConfig())
+    # LLM 监督层：看预测-实测对账，判断"这串动作有没有用"，有权踩刹车
+    supervisor: "SupervisorConfig" = Field(default_factory=lambda: SupervisorConfig())
     # 拟人化行为（疲劳/反应时间/走神/社交噪音）—— 降短期统计风险，非安全方案
     humanize: "HumanizeConfig" = Field(default_factory=lambda: HumanizeConfig())
     # 走位等待：把"点地面→人物走过去→A框出现→按拾取键"拆成显式多步

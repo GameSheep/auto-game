@@ -133,6 +133,40 @@ decision:
     min_confidence: 0.45       # 低置信度建议只记录不执行
     # provider: openai 时可用 api_key_env 指定环境变量名（默认 AUTOGAME_VLM_KEY）
 
+  # ---------------- LLM 监督层（判断"结果是否正向" + 处理突发） ----------------
+  # 和上面两个模型层的分工：
+  #   llm  看摘要 → "该不该换策略"，连续放弃才问，被动
+  #   vlm  看截图 → "我在哪、往哪走"，卡壳才问，贵
+  #   supervisor（本段）看**预测-实测对账** → "这串动作有没有用"，有权踩刹车
+  #
+  # 它只能踩刹车（降速/暂停/接管一次安全动作/停车），**不能指定去哪捡哪个**——
+  # 目标和坐标永远来自像素证据。这条线松了就会变成"模型幻觉驱动机器人"。
+  #
+  # mode 必须从 shadow 开始：照常判断、照常记账、照常出结论，但不执行。
+  # 跑几小时看 logs/supervisor.jsonl 里它想拦什么，确认每条都站得住再切 enforce。
+  # 没有影子期的监督层不该上线 —— 它会成为新的故障源。
+  supervisor:
+    mode: shadow               # off（关闭）/ shadow（只观察）/ enforce（真生效）
+    provider: ollama
+    base_url: http://127.0.0.1:11434
+    model: qwen2.5:7b          # 纯文本就够：喂的是数字对账，不是截图
+    timeout_s: 12.0
+    check_interval_s: 5.0      # 本地体检节拍（零成本，每帧都记账）
+    max_calls_per_min: 3       # 预算
+    min_interval_s: 20.0
+    # 触发条件（任一条命中才叫模型，不是每帧都问）
+    miss_streak_trigger: 3     # 预测连续落空 3 次（走位没走近/按了没捡到）
+    no_progress_trigger_s: 60  # 在动但 60s 没捡到东西 —— 最危险的假动作
+    unmatched_trigger_s: 45    # 未识别画面持续 45s
+    churn_trigger: 6           # 每分钟意图切换 6 次 = 决策在抖
+    # 效力与安全
+    min_confidence: 0.60
+    takeover_min_confidence: 0.80   # 接管/停车要更高把握
+    hold_max_s: 6.0            # 单次暂停上限，过期自动放行（防误判卡死）
+    throttle_pace: 2.0         # 降速倍率
+    panic_confirm: 2           # 停车要连续 2 次一致（防单次幻觉）
+    audit_path: logs/supervisor.jsonl
+
   # ---------------- 走位等待（动作链：点一下 ≠ 走到位） ----------------
   # 真实链路：点地面 → 人物在游戏里走过去（1-3s）→ 进到一定距离 → A框出现 → 按拾取键。
   # 开启后走位期间不重复点击，而是观察"画面是否在动 + 距离是否真的缩短"。
