@@ -154,6 +154,23 @@ class MinimapInfo(BaseModel):
     arrived: bool = False
 
 
+class MapPos(BaseModel):
+    """人物在整张地图上的位置（小地图裁片与离线底图对齐的结果）。
+
+    坐标有两种口径，都留着：
+      - x/y：底图像素，和标定底图上的像素直接对得上（画点、量距离用这个）
+      - u/v：归一化 0..1，换分辨率/换底图尺寸都不失效（存档、策略用这个）
+    """
+
+    x: int
+    y: int
+    u: float
+    v: float
+    score: float = 0.0        # 灰度 NCC 分数
+    edge_score: float = 0.0   # 边缘图复核分数
+    hinted: bool = False      # 是否用了上一帧位置做窗口搜索
+
+
 class SceneState(BaseModel):
     """一帧画面解析后的完整场景状态（决策输入）。"""
 
@@ -165,6 +182,7 @@ class SceneState(BaseModel):
     aframe: Optional[AFrame] = None
     rechallenge: Optional[ButtonHit] = None
     minimap: Optional[MinimapInfo] = None
+    map_pos: Optional[MapPos] = None  # 人物在整图上的位置（小地图定位，需标定）
     item_list: list[ListEntry] = Field(default_factory=list)
     ground_labels: list[ListEntry] = Field(default_factory=list)  # 地面掉落标签（黄条=掉落物）
     monsters: list[Monster] = Field(default_factory=list)  # 战斗区域怪物

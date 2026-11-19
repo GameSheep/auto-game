@@ -78,6 +78,29 @@ vision:
   # 只捡金色 → ["gold"]；金+粉 → ["gold", "pink"]。这是 C3 铁律的默认实现方式。
   whitelist_colors: []
 
+  # 掉落物名词表（对话定稿：词表固定，裁字条做模板，不走 OCR）
+  # 模板目录里每个文件 = 一个物品名，文件名就是名字（中文没问题，读图走字节）。
+  # 同一物品多张样本：强化石__1.png / 强化石__2.png → 都归到「强化石」。
+  nametags:
+    enabled: false
+    template_dir: templates/names   # 没有这个目录就等于空词表（会 warn）
+    threshold: 0.72                 # 低于它就当"认不出"，不猜
+    scales: [1.0]                   # UI 缩放变过就加一档，如 [1.0, 0.85]
+
+  # 小地图 → 人物在整张地图上的位置（小地图是滚动的局部视图，靠底图配准）
+  # 标定顺序：python tools/map_probe.py --map 底图.png --frame 截图.png --roi 0,55,245,245 --sweep
+  minimap:
+    enabled: false
+    roi: [0, 55, 245, 245]   # 左上角小地图
+    map_image: null          # 整张地图底图（无 HUD 的整图）；null=定位不可用
+    zoom: 0.0                # 小地图像素/底图像素；0=未标定（别手填，用 --sweep 量）
+    inset: 6                 # 四边裁掉以免边框干扰
+    locate_threshold: 0.55
+    edge_threshold: 0.25     # 边缘复核线：只靠分数会漂几十像素
+    search_radius_px: 220    # 有上一帧就只搜附近；0=每次全图
+    max_jump_px: 400
+    jump_confirm: 2
+
 decision:
   tick_hz: 1.0          # 1秒1次决策（对话定稿）
   pickup_key: a

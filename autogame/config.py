@@ -122,6 +122,9 @@ class VisionConfig(BaseModel):
 
     minimap: "MinimapConfig" = Field(default_factory=lambda: MinimapConfig())
 
+    # 掉落物名词表（固定词表的模板匹配，替代光柱旁的小字 OCR）
+    nametags: "NameTagConfig" = Field(default_factory=lambda: NameTagConfig())
+
     # HUD 固定区域排除（小地图/任务/聊天/技能栏/ Buff 条——掉落物不可能出现在这里）
     # 每项 [x, y, w, h]，原分辨率坐标；默认按《火炬之光：无限》1280x720 布局
     hud_exclusions: list[list[int]] = Field(
@@ -246,10 +249,15 @@ class GroundLabelConfig(BaseModel):
 
 
 class MinimapConfig(BaseModel):
-    """小地图目标点检测（对话定稿：根据左上角地形判断往哪里走）。
+    """小地图：目标标记方向（在游戏界面内找标记来导航）与整图定位（找自己在地图哪）。
 
-    小地图 ROI 内检测目标标记（高亮色点），角色假设在小地图中心（ARPG 通用），
-    输出标记相对中心的方向 → 决策器换算为方向键走位。
+    两件事别混：
+      - marker/arrived_ratio：假设人物在小地图中心，找一个**目标标记**算方向。
+        用于"往任务点走"，只要方向，不要坐标。
+      - map_image/zoom：小地图是**随人物滚动**的局部视图，拿这块地形去和离线底图
+        对齐，得到人物在整张地图上的 (u, v)。用于"我在哪、往哪边刷"。
+
+    后者依赖标定（zoom/inset），没标定就明确不可用（`why` 会写原因），不猜。
     """
 
     enabled: bool = False
@@ -263,6 +271,48 @@ class MinimapConfig(BaseModel):
     arrived_ratio: float = Field(
         0.12, ge=0.01, le=0.9, description="标记距小地图中心 < 该比例(×半径) 视为已到达"
     )
+
+    # ---------------- 整图定位（对话定稿：小地图滚动，中心那张是半透明大地图） ----------------
+    map_image: Optional[str] = Field(
+        None, description="整张地图底图（无 HUD 的整图 PNG）；相对路径按项目根解析"
+    )
+    zoom: float = Field(
+        0.0, ge=0.0, le=1.0,
+        description="小地图像素 / 底图像素。0=未标定，定位不可用（标定法见 docs/小地图与词表.md）",
+    )
+    inset: int = Field(6, ge=0, description="小地图裁片四边各裁掉多少像素（去边框/圆角）")
+    locate_threshold: float = Field(0.55, ge=0.1, le=0.99, description="灰度 NCC 通过线")
+    edge_threshold: float = Field(
+        0.25, ge=0.0, le=0.99,
+        description="边缘图复核线。平滑地形上 NCC 会出现大范围高分区，只靠分数会漂几十像素",
+    )
+    search_radius_px: int = Field(
+        220, ge=0, description="有上一帧位置时只在 ±该半径（底图像素）内搜；0=每次都全图"
+    )
+    max_jump_px: int = Field(400, ge=0, description="单帧位移超过它先不采信（防漂到相似地形）")
+    jump_confirm: int = Field(2, ge=1, description="连续 N 帧都在新位置才认（真传送/切图）")
+
+
+class NameTagConfig(BaseModel):
+    """掉落物名词表匹配（对话定稿：词表固定，裁字条做模板，不走 OCR）。
+
+    为什么不是 OCR：手机画面里物品名通常只有 10~14px 高，tesseract 在这个尺度上
+    中文误识率不低（"强化石"→"强化右"），而认错的代价是捡错东西。词表固定时，
+    "背下来"比"读出来再比对"少一层误差。
+    """
+
+    enabled: bool = False
+    template_dir: Optional[str] = Field(
+        None, description="字条模板目录（文件名=物品名）；None=templates/names"
+    )
+    threshold: float = Field(0.72, ge=0.3, le=0.99)
+    scales: list[float] = Field(
+        default_factory=lambda: [1.0], description="渲染尺度；UI 缩放没变就只留 1.0"
+    )
+    band_up: int = Field(46, ge=0, description="以光柱顶部为基准向上扩多少像素（名字在柱上方）")
+    band_down: int = Field(18, ge=0, description="向下扩多少（有的游戏名字压在柱身上）")
+    band_w: int = Field(240, ge=20, description="横向搜索宽度")
+
 
 
 class RechallengeConfig(BaseModel):
