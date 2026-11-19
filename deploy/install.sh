@@ -31,6 +31,9 @@ sudo apt-get install -y -qq python3-venv python3-pip tar tesseract-ocr tesseract
 
 echo "[2/6] 用户与目录"
 id "$USER_NAME" >/dev/null 2>&1 || sudo useradd --system --home "$APP" --shell /usr/sbin/nologin "$USER_NAME"
+# 串口执行器要 dialout：服务单元里有 SupplementaryGroups=dialout，这里补组，
+# 让人手工 `sudo -u autogame` 调试时也能开串口。
+getent group dialout >/dev/null && sudo usermod -aG dialout "$USER_NAME" || true
 sudo mkdir -p "$APP/releases" "$APP/bin" "$APP/venv"
 sudo mkdir -p "$DATA/profiles" "$DATA/logs" "$DATA/snapshots" "$DATA/packages"
 sudo chown -R "$USER_NAME:$USER_NAME" "$DATA"

@@ -7,6 +7,10 @@ Wants=network-online.target
 Type=simple
 User=autogame
 Group=autogame
+# 串口执行器（executor.backend=rp2040）：/dev/ttyACM* 属 dialout，不加这行
+# 服务一起来就 "Permission denied: /dev/ttyACM0"，而页面只显示"执行器不可用"，
+# 归因不到权限上。免密 sudo、组授权都不需要，这一行就是授权本身。
+SupplementaryGroups=dialout
 WorkingDirectory=/opt/autogame
 Environment=AUTOGAME_HOME=/opt/autogame
 Environment=AUTOGAME_DATA=/var/lib/autogame
