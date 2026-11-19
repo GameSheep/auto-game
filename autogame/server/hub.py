@@ -308,7 +308,12 @@ class Hub:
                         buf = np.frombuffer(jpeg, dtype=np.uint8)
                         fimg = cv2.imdecode(buf, cv2.IMREAD_COLOR)
                         if fimg is not None:
-                            await loop.run_in_executor(None, task.tick, fimg, scene.ts_ms)
+                            # 指令组要整帧场景（它要在"打一圈"时把控制权交回 FSM，
+                            # 交回的那一刻需要有 scene）。配方只要图。
+                            if getattr(task, "wants_scene", False):
+                                await loop.run_in_executor(None, task.tick_frame, scene, fimg)
+                            else:
+                                await loop.run_in_executor(None, task.tick, fimg, scene.ts_ms)
                     if task.done or task.failed:
                         end = {"event": "ui_task_end", "name": task.name,
                                "failed": task.failed, "step": task.step_i,

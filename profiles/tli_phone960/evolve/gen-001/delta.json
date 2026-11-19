@@ -1,0 +1,26 @@
+{
+  "tracked": false,
+  "added": [
+    "labels.json",
+    "lessons/tli.md",
+    "refs/tli_combat_01.jpg",
+    "refs/tli_combat_02.jpg",
+    "refs/tli_nether_map_01.jpg",
+    "templates/gate_neg_nether_title.png",
+    "templates/gate_pos_boss.png",
+    "templates/gate_pos_skillwheel.png"
+  ],
+  "changed": [],
+  "removed": [],
+  "newest": 1795060547,
+  "n_files": 8,
+  "empty": false,
+  "vs": "gen-000",
+  "knowledge": {
+    "added": [],
+    "removed": [],
+    "n_added": 0,
+    "n_removed": 0
+  },
+  "blind": true
+}

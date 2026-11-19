@@ -1,0 +1,41 @@
+#!/bin/sh
+# /opt/autogame/bin/autogame —— 唯一入口：读 current 指针，决定跑哪个 release。
+#
+# 为什么不用符号链接：文本指针能 `cat` 看、能原子 rename、断电不留半截，
+# 而且换版只是改一行字，不需要什么文件系统特性。指针坏了就自动挑最新的完整版本，
+# 让设备自己站起来，而不是等人 ssh 进来。
+set -eu
+
+APP=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export AUTOGAME_HOME="$APP"
+export AUTOGAME_DATA="${AUTOGAME_DATA:-/var/lib/autogame}"
+export AUTOGAME_SUPERVISED="${AUTOGAME_SUPERVISED:-1}"
+export PYTHONIOENCODING=utf-8
+
+PY="$APP/venv/bin/python"
+[ -x "$PY" ] || PY=$(command -v python3 || true)
+if [ -z "${PY:-}" ]; then
+    echo "找不到 python3，也找不到 $APP/venv/bin/python" >&2
+    exit 78
+fi
+
+VER=$(cat "$APP/current" 2>/dev/null | tr -d ' \r\n' || true)
+if [ -z "$VER" ] || [ ! -f "$APP/releases/$VER/run_server.py" ]; then
+    # 指针为空/指向残缺目录：挑最新一个完整 release，并把指针修正回来
+    VER=$(ls -1 "$APP/releases" 2>/dev/null | while read -r v; do
+              [ -f "$APP/releases/$v/run_server.py" ] && echo "$v"
+          done | sort -V | tail -1)
+    if [ -z "$VER" ]; then
+        echo "没有可用的 release：$APP/releases 是空的" >&2
+        exit 78
+    fi
+    echo "current 指针无效，回退到最新完整版本 $VER" >&2
+    # 只读盘上写不进去是正常的（服务进程对 /opt/autogame 没有写权限），
+    # 所以这里只尽力修正，失败也不影响启动：下次升级会把指针写回正确值。
+    { printf '%s\n' "$VER" > "$APP/current.tmp" && mv -f "$APP/current.tmp" "$APP/current"; } \
+        2>/dev/null || echo "（指针只读，跳过写回）" >&2
+fi
+
+REL="$APP/releases/$VER"
+echo "autogame $VER  code=$REL  data=$AUTOGAME_DATA" >&2
+exec "$PY" "$REL/run_server.py" "$@"

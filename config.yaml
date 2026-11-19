@@ -286,3 +286,14 @@ sim:
   walk_speed_px_s: 260.0
   pickup_radius_px: 130.0
   pillar_spawn_interval_s: 2.2
+
+# ---------------- 持续学习（二次进化的节奏） ----------------
+# 材料一变就自己学，不用人记得点按钮。关掉之后只在页面点「现在学」才动。
+# 页面上的开关存在 profile 的 evolve/learner.json 里，会覆盖这里的 enabled。
+learner:
+  enabled: true
+  interval_s: 15           # 多久看一眼材料有没有变
+  quiet_s: 45              # 材料安静多久才动手（你在连续截图时别学半截）
+  min_gap_s: 180           # 两代之间至少隔多久（别把设备算力吃干）
+  max_tries: 1             # 同一批材料自动试几次；失败多半是材料问题，等改了再试
+  use_model: true          # 关掉则只编手册、不起草规则（ollama 没起时也照常出代）

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated": "2026-11-18",
+  "updated": "2026-11-19",
   "howto": [
     "火炬之光：无限 手机端录屏（960x432）的标答台账。file 相对本 profile 目录解析。",
     "strict=true 必须完全对上，不符就是回归失败（tools/ref_check.py --profile tli_phone960 退出码 1）。",

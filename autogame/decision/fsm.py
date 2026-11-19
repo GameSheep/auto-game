@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..config import DecisionConfig
+from .. import paths
 from ..decision.actions import ActionRegistry
 from ..decision.arbiter import Arbiter
 from ..decision.knowledge import KnowledgeBase
@@ -40,7 +41,8 @@ from ..protocol import Command, Pillar, SceneState
 
 log = logging.getLogger(__name__)
 
-_ROOT = Path(__file__).resolve().parents[2]
+#: 台账/日志是数据，写到数据根（设备上是 /var/lib/autogame），升级换代码时不能带走。
+_DATA = paths.data_root()
 
 
 def _knowledge_dir(cfg) -> Path:
@@ -48,12 +50,12 @@ def _knowledge_dir(cfg) -> Path:
 
     不放到仓库根，是为了让"一个游戏一个目录"这条约定不出例外 ——
     否则用户会看到根的 knowledge/ 和 profiles/<id>/knowledge/ 两份，不知道该填哪个。
+    相对路径按**数据根**解析（不是 cwd）：systemd 下 cwd 是 `/`。
     """
     raw = str(getattr(cfg, "knowledge_dir", "") or "").strip()
     if raw:
-        p = Path(raw)
-        return p if p.is_absolute() else _ROOT / p
-    return _ROOT / "profiles" / "generic_1280x720" / "knowledge"
+        return paths.resolve(raw)
+    return paths.data("profiles", "generic_1280x720", "knowledge")
 
 # 目标匹配容差 & 拉黑半径（像素）
 TARGET_MATCH_TOL_PX = 70
@@ -123,13 +125,13 @@ class DecisionEngine:
         self.frame_source: Callable[[], bytes | None] | None = None
         self.vlm.frame_source = self._current_frame
         # LLM 监督层：对账"动作有没有用"，有权踩刹车（默认 shadow，不真的拦）
-        self.supervisor = supervisor or Supervisor(cfg.supervisor, root=_ROOT)
+        self.supervisor = supervisor or Supervisor(cfg.supervisor, root=_DATA)
         # 三级裁决：经验直出 → laya 从能力清单里选 → 都不行才问大模型。
         # 行为清单必须由 action_table() 提供实现，清单里没有实现的动作执行不了，
         # 所以 registry 只描述、FSM 才拥有"能不能做"的最终解释权。
         self.actions = ActionRegistry()
         self.kb = KnowledgeBase(_knowledge_dir(cfg.arbiter))
-        self.arbiter = arbiter or Arbiter(cfg.arbiter, self.actions, self.kb, root=_ROOT)
+        self.arbiter = arbiter or Arbiter(cfg.arbiter, self.actions, self.kb, root=_DATA)
         self._scene: SceneState | None = None
         self._last_action_at = 0.0
         self._arbiter_paused_until = 0.0

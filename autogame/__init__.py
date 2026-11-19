@@ -15,4 +15,6 @@
   3. 一键急停 (panic)，执行器立刻停止一切输出。
 """
 
-__version__ = "0.1.0"
+from .version import ENGINE_VERSION as __version__  # noqa: E402  (单一版本来源)
+
+__all__ = ["__version__"]

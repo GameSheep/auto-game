@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 import threading
 import time
@@ -99,9 +100,21 @@ def _ensure_port_free(host: str, port: int) -> None:
             raise SystemExit(2)
 
 
+def _default_config() -> str:
+    """配置文件按"数据优先"找：数据根有就用它，否则用引擎自带的样例。
+
+    设备上数据根是 /var/lib/autogame，config.yaml 属于这台机器自己的设置，
+    升级换代码时不能被覆盖；开发机上两者同一目录，行为与以前一致。
+    """
+    from autogame import paths
+
+    data_cfg = paths.data("config.yaml")
+    return str(data_cfg if data_cfg.exists() else paths.code("config.yaml"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="autogame 服务端")
-    parser.add_argument("--config", default=str(ROOT / "config.yaml"))
+    parser.add_argument("--config", default=_default_config())
     parser.add_argument("--profile", default="",
                         help="游戏适配包 id（profiles/<id>/）：决定门禁模板、标答台账、"
                              "坐标基准。换游戏必须带这个，否则会用错 HUD 模板。")
@@ -114,9 +127,16 @@ def main() -> None:
 
     _setup_logging()
     prof = None
-    if args.profile:
+    profile_id = args.profile or os.environ.get("AUTOGAME_PROFILE", "").strip()
+    if not profile_id:
+        from autogame.profile import active_profile_id
+
+        profile_id = active_profile_id()      # 数据根里的 `profile` 指针
+        if profile_id:
+            log.info("使用数据根里的 profile 指针: %s", profile_id)
+    if profile_id:
         from autogame.profile import load_profile
-        prof = load_profile(args.profile)
+        prof = load_profile(profile_id)
         log.info("使用 profile: %s  基准 %dx%d  状态 %s  模板 %s",
                  prof.id, prof.reference_resolution[0], prof.reference_resolution[1],
                  prof.status, prof.templates_dir)

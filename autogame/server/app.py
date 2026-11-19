@@ -51,14 +51,41 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
         hub.bind_loop(loop)
         decide_task = asyncio.create_task(hub.decision_loop(), name="decision-loop")
         watch_task = asyncio.create_task(hub.watchdog_loop(), name="frame-watchdog")
+        tasks = [decide_task, watch_task]
+        if profile is not None:
+            tasks.append(asyncio.create_task(_learner_loop(), name="learner-loop"))
         log.info("决策循环已启动（含帧流看门狗）")
         try:
             yield
         finally:
-            for t in (decide_task, watch_task):
+            for t in tasks:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
+
+    async def _learner_loop() -> None:
+        """持续学习：材料变了就自己学，不用人记得点按钮。
+
+        为什么在服务里跑而不是 cron：它要知道"现在是不是在打怪"。换代会让正在
+        执行的动作失去依据，所以只在这个进程空闲时才动手 —— 这个状态只有这里知道。
+        """
+        from .. import learner as lr
+
+        interval = max(5.0, float(getattr(cfg.learner, "interval_s", 15.0)))
+        log.info("持续学习已启动（每 %.0fs 看一次材料）", interval)
+        while True:
+            try:
+                busy_now = hub.fsm.state.value != "PAUSED"
+                use_model = bool(getattr(cfg.learner, "use_model", True))
+                res = await asyncio.to_thread(
+                    lr.tick, profile, cfg, use_model=use_model, busy=busy_now)
+                if res.get("action") == "learn":
+                    log.info("自动学习：%s", res.get("message") or res.get("code"))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("自动学习这一轮出错（下一轮继续）")
+            await asyncio.sleep(interval)
 
     app = FastAPI(title="autogame", docs_url=None, redoc_url=None, lifespan=lifespan)
 
@@ -309,13 +336,16 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
 
     @app.get("/api/evolve")
     async def evolve_state(request: Request) -> JSONResponse:
-        """当前代数、材料体检、它认为缺什么。页面刷新用。"""
+        """当前代数、材料体检、它认为缺什么、以及"持续学习"现在在干什么。"""
         _require_token_header(request)
         if profile is None:
             return JSONResponse({"ok": False, "error": "没有绑定 profile（单游戏模式）"})
         from .. import evolve as ev
+        from .. import learner as lr
 
         audit = await asyncio.to_thread(ev.audit_materials, profile)
+        busy_now = hub.fsm.state.value != "PAUSED"
+        learn = await asyncio.to_thread(lr.snapshot, profile, cfg, busy=busy_now)
         wanted_path = ev.evolve_root(profile) / "wanted.json"
         wanted = {}
         if wanted_path.exists():
@@ -323,32 +353,98 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
                 wanted = json.loads(wanted_path.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001
                 wanted = {}
+
+        def _row(g) -> dict:
+            """一代 + 它带来的变化。页面要能回答"这次多认了什么"。"""
+            d = g.to_dict()
+            dp = Path(g.root) / "delta.json"
+            if dp.exists():
+                try:
+                    raw = json.loads(dp.read_text(encoding="utf-8"))
+                    kn = raw.get("knowledge") or {}
+                    d["delta"] = {
+                        "ma": len(raw.get("added") or []),
+                        "mc": len(raw.get("changed") or []),
+                        "mr": len(raw.get("removed") or []),
+                        "ka": int(kn.get("n_added") or 0),
+                        "kr": int(kn.get("n_removed") or 0),
+                        "blind": bool(raw.get("blind")),
+                        "vs": raw.get("vs") or "",
+                    }
+                except Exception:  # noqa: BLE001
+                    pass
+            return d
+
         return JSONResponse({
             "ok": True,
             "profile": profile.id,
             "active": ev.active_id(profile),
-            "generations": [g.to_dict() for g in ev.list_generations(profile)],
+            "generations": [_row(g) for g in ev.list_generations(profile)],
             "audit": audit.to_dict(),
             "audit_summary": audit.summary(),
+            "learner": learn,
             "wanted": wanted.get("asks") or [],
             "history": ev.history(profile, limit=8),
         })
 
     @app.post("/api/evolve/run")
     async def evolve_run(request: Request) -> JSONResponse:
-        """吃材料出一代并过回归。跑在后台线程：回归要动检测器和 FSM，几十秒。"""
+        """手动催一次（"现在学"）。跑在后台线程：回归要动检测器和 FSM，几十秒。
+
+        不走自动那套防抖/间隔 —— 人点了就是现在要，哪怕机器人正在跑。
+        """
         _require_token_header(request)
         if profile is None:
             return JSONResponse({"ok": False, "error": "没有绑定 profile"})
-        from .. import evolve as ev
+        from .. import learner as lr
 
         body = {}
         with contextlib.suppress(Exception):
             body = await request.json() or {}
         use_model = bool(body.get("use_model", True))
-        res = await asyncio.to_thread(ev.evolve, profile, cfg,
-                                     force=bool(body.get("force")), use_model=use_model)
+        res = await asyncio.to_thread(lr.learn, profile, cfg,
+                                     source="manual", use_model=use_model)
         return JSONResponse({"ok": bool(res.get("ok")), **res})
+
+    @app.post("/api/evolve/auto")
+    async def evolve_auto(request: Request) -> JSONResponse:
+        """开关持续学习。存在 learner.json（数据根），重启和升级都不丢。"""
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import learner as lr
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        st = await asyncio.to_thread(lr.set_enabled, profile, cfg,
+                                     bool(body.get("enabled", True)))
+        return JSONResponse({"ok": True, "enabled": bool(st.enabled)})
+
+    @app.post("/api/evolve/note")
+    async def evolve_note(request: Request) -> JSONResponse:
+        """补一条经验：问两个问题，写进手册认得的格式，剩下的交给持续学习。
+
+        不做自由文本 —— 解析器不认的自由文本，写进去也学不到，比不给入口更糟。
+        """
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from ..teach import append_note
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        try:
+            path, block = await asyncio.to_thread(
+                append_note, profile, str(body.get("when") or ""),
+                str(body.get("todo") or ""))
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            log.exception("写补充经验失败")
+            return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        return JSONResponse({"ok": True, "file": str(path.name), "added": block})
 
     @app.post("/api/evolve/rollback")
     async def evolve_rollback(request: Request) -> JSONResponse:
@@ -360,6 +456,207 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
 
         ok, msg = await asyncio.to_thread(ev.rollback, profile)
         return JSONResponse({"ok": ok, "message": msg, "active": ev.active_id(profile)})
+
+    # ---------------- 指令组：喊一句就跑整套 ----------------
+
+    def _group_tpl_dir():
+        """组用哪套模板。有激活代就用代的模板，否则用 profile 的。"""
+        if profile is None:
+            return None
+        from .. import evolve as ev
+
+        gen = ev.active_generation(profile)
+        if gen is not None:
+            return gen.resolved_templates(profile)
+        return Path(profile.templates_dir)
+
+    @app.get("/api/groups")
+    async def groups_state(request: Request) -> JSONResponse:
+        """列出能喊的组、每个缺什么，以及世界层的规模。
+
+        `ready=False` 的组也列出来 —— 它缺的是模板，不是不存在。藏起来会让人
+        以为自己没教会，其实是没截图。
+        """
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import groups as gp
+
+        def _read():
+            world = gp.load_world(profile)
+            tpl = _group_tpl_dir()
+            rows, conflicts, orphans = [], [], []
+            for g in gp.load_groups(profile):
+                gaps = g.gaps(world, tpl)
+                rows.append({**g.to_dict(), "gaps": gaps, "ready": not gaps,
+                             "say_line": g.say_line()})
+            root = gp.groups_root(profile)
+            for name, key in (("_conflicts.json", "conflicts"),
+                              ("_orphans.json", "orphans")):
+                p = root / name
+                if p.exists():
+                    try:
+                        obj = json.loads(p.read_text(encoding="utf-8"))
+                    except Exception:  # noqa: BLE001
+                        obj = {}
+                    if key == "conflicts":
+                        conflicts = obj.get("conflicts") or []
+                    else:
+                        orphans = obj.get("orphans") or []
+            return {
+                "ok": True,
+                "world": {"scenes": world.known_scenes(),
+                          "objects": sorted(world.objects),
+                          "keys": world.keys,
+                          "terms": len(world.terms),
+                          "taboos": len(world.taboos)},
+                "groups": rows, "conflicts": conflicts, "orphans": orphans,
+                "active_task": (_HUB.ui_task.status() if _HUB and _HUB.ui_task else None),
+            }
+
+        return JSONResponse(await asyncio.to_thread(_read))
+
+    @app.post("/api/groups/sync")
+    async def groups_sync(request: Request) -> JSONResponse:
+        """手册改了立刻同步，不等出代。组是数据，不吃回归。"""
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import groups as gp
+
+        try:
+            info = await asyncio.to_thread(gp.sync_from_lessons, profile)
+        except Exception as e:  # noqa: BLE001
+            log.exception("同步指令组失败")
+            return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        return JSONResponse({"ok": True, **info})
+
+    @app.post("/api/groups/route")
+    async def groups_route(request: Request) -> JSONResponse:
+        """只试匹配，不执行。页面上的"喊一句"用它 —— 想先看它听懂了没有再跑。"""
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import groups as gp
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        text = str(body.get("text") or "").strip()
+
+        def _do():
+            world = gp.load_world(profile)
+            r = gp.route(text, gp.load_groups(profile), world)
+            out = r.to_dict()
+            # ok 表示"认出这一组了吗"，不是"接口通不通"。覆盖它会害页面把
+            # "没听懂"显示成"还跑不了" —— 两种状态对用户是完全不同的两件事。
+            out["routed"] = r.ok
+            # 缺口一起带回去：只"听"的时候最该看到的就是"认出来了，但缺什么"，
+            # 不然用户点了「开始」才知道跑不了。
+            gaps = r.group.gaps(world, _group_tpl_dir()) if r.group else []
+            out["gaps"] = gaps
+            out["ready"] = bool(r.group) and not gaps
+            return out
+
+        return JSONResponse(await asyncio.to_thread(_do))
+
+    @app.post("/api/command")
+    async def run_command(request: Request) -> JSONResponse:
+        """用户的命令进来：认出是哪一组就交给组执行器，认不出就把候选摆出来。
+
+        认不出时**不执行任何动作**。猜错的代价是几十秒到几分钟的错误操作，
+        而"没听懂"只丢几秒钟。这一条比召回率重要。
+        """
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import groups as gp
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"ok": False, "error": "命令是空的"})
+
+        world = gp.load_world(profile)
+        all_groups = gp.load_groups(profile)
+        r = gp.route(text, all_groups, world)
+        out = r.to_dict()
+        if not r.ok:
+            out.update({"ok": False, "routed": False,
+                        "error": r.why or "没认出是哪一组"})
+            return JSONResponse(out)
+        tpl_dir = _group_tpl_dir()
+        gaps = r.group.gaps(world, tpl_dir)
+        if gaps and not bool(body.get("force")):
+            # 缺模板还硬跑 = 每一步都点不出去，然后在超时里说"失败"，比不做更糟
+            out.update({"ok": False, "routed": True, "ready": False, "gaps": gaps,
+                        "error": "这一组还缺东西，跑不了：" + "；".join(gaps[:3])})
+            return JSONResponse(out)
+
+        fsm = _HUB.fsm if _HUB else None
+        # 喊一句"刷k7"就是让它开始干活，不该再让人去别的页面点一次「开始」。
+        # 但急停（PANIC）不自动解 —— 那是事故现场，必须人看过再解。
+        if fsm is not None:
+            from ..decision.fsm import State
+
+            if fsm.state == State.PANIC:
+                out.update({"ok": False, "routed": True,
+                            "error": "现在是急停状态，先解除急停再喊"})
+                return JSONResponse(out)
+            if fsm.state == State.PAUSED:
+                fsm.start()
+                log.info("指令组启动前自动恢复运行（原状态 PAUSED）")
+
+        runner = gp.GroupRunner(r.group, world, tpl_dir,
+                                executor=(_HUB.executor if _HUB else None),
+                                fsm=fsm)
+        if _HUB is not None:
+            _HUB.ui_task = runner
+        log.info("指令组启动: %s（%d 步）← %r", r.group.name, len(r.group.steps), text)
+        out.update({"ok": True, "routed": True, "ready": True,
+                    "steps": len(r.group.steps),
+                    "message": f"开始跑「{r.group.name}」，共 {len(r.group.steps)} 步"})
+        return JSONResponse(out)
+
+    @app.delete("/api/groups/{gid}")
+    async def groups_forget(gid: str, request: Request) -> JSONResponse:
+        """忘掉一组。只由人触发 —— 学习过程永远不删组。"""
+        _require_token_header(request)
+        if profile is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        from .. import groups as gp
+
+        ok = await asyncio.to_thread(gp.forget_group, profile, gid)
+        return JSONResponse({"ok": ok, "message": "已删掉" if ok else "没有这一组"})
+
+    # ---------------- 引擎版本 ----------------
+    # 和"进化"是两件事：进化换配方（设备自己长），升级换引擎（只有人能推）。
+    # 页面只做"看"和"退"：装新包要 sudo + 重启服务，从网页点一下只会让人
+    # 以为已经换了。所以安装留在 shell，页面负责把话说清楚。
+
+    @app.get("/api/upgrade")
+    async def upgrade_state(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from .. import upgrade as upg
+        from .. import version
+
+        st = await asyncio.to_thread(upg.status, deep=True)
+        st["running"] = version.ENGINE_VERSION
+        # 指针和正在跑的代码不是同一个 → 说明切过了但还没重启
+        st["pending"] = bool(st.get("engine_version")) and st["engine_version"] != st["running"]
+        st["can_rollback"] = bool(st.get("previous")) and st["previous"] != st.get("engine_version")
+        return JSONResponse(st)
+
+    @app.post("/api/upgrade/rollback")
+    async def upgrade_rollback(request: Request) -> JSONResponse:
+        """退回上一版引擎。返回 restart_required=True 时，页面会提示"重启后生效"。"""
+        _require_token_header(request)
+        from .. import upgrade as upg
+
+        res = await asyncio.to_thread(upg.rollback)
+        return JSONResponse({"ok": bool(res.get("ok")), **res})
 
     @app.post("/api/preset/{name}")
     async def apply_named_preset(name: str, request: Request) -> JSONResponse:
@@ -592,11 +889,21 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
 
     @app.post("/api/task/stop")
     async def stop_task(request: Request) -> JSONResponse:
+        """停手。页面上这个按钮的含义是"立刻别动了"，所以任务和引擎一起停。
+
+        只清任务不停引擎的后果：点了停，人走开了，它还在自由刷 ——
+        按钮叫「停」，那就必须是真的停。
+        """
         _require_token_header(request)
         hub_ = _HUB
         t = hub_.ui_task if hub_ else None
-        hub_.ui_task = None
-        return JSONResponse({"ok": True, "stopped": t.name if t else None})
+        if hub_ is not None:
+            hub_.ui_task = None
+            if t is not None and getattr(t, "wants_scene", False) and hub_.fsm is not None:
+                hub_.fsm.stop()
+        return JSONResponse({"ok": True, "stopped": t.name if t else None,
+                             "engine": "paused" if (t is not None and
+                                                    getattr(t, "wants_scene", False)) else ""})
 
     @app.get("/api/task/status")
     async def task_status(request: Request) -> JSONResponse:

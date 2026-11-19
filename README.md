@@ -701,7 +701,23 @@ systemctl status autogame
 cat /opt/auto-game/.token
 ```
 
-### 3. 视觉标定（三步，全部有工具）
+### 3. 升级与回退（引擎可换，数据不动）
+
+引擎**不能在设备上改**，但可以整包换：解到 `releases/<版本>/`、用新引擎在真实数据上
+自检、过了才切指针。数据和代码分住在两个根上，升级一个字都不碰用户的图。
+
+```bash
+# 开发机
+python tools/release.py                      # → dist/autogame-0.2.0.tar.gz
+
+# 设备
+sudo autogame-install autogame-0.2.1.tar.gz  # 校验 → 自检 → 切指针（失败原地不动）
+sudo systemctl restart autogame              # 重启后生效
+```
+
+细节（布局、三个版本号、每一步失败会怎样、只读怎么保证）：[docs/升级引擎.md](docs/升级引擎.md)
+
+### 4. 视觉标定（三步，全部有工具）
 
 ```bash
 # ① 游戏里出现目标光柱 → 抓图
@@ -925,6 +941,7 @@ tools/                   # preflight 自检 / stuck_demo 卡壳自愈演示 / e2
                          # / batch_validate / video_replay / soak
 firmware/rp2040/         # RP2040 组合 HID 固件 (.ino + platformio.ini + README)
 scripts/                 # J4125 部署 / RPi5 gadget / benchmark / 打包 EXE
+deploy/                  # 可升级布局：启动器 + systemd 单元 + 首次安装脚本
 web/                     # 监控仪表盘 + 图片审查页
 tests/                   # 286 用例（fixtures 内含 9 张真实帧，12MB）
 templates/               # 标定资产：aframe.png / skillbar*.png / ui/（必须入库）

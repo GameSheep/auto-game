@@ -134,7 +134,10 @@ class SimWorld:
         self.map_clears += 1
         self.map_cleared = False
         self._clear_at = None
-        self._last_spawn = now - self.spawn_interval  # 立即刷怪
+        # 立即刷怪。多留 1ms：`now - interval` 再被 `now' - _last_spawn` 减回来，
+        # 浮点会得到 2.19999999995（差 4.6e-11），`>= interval` 就判成"还没到点"，
+        # 表现为"点了『再次挑战』却没刷出光柱"。时间戳判据不要卡在边界上。
+        self._last_spawn = now - self.spawn_interval - 1e-3
         self.objective_world = self._new_objective()
         self._objective_hit = False
         log.info("模拟器: 『再次挑战』点击成功 → 第 %d 张图", self.map_clears + 1)

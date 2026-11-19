@@ -1,0 +1,34 @@
+{
+"labels.json": {
+"mtime": 1794989107,
+"size": 2456
+},
+"lessons/tli.md": {
+"mtime": 1795060547,
+"size": 5688
+},
+"refs/tli_combat_01.jpg": {
+"mtime": 1794966284,
+"size": 57730
+},
+"refs/tli_combat_02.jpg": {
+"mtime": 1794966284,
+"size": 58775
+},
+"refs/tli_nether_map_01.jpg": {
+"mtime": 1794966284,
+"size": 57198
+},
+"templates/gate_neg_nether_title.png": {
+"mtime": 1794990536,
+"size": 54160
+},
+"templates/gate_pos_boss.png": {
+"mtime": 1794990536,
+"size": 163014
+},
+"templates/gate_pos_skillwheel.png": {
+"mtime": 1794990536,
+"size": 92635
+}
+}

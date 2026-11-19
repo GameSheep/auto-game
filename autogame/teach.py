@@ -63,12 +63,13 @@ KIND_FLOW = "flow"
 KIND_KEY = "key"
 KIND_TABOO = "taboo"
 KIND_TERM = "term"
+KIND_GROUP = "group"
 KIND_UNKNOWN = "unknown"
 
 KIND_LABEL = {
     KIND_SCENE: "界面", KIND_OBJECT: "物体", KIND_FLOW: "流程",
     KIND_KEY: "键位", KIND_TABOO: "禁忌", KIND_TERM: "术语",
-    KIND_UNKNOWN: "没看懂",
+    KIND_GROUP: "指令组", KIND_UNKNOWN: "没看懂",
 }
 
 _SECTION_ALIASES = {
@@ -77,6 +78,10 @@ _SECTION_ALIASES = {
     "object": KIND_OBJECT, "item": KIND_OBJECT,
     "流程": KIND_FLOW, "玩法": KIND_FLOW, "循环": KIND_FLOW, "步骤": KIND_FLOW,
     "flow": KIND_FLOW,
+    # 「指令组」= 有名字的任务：喊一声就跑整套。和「流程」的区别是流程只说明玩法，
+    # 组要能被叫出来、要能被执行器推进，所以它多出「喊作 / 起点 / 失败怎么办」。
+    "指令组": KIND_GROUP, "任务": KIND_GROUP, "组": KIND_GROUP, "宏": KIND_GROUP,
+    "group": KIND_GROUP, "macro": KIND_GROUP, "task": KIND_GROUP,
     "键位": KIND_KEY, "按键": KIND_KEY, "操作": KIND_KEY, "key": KIND_KEY, "keys": KIND_KEY,
     "禁忌": KIND_TABOO, "别做": KIND_TABOO, "注意事项": KIND_TABOO, "taboo": KIND_TABOO,
     "术语": KIND_TERM, "黑话": KIND_TERM, "简称": KIND_TERM, "叫法": KIND_TERM,
@@ -98,6 +103,13 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "note": ("备注", "note", "说明"),
     "pos": ("位置", "在哪", "pos", "在", "方位", "方向", "画面位置"),
     "tpl_name": ("模板名", "文件名", "name", "slug", "tpl"),
+    # ---- 指令组专用 ----
+    "say": ("喊作", "叫我", "口令", "别名", "触发词", "say", "alias", "trigger"),
+    "start": ("起点", "从哪开始", "开始界面", "start", "from"),
+    "until": ("直到", "完成条件", "做完的标志", "until"),
+    "loop": ("循环", "交给", "loop", "delegate"),
+    "target": ("目标", "点它", "点这个", "target", "click"),
+    "on_fail": ("失败", "没用时", "怎么办", "on_fail", "fallback"),
 }
 
 # 键位动作 → (decision 下的点路径, 别名)。路径为空 = 配置里没这个概念，单独报。
@@ -456,6 +468,16 @@ def check_claims(lessons: list[Lesson], prof: Any, cfg: Any,
 
             if c.kind in (KIND_FLOW, KIND_TABOO, KIND_TERM):
                 row["detail"] = "文字类：已写进 game.md，供模型参考（无法用像素验）"
+                rows.append(row)
+                continue
+
+            if c.kind == KIND_GROUP:
+                # 指令组不是界面样本，不该要图 —— 它的"验证"是能不能被喊出来、
+                # 缺哪个模板，那些在「指令」页说，不在这里。
+                steps = len([ln for ln in c.body if ln.strip()])
+                row["status"] = "skip"
+                row["detail"] = (f"指令组：{steps} 步，喊得出就写得对。"
+                                f"缺模板/步骤的检查在「指令」页")
                 rows.append(row)
                 continue
 
@@ -845,6 +867,54 @@ def write_game_md(res: TeachResult, knowledge_dir: Path) -> Path:
         new = old.rstrip() + sep + block + "\n"
     p.write_text(new, encoding="utf-8")
     return p
+
+
+def append_note(profile: Any, when: str, todo: str, *,
+                lesson_dir: Path | None = None) -> tuple[Path, str]:
+    """把玩家随口说的一条经验，写成手册认得的「流程」条目。
+
+    ## 为什么要这个入口
+
+    在电视盒子上，玩家想到"背包满了得先回城"的时候，不该被要求：找到 lessons/、
+    打开 md、照着格式写 `- 一眼认出:`。那不是人能顺手做的事。所以问两个问题就够了：
+
+        什么时候用得上    →  - 一眼认出:
+        该怎么做          →  - 该做什么:
+
+    写进去之后不再需要"点学一遍"——材料一变，持续学习自己会接手（`learner`）。
+
+    ## 为什么不清成自由文本
+
+    自由文本进不了任何地方：解析器不认，模型读了也不知道该在什么时候用。
+    宁可要求两个短句，也不要写一段"看起来很用心但其实没用"的笔记。
+    """
+    import time as _time
+
+    def clean(s: str) -> str:
+        # 压成一行：换行会造出新段落，`##` 会把后面的话变成标题，两者都能把
+        # 手册结构搞坏，而用户完全是无心的。
+        s = " ".join(str(s or "").split())
+        return s.replace("`", "'")[:500]
+
+    w, t = clean(when), clean(todo)
+    if len(w) < 2 or len(t) < 2:
+        raise ValueError("两句话都要写，各自至少两个字")
+
+    d = lesson_dir or (Path(profile.root) / "lessons")
+    d.mkdir(parents=True, exist_ok=True)
+    files = sorted(p for p in d.glob("*.md")
+                   if p.name.lower() not in ("readme.md", "index.md"))
+    if files:
+        path = files[0]
+    else:
+        path = d / "补充.md"
+        path.write_text("# 玩家补充\n\n", encoding="utf-8")
+
+    stamp = _time.strftime("%Y-%m-%d %H:%M")
+    block = f"\n## 流程 · 补充 {stamp}\n- 一眼认出: {w}\n- 该做什么: {t}\n"
+    old = path.read_text(encoding="utf-8")
+    path.write_text(old.rstrip() + "\n" + block, encoding="utf-8")
+    return path, block.strip()
 
 
 def write_labels(res: TeachResult, labels_path: Path) -> tuple[int, Path]:

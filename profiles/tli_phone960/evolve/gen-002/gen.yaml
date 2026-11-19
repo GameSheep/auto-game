@@ -1,0 +1,12 @@
+id: gen-002
+status: active
+parent: gen-001
+created: 1795062781.1607676
+digest: 69fffb8e1c13
+score:
+  strict_pass: 3
+  strict_total: 3
+  ratio: 1.0
+  fail: []
+rules_source: none
+note: 手册 11 条声明 / 1 份文件；模型不可用或输出不是 JSON：[WinError 10061] 由于目标计算机积极拒绝，无法连接。

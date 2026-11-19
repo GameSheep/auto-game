@@ -263,40 +263,150 @@ def history(profile: Any, limit: int = 50) -> list[dict]:
 # 材料指纹：材料没变就不该出新代
 # ---------------------------------------------------------------------------
 
-def materials_digest(profile: Any) -> str:
-    """把"程序会看的全部材料"折成一个指纹。
+def material_files(profile: Any) -> dict[str, dict]:
+    """程序会看的全部材料，一个文件一项：`键 → {size, mtime}`。
 
-    只算会看的东西：手册文本、refs 里的图（名字 + 尺寸）、templates 里的模板。
+    键是相对 profile 根的路径（`lessons/tli.md`、`refs/bag.png`、`labels.json`），
+    这样报给用户的就是"你改了哪个文件"，而不是一个 12 位十六进制。
     inbox 不算 —— 那是待标定的，还没进教学范围；算进去会让"丢一张图进 inbox"
     就触发一整代验证，白烧设备算力。
     """
-    h = hashlib.sha1()
     root = Path(profile.root)
+    out: dict[str, dict] = {}
 
-    for p in sorted((root / "lessons").glob("*.md")) if (root / "lessons").is_dir() else []:
-        h.update(p.name.encode())
-        h.update(p.read_bytes())
+    def add(p: Path, key: str) -> None:
+        try:
+            st = p.stat()
+        except OSError:
+            return
+        out[key] = {"size": int(st.st_size), "mtime": int(st.st_mtime)}
+
+    ld = root / "lessons"
+    if ld.is_dir():
+        for p in sorted(ld.glob("*.md")):
+            add(p, f"lessons/{p.name}")
 
     refs = root / "refs"
     if refs.is_dir():
         for p in sorted(refs.iterdir()):
-            if not p.is_file():
-                continue
-            st = p.stat()
-            h.update(f"{p.name}:{st.st_size}".encode())
+            if p.is_file():
+                add(p, f"refs/{p.name}")
 
     tdir = Path(profile.templates_dir)
     if tdir.is_dir():
         for p in sorted(tdir.glob("*.png")):
-            st = p.stat()
-            h.update(f"tpl:{p.name}:{st.st_size}".encode())
+            add(p, f"templates/{p.name}")
 
-    labels = Path(profile.labels_path)
-    if labels.exists():
-        h.update(b"labels:")
-        h.update(labels.read_bytes())
+    lp = Path(profile.labels_path)
+    if lp.exists():
+        add(lp, "labels.json")
+    return out
 
+
+def materials_digest(profile: Any) -> str:
+    """把"程序会看的全部材料"折成一个指纹：内容变了才变。
+
+    只算会看的东西（和 `material_files` 同一批文件）。图不整张读：尺寸 + 头 8KB
+    就够识别"同一张图被重新截过"——同名覆盖时用户最先改的就是像素开头，
+    而整读几十 MB 在 RK3566 上每轮都做没必要。
+    """
+    h = hashlib.sha1()
+    root = Path(profile.root)
+
+    def feed(p: Path, key: str) -> None:
+        h.update(key.encode())
+        try:
+            if p.suffix.lower() == ".png":
+                h.update(str(p.stat().st_size).encode())
+                with p.open("rb") as f:
+                    h.update(f.read(8192))
+            else:
+                h.update(p.read_bytes())
+        except OSError:
+            h.update(b"<unreadable>")
+
+    for key in material_files(profile):
+        feed(root / key, key)
     return h.hexdigest()[:12]
+
+
+def materials_delta(profile: Any, base: "Generation | None") -> dict:
+    """相对某一代，材料动了哪些。给页面报"待学清单"用。
+
+    只报文件级（新增/改了/删了），不报像素级 —— 用户要的是"你上次给的
+    `refs/bag.png` 我还没看"，不是一个 diff。老代没有 materials.json 时
+    `tracked=False`，页面就知道"只能列出当前材料，说不出哪些是新的"。
+    """
+    now = material_files(profile)
+    old: dict[str, dict] = {}
+    tracked = False
+    if base is not None:
+        p = Path(base.root) / "materials.json"
+        if p.exists():
+            try:
+                old = json.loads(p.read_text(encoding="utf-8")) or {}
+                tracked = True
+            except Exception:  # noqa: BLE001
+                old = {}
+    added = sorted(k for k in now if k not in old)
+    removed = sorted(k for k in old if k not in now)
+    changed = sorted(k for k in now if k in old
+                     and (now[k]["size"] != old[k]["size"]
+                          or now[k]["mtime"] != old[k]["mtime"]))
+    newest = max((v["mtime"] for v in now.values()), default=0)
+    return {"tracked": tracked, "added": added, "changed": changed,
+            "removed": removed, "newest": newest,
+            "n_files": len(now),
+            "empty": not (added or changed or removed)}
+
+
+def write_materials_snapshot(profile: Any, gen: "Generation") -> None:
+    """把这一代"看到的是哪些材料"存下来，下次才能说出差在哪。"""
+    p = Path(gen.root) / "materials.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(material_files(profile), ensure_ascii=False,
+                            indent=0, sort_keys=True), encoding="utf-8")
+
+
+def knowledge_delta(prev: "Generation | None", cur: "Generation") -> dict:
+    """这一代的知识相对上一代多了什么、少了什么（按条目比）。
+
+    少了什么比多了什么更重要：用户补了一条新说法，可能让旧说法被删掉。
+    不吭声地消失，等于悄悄改了它的认识 —— 所以学习回执里必须列出来。
+
+    `game.md` 的表格行和 `glossary.json` 的术语都算条目：用户补一句"光柱也叫光条"
+    只会进术语表，如果只 diff game.md，这次学习看起来就像什么都没学到。
+    """
+    def lines(g: "Generation | None") -> set[str]:
+        if g is None:
+            return set()
+        d = Path(g.root) / "knowledge"
+        if not d.is_dir():
+            return set()
+        out: set[str] = set()
+        for p in sorted(d.iterdir()):
+            try:
+                if p.suffix == ".md":
+                    for raw in p.read_text(encoding="utf-8").splitlines():
+                        s = raw.strip()
+                        if s and not s.startswith("#") and not s.startswith("<!--"):
+                            out.add(s)
+                elif p.suffix == ".json":
+                    doc = json.loads(p.read_text(encoding="utf-8"))
+                    terms = doc.get("terms") if isinstance(doc, dict) else None
+                    if isinstance(terms, dict):
+                        for k, v in terms.items():
+                            out.add(f"术语 {k}：{v}")
+                    elif isinstance(terms, list):
+                        for t in terms:
+                            out.add(json.dumps(t, ensure_ascii=False, sort_keys=True))
+            except Exception:  # noqa: BLE001
+                log.warning("knowledge 条目读不出: %s", p, exc_info=True)
+        return out
+
+    a, b = lines(prev), lines(cur)
+    return {"added": sorted(b - a)[:40], "removed": sorted(a - b)[:40],
+            "n_added": len(b - a), "n_removed": len(a - b)}
 
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1192,22 @@ def build(profile: Any, cfg: Any, *, force: bool = False,
         (root / "rule_errors.txt").write_text(
             "\n".join(str(e) for e in rule_errors), encoding="utf-8")
 
+    # 3) 记下"这一代吃的是哪些材料"以及"相对上一代变了什么"。
+    #    没有这份，下一页就只能说"材料指纹变了"，说不出"你新给了两张图"。
+    prev_gen = active_generation(profile)
+    write_materials_snapshot(profile, gen)
+    delta = materials_delta(profile, prev_gen)
+    delta["vs"] = prev_active
+    kd = knowledge_delta(prev_gen, gen)
+    delta["knowledge"] = kd
+    # 手册改了、知识一个字都没变 = 用户写的格式没被认出来。
+    # 这比"回归没过"更值得说：没过至少知道没生效，这个看起来像成功了。
+    touched_lesson = any(k.startswith("lessons/")
+                         for k in delta["added"] + delta["changed"])
+    delta["blind"] = bool(touched_lesson and not (kd["n_added"] or kd["n_removed"]))
+    (root / "delta.json").write_text(
+        json.dumps(delta, ensure_ascii=False, indent=2), encoding="utf-8")
+
     return gen, gen.note
 
 
@@ -1179,24 +1305,58 @@ def evolve(profile: Any, cfg: Any, *, force: bool = False,
         return {"ok": False, "stage": "audit", "audit": audit.to_dict(),
                 "message": audit.summary()}
 
+    # 先把手册里的"指令组"同步出来：它是数据，不吃回归、不换代也该更新 ——
+    # 用户补一句"刷k7 是这么打的"，能立刻喊得动，不该等到下一版配方。
+    # 失败不拦出代：组是附加层，坏了最多喊不动，不能让整代卡住。
+    groups_info: dict = {}
+    try:
+        from .groups import sync_from_lessons
+
+        groups_info = sync_from_lessons(profile)
+    except Exception:  # noqa: BLE001
+        log.warning("指令组同步失败（不影响出代）", exc_info=True)
+
     gen, note = build(profile, cfg, force=force, use_model=use_model)
     if gen is None:
         return {"ok": False, "stage": "build", "audit": audit.to_dict(),
-                "message": note}
+                "message": note, "groups": groups_info}
+
+    # 每代留一份组快照：只用于回答"这一代当时看到的是哪几组、哪些能跑"。
+    # 加载组永远读 profile/groups/ —— 回退配方不该让一个能喊的任务消失。
+    try:
+        _write_groups_snapshot(profile, gen, groups_info)
+    except Exception:  # noqa: BLE001
+        log.warning("组快照写入失败", exc_info=True)
 
     score = score_generation(profile, gen)
     ok, reason = promote(profile, gen, score=score)
     return {"ok": ok, "stage": "promote", "gen": gen.id, "audit": audit.to_dict(),
             "score": {k: score[k] for k in ("strict_pass", "strict_total", "ratio")},
             "fail": score.get("fail") or [], "message": reason,
-            "promoted": ok}
+            "promoted": ok, "groups": groups_info}
+
+
+def _write_groups_snapshot(profile: Any, gen: "Generation", info: dict) -> None:
+    from .groups import load_groups, load_world
+
+    world = load_world(profile)
+    tpl_dir = gen.resolved_templates(profile)
+    rows = []
+    for g in load_groups(profile):
+        gaps = g.gaps(world, tpl_dir)
+        rows.append({"id": g.id, "name": g.name, "say": g.say, "start": g.start,
+                     "steps": len(g.steps), "ready": not gaps, "gaps": gaps})
+    (gen.root / "groups.json").write_text(
+        json.dumps({"synced": info, "groups": rows}, ensure_ascii=False, indent=2),
+        encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
 # 自我纠正：从运行日志里挖"我在哪儿不确定"
 # ---------------------------------------------------------------------------
 
-def collect_wanted(profile: Any, *, limit: int = 200) -> dict:
+def collect_wanted(profile: Any, *, limit: int = 200,
+                   logs_dir: str | Path | None = None) -> dict:
     """扫审计日志，把"我不确定/我错了"聚成一份"要你补什么材料"。
 
     这是"自我纠正"唯一诚实的形态。模型自己改参数不叫纠正，叫漂移；
@@ -1208,9 +1368,12 @@ def collect_wanted(profile: Any, *, limit: int = 200) -> dict:
         evaluate 里 unknown 非空    → 规则引用了没产出的字段
     """
     from .teach import load_lessons
+    from . import paths
 
     root = Path(profile.root)
-    logs = Path("logs")
+    # 台账是数据：默认按数据根找，不看 cwd（systemd 下 cwd 是 `/`，相对路径会静默读不到）。
+    # logs_dir 是给测试/离线分析用的显式入口。
+    logs = Path(logs_dir) if logs_dir else paths.data("logs")
     signals: dict[str, int] = {}
     samples: list[dict] = []
 

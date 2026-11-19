@@ -188,6 +188,74 @@ td.num{width:64px} td.ck{width:28px;text-align:center}
 #page-evolve code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--soft);
   border-radius:3px;padding:0 4px;font-size:11.5px}
 
+/* 持续学习的状态条：一行字说明"现在在等什么"，比一个灰按钮有用 */
+.learn{display:flex;align-items:center;gap:10px;padding:8px 11px;border:1px solid var(--line);
+  border-radius:6px;background:var(--soft);font-size:12.5px;margin-bottom:8px}
+.learn .lz{display:flex;align-items:center;gap:7px;flex:1;min-width:0;line-height:1.5}
+.learn .lz b{font-weight:600}
+.pulse{width:7px;height:7px;border-radius:50%;background:#a1a1aa;flex:none}
+.pulse.ok{background:#16a34a}
+.pulse.busy{background:var(--accent);animation:pl 1.5s ease-in-out infinite}
+.pulse.warn{background:#d97706}
+.pulse.bad{background:var(--bad)}
+@keyframes pl{0%,100%{opacity:1}50%{opacity:.25}}
+.pend{display:flex;flex-wrap:wrap;gap:4px 6px;align-items:center;font-size:11.5px;
+  color:var(--muted);line-height:1.8}
+.pend .f{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--panel);
+  border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--ink)}
+.pend .k{color:var(--muted);margin-right:2px}
+
+/* 补一条经验：两句话，两个框，不要求懂 markdown */
+.note-form{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+.note-form .nf{display:flex;flex-direction:column;gap:4px;flex:1;min-width:200px}
+.note-form .nf span{font-size:11.5px;color:var(--muted)}
+.note-form input{padding:7px 9px;border:1px solid var(--line);border-radius:6px;
+  background:var(--panel);font-size:12.5px;outline:none;color:var(--ink)}
+.note-form input:focus{border-color:var(--accent)}
+
+/* ============ 指令组 ============ */
+.shout{display:flex;gap:8px;align-items:center}
+.shout input{flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:7px;
+  background:var(--panel);font-size:14px;outline:none;color:var(--ink)}
+.shout input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #eff4ff}
+.shout .btn{padding:9px 16px;font-size:13px}
+/* 匹配回执：认出来了就一句"为什么"，认不出来就把候选摆出来 */
+.mres{margin-top:10px;padding:9px 12px;border-radius:6px;font-size:12.5px;
+  border:1px solid var(--line);background:var(--soft);line-height:1.7}
+.mres.ok{border-color:#bbf7d0;background:#f0fdf4}
+.mres.bad{border-color:#fecaca;background:#fef2f2}
+.mres.amb{border-color:#fde68a;background:#fffbeb}
+.mres b{font-weight:600}
+.mres .pick{display:inline-block;margin:3px 6px 0 0;padding:2px 9px;border-radius:5px;
+  border:1px solid var(--line);background:var(--panel);cursor:pointer;font-size:12px}
+.mres .pick:hover{border-color:var(--accent);color:var(--accent)}
+
+/* 组卡：名字 + 喊法 + 步骤，一行一组，缺东西的整行标黄 */
+.gcard{border:1px solid var(--line);border-radius:7px;padding:10px 12px;margin-bottom:8px}
+.gcard:last-child{margin-bottom:0}
+.gcard .gt{display:flex;align-items:center;gap:8px;margin-bottom:5px;flex-wrap:wrap}
+.gcard .gn{font-size:13.5px;font-weight:600}
+.gcard .gsay{font-size:11.5px;color:var(--muted);margin-left:2px}
+.gcard .gsay i{font-style:normal;background:var(--soft);border-radius:4px;
+  padding:1px 5px;margin-right:4px}
+.gcard .gsteps{font-size:12px;color:var(--muted);line-height:1.85}
+.gcard .gsteps em{font-style:normal;color:var(--ink);font-family:ui-monospace,Menlo,Consolas,monospace;
+  font-size:11.5px;margin-right:5px}
+.gcard .ggap{font-size:11.5px;color:var(--bad);margin-top:5px;line-height:1.7}
+.gcard .gact{margin-left:auto;display:flex;gap:6px;flex:none}
+.gcard .gact .btn{padding:3px 10px;font-size:11.5px}
+/* 缺东西的组只是左边一道黄边，不整体变淡 —— 变淡会让人以为"这组不能点"，
+   其实它只是缺一张模板，说一声就能补。 */
+.gcard.dim{border-left:3px solid #f59e0b}
+
+/* 世界层摘要：四格，一眼看出"共用的是什么" */
+.wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.wcell{border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:var(--soft)}
+.wcell .wk{font-size:11px;color:var(--muted)}
+.wcell .wv{font-size:12.5px;margin-top:3px;line-height:1.65}
+.wcell .wv span{display:inline-block;background:var(--panel);border:1px solid var(--line);
+  border-radius:4px;padding:0 5px;margin:1px 3px 1px 0;font-size:11.5px}
+
 /* switch */
 .switch{position:relative;display:inline-flex;align-items:center;cursor:pointer;flex:none}
 .switch input{position:absolute;opacity:0;width:0;height:0}
@@ -212,6 +280,7 @@ td.num{width:64px} td.ck{width:28px;text-align:center}
     <button data-page="params" class="on">参数</button>
     <button data-page="camera">摄像头</button>
     <button data-page="alert">告警</button>
+    <button data-page="cmd">指令</button>
     <button data-page="evolve">进化</button>
   </nav>
   <div class="spacer"></div>
@@ -315,22 +384,97 @@ td.num{width:64px} td.ck{width:28px;text-align:center}
   </div>
 </section>
 
+<!-- ============ 指令组 ============ -->
+<!-- 这一页回答"我教会它的任务，怎么用一句话叫出来"。
+     核心不是按钮多好看，而是：喊完之后它认得出是哪一组、为什么认出来、
+     缺什么就跑不了。认不出比认错好 —— 所以宁可列候选也不猜。 -->
+<section class="page" id="page-cmd">
+  <div class="card">
+    <div class="sec-hd">喊一句<span id="cmdState"></span></div>
+    <div class="shout">
+      <input id="cmdText" placeholder="刷k7" autocomplete="off" spellcheck="false">
+      <button class="btn" id="cmdTry" title="只试匹配，不动手">只听</button>
+      <button class="btn primary" id="cmdRun">开始</button>
+      <button class="btn" id="cmdStop" title="停下手里的任务，把控制权交回自由模式">停</button>
+    </div>
+    <div id="cmdMatch"></div>
+    <div id="cmdNow" style="display:none"></div>
+    <p class="hint" style="margin:10px 0 0">
+      认得出的直接跑；分不清就把候选摆出来让你选，认不出就什么都不做。
+      猜错一次不是多点一下，是好几分钟的错误操作。
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="sec-hd">会的任务<span id="cmdCount"></span></div>
+    <div id="cmdGroups"><div class="muted">读取中…</div></div>
+    <p class="hint" style="margin:10px 0 0">
+      每个组只写「先点什么、什么时候算打完、再来一局」；怎么走位、怎么捡、怎么脱困
+      全由引擎负责 —— 所以加一组不会影响别的组，也不会把别组的本事弄丢。
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="sec-hd">它认识的世界<span>所有组共用这一份</span></div>
+    <div id="cmdWorld"></div>
+    <p class="hint" style="margin:10px 0 0">
+      术语、界面、物体、键位、禁忌只有这一份。新教一组只能往这里添，不会另起一套 ——
+      这就是"进了另一组也不会把上一组忘了"的原因：忘不忘取决于认识存在哪，
+      不存在组里就忘不掉。
+    </p>
+  </div>
+
+  <div class="card" id="cmdIssuesCard" style="display:none">
+    <div class="sec-hd">要你定一下</div>
+    <div id="cmdIssues"></div>
+  </div>
+</section>
+
 <!-- ============ 进化 ============ -->
 <section class="page" id="page-evolve">
   <div class="card">
-    <div class="sec-hd">当前这一代</div>
-    <div class="rowbar" style="margin-bottom:10px">
+    <div class="sec-hd">当前这一代<span id="evAutoHint"></span></div>
+    <div class="rowbar" style="margin-bottom:8px">
       <span class="lbl" id="evGen">—</span>
       <div style="flex:1"></div>
       <button class="btn" id="evRefresh">刷新</button>
       <button class="btn" id="evRollback" title="设备上没有 git，学坏了就靠这个回到上一版">退回上一代</button>
-      <button class="btn primary" id="evRun">学一遍</button>
+      <button class="btn primary" id="evRun">现在学</button>
     </div>
-    <p class="hint" style="margin:0 0 10px">
-      改了截图或玩法描述之后点「学一遍」：先体检材料，再编手册、出规则、跑回归，
-      全部通过才换到新的一代。不通过就停在原地，并告诉你哪一条退化了。
+
+    <!-- 持续学习：材料一直会长，所以不是"点一次学一遍"，而是盯着材料自己学 -->
+    <div class="learn" id="evLearner">
+      <div class="lz"><span class="pulse" id="evPulse"></span><span id="evLearnTxt">读取中…</span></div>
+      <label class="switch" title="材料变了就自己学。关掉之后只在点「现在学」时动">
+        <input type="checkbox" id="evAuto"><span class="track"></span></label>
+    </div>
+    <div id="evPending"></div>
+    <p class="hint" style="margin:8px 0 10px">
+      你不用记得点：往手册里补一句、往 refs 里丢张图，安静几十秒它就自己学一遍，
+      过回归才换到新的一代。机器人正在跑的时候不学 —— 不在它手里换配方。
+      不通过就停在原地，并告诉你哪一条退化了；同一份材料不会反复重试，改了才会再试。
     </p>
     <div id="evNeeds"></div>
+  </div>
+
+  <div class="card">
+    <div class="sec-hd">补一条经验<span>想到就写，不用等</span></div>
+    <p class="hint" style="margin:0 0 10px">
+      玩的时候想到的，直接写两句话。写进手册之后不用再点「现在学」——
+      材料一变，上面那条自己会学一遍，过回归才生效。
+    </p>
+    <div class="note-form">
+      <label class="nf">
+        <span>什么时候用得上</span>
+        <input id="evNoteWhen" placeholder="例：拾取时提示背包已满">
+      </label>
+      <label class="nf">
+        <span>该怎么做</span>
+        <input id="evNoteTodo" placeholder="例：先回城清包，别继续点拾取">
+      </label>
+      <button class="btn primary" id="evNoteSave">记下来</button>
+    </div>
+    <div id="evNoteHint"></div>
   </div>
 
   <div class="card">
@@ -341,6 +485,22 @@ td.num{width:64px} td.ck{width:28px;text-align:center}
   <div class="card">
     <div class="sec-hd">代数记录</div>
     <ul class="hist" id="evGens"><li class="muted">还没有任何一代</li></ul>
+  </div>
+
+  <div class="card">
+    <div class="sec-hd">引擎</div>
+    <div class="rowbar" style="margin-bottom:10px">
+      <span class="lbl" id="upVer">—</span>
+      <div style="flex:1"></div>
+      <button class="btn" id="upRefresh">刷新</button>
+      <button class="btn" id="upRollback" title="换回上一版引擎。和上面「退回上一代」是两件事：那个退配方，这个退代码">退回上一版</button>
+    </div>
+    <p class="hint" style="margin:0 0 8px">
+      上面是<b>配方</b>（规则/模板，设备自己学出来的），这里是<b>引擎</b>（代码）。
+      引擎不能在设备上改：新包先在真实数据上自检，过了才切过去，没过就留在原地。
+      装新包要在命令行做（要 sudo 和重启服务），所以这里只负责「看」和「退」。
+    </p>
+    <div id="upDetail"></div>
   </div>
 </section>
 </main>
@@ -910,11 +1070,211 @@ function refreshAlerts(){
 }
 
 
+/* ============ 指令组 ============ */
+/* 这一页回答"我教会它的任务，怎么用一句话叫出来"。
+   两件事不能含糊：认出来是哪一组、为什么认出来；缺什么就跑不了。
+   认不出时给候选不猜 —— 猜错的代价是几分钟错误操作，句号。 */
+let CMD=null, CMD_BUSY=false, CMD_TIMER=null;
+
+function cmdStepLine(s,i){
+  const kind={click:"点",key:"按",wait:"等",delegate:"交引擎",unknown:"?"}[s.kind]||s.kind;
+  let t=s.target||"";
+  if(s.kind==="delegate") t=s.until?("直到 "+s.until):"跑到底";
+  else if(s.kind==="click"||s.kind==="key") t=s.target||"";
+  else if(s.kind==="wait") t=s.until||"";
+  const j=s.jump?` <span class="muted">· 回第 ${s.jump} 步</span>`:"";
+  return `<div><em>${i}.</em>${esc(kind)} ${esc(t)}${j}</div>`;
+}
+
+function refreshCmd(){
+  $("cmdGroups").innerHTML='<div class="muted">读取中…</div>';
+  api("/api/groups").then(d=>{
+    if(!d.ok){ $("cmdGroups").innerHTML=`<div class="muted">${esc(d.error||"不可用")}</div>`; return; }
+    CMD=d;
+    const gs=d.groups||[];
+    const ready=gs.filter(g=>g.ready).length;
+    $("cmdCount").textContent=gs.length?`${gs.length} 组 · ${ready} 组能跑`:"";
+    $("cmdGroups").innerHTML=gs.length?gs.map(g=>{
+      const say=[g.name].concat(g.say||[]).filter((v,i,a)=>a.indexOf(v)===i);
+      return `<div class="gcard${g.ready?"":" dim"}">
+        <div class="gt">
+          <span class="gn">${esc(g.name)}</span>
+          ${g.ready?'<span class="badge ok">能跑</span>':'<span class="badge warn">缺东西</span>'}
+          <span class="gsay">${say.slice(1).map(s=>`<i>${esc(s)}</i>`).join("")}</span>
+          <span class="gact">
+            <button class="btn" data-say="${esc(g.name)}">试</button>
+            <button class="btn" data-forget="${esc(g.id)}" title="从会做的列表里去掉。学习过程不会自己删组">忘掉</button>
+          </span>
+        </div>
+        <div class="gsteps">${(g.steps||[]).map((s,i)=>cmdStepLine(s,i+1)).join("")}</div>
+        ${(g.gaps||[]).length?`<div class="ggap">${g.gaps.map(esc).join("<br>")}</div>`:""}
+      </div>`;
+    }).join(""):'<div class="muted">还不会任何任务。在手册里写一段「指令组 · 刷k7」，或者上「进化」页补描述。</div>';
+
+    $$("[data-say]").forEach(b=>b.onclick=()=>{ $("cmdText").value=b.dataset.say; tryCmd(false); });
+    $$("[data-forget]").forEach(b=>b.onclick=()=>{
+      if(!confirm("忘掉这一组？（文件会删掉，手册里还能重新学回来）")) return;
+      api("/api/groups/"+encodeURIComponent(b.dataset.forget),{method:"DELETE"})
+        .then(()=>{ toast("已忘掉"); refreshCmd(); }).catch(e=>toast(e.message,true));
+    });
+
+    const w=d.world||{};
+    $("cmdWorld").innerHTML=`<div class="wgrid">
+      <div class="wcell"><div class="wk">界面</div><div class="wv">${
+        (w.scenes||[]).length?(w.scenes||[]).map(s=>`<span>${esc(s)}</span>`).join(""):'<span class="muted">还没有</span>'}</div></div>
+      <div class="wcell"><div class="wk">物体</div><div class="wv">${
+        (w.objects||[]).length?(w.objects||[]).map(s=>`<span>${esc(s)}</span>`).join(""):'<span class="muted">还没有</span>'}</div></div>
+      <div class="wcell"><div class="wk">键位</div><div class="wv">${
+        Object.keys(w.keys||{}).length?Object.entries(w.keys).map(([k,v])=>`<span>${esc(k)}: ${esc(v)}</span>`).join(""):'<span class="muted">还没有</span>'}</div></div>
+      <div class="wcell"><div class="wk">术语 / 禁忌</div><div class="wv">${num(w.terms)} 条 · ${num(w.taboos)} 条</div></div>
+    </div>`;
+
+    const issues=[];
+    (d.orphans||[]).forEach(id=>issues.push(
+      `<div class="gcard"><div class="gt"><span class="gn">${esc(id)}</span>
+        <span class="badge warn">手册里没了</span>
+        <span class="gact"><button class="btn" data-forget="${esc(id)}">删掉</button></span></div>
+        <div class="gsteps muted">文件还在，也还能跑 —— 手册改了一句话不该让一个能跑的任务凭空消失。</div></div>`));
+    (d.conflicts||[]).forEach(c=>issues.push(
+      `<div class="gcard"><div class="gt"><span class="gn">${esc(c.key||"")}</span>
+        <span class="badge bad">${esc(c.kind||"冲突")}</span></div>
+        <div class="gsteps">旧：${esc(c.old)} → 新：${esc(c.new)}<br>
+        <span class="muted">${esc(c.why||"")}</span></div></div>`));
+    $("cmdIssuesCard").style.display=issues.length?"":"none";
+    $("cmdIssues").innerHTML=issues.join("");
+    $$("#cmdIssues [data-forget]").forEach(b=>b.onclick=()=>{
+      if(!confirm("删掉这一组？")) return;
+      api("/api/groups/"+encodeURIComponent(b.dataset.forget),{method:"DELETE"})
+        .then(()=>{ toast("已删掉"); refreshCmd(); }).catch(e=>toast(e.message,true));
+    });
+  }).catch(e=>{
+    $("cmdGroups").innerHTML=`<div class="muted">${esc(e.message)}</div>`;
+  });
+}
+
+function cmdShowMatch(d,kind){
+  const el=$("cmdMatch");
+  if(!d.ok&&!d.routed){
+    el.className="mres bad";
+    el.innerHTML=`<b>没听懂</b>：${esc(d.why||"")}<br>
+      <span class="muted">什么都没做。说准一点点，或者下面挑一个。</span>`+
+      ((d.candidates||[]).length?`<div>${d.candidates.map(c=>
+        `<span class="pick" data-p="${esc(c.name)}">${esc(c.name)}</span>`).join("")}</div>`:"");
+  }else if(d.ambiguous){
+    el.className="mres amb";
+    el.innerHTML=`<b>都像</b>：${esc(d.why||"")}<div>${(d.candidates||[]).map(c=>
+      `<span class="pick" data-p="${esc(c.name)}">${esc(c.name)}</span>`).join("")}</div>`;
+  }else if(d.ready===false){
+    // 认出来了但缺东西：和"没听懂"是两件事，措辞必须分开
+    el.className="mres amb";
+    el.innerHTML=`<b>${esc(d.group)}</b> · ${esc(d.why||"")}<br>
+      还跑不了：${(d.gaps||[]).map(esc).join("；")}`;
+  }else{
+    el.className="mres ok";
+    el.innerHTML=`<b>${esc(d.group)}</b> · ${esc(d.why||"")}`+
+      (kind==="try"?`<br><span class="muted">点「开始」就跑这一组</span>`:`<br><span class="muted">已开始</span>`);
+  }
+  $$("#cmdMatch .pick").forEach(b=>b.onclick=()=>{ $("cmdText").value=b.dataset.p; tryCmd(false); });
+}
+
+/* 当前任务进度。组跑起来以后人最想知道的就是"到第几步了"，
+   不给看的话只能盯着画面猜，或者去翻日志。 */
+function refreshNow(){
+  const el=$("cmdNow"); if(!el) return;
+  api("/api/groups").then(d=>{
+    const t=d.active_task;
+    if(!t){ el.style.display="none"; if($("cmdState"))$("cmdState").textContent=""; return; }
+    el.style.display="";
+    el.className="mres"+(t.failed?" bad":"");
+    const i=Math.min(num(t.step,0)+1, num(t.total_steps,1));
+    el.innerHTML=(t.failed?"停下":"在跑")+` <b>${esc(t.name)}</b> · 第 ${i}/${num(t.total_steps,1)} 步`+
+      (t.current?` · ${esc(t.current)}`:"")+
+      (t.failed?`<br><span class="muted">${esc(t.failed)}</span>`:"");
+    $("cmdState").textContent=t.failed?"已停":"在跑";
+  }).catch(()=>{});
+}
+
+function tryCmd(run){
+  const text=($("cmdText").value||"").trim();
+  if(!text){ toast("先说一句",true); return; }
+  if(CMD_BUSY) return;
+  CMD_BUSY=true;
+  const btn=run?$("cmdRun"):$("cmdTry");
+  const old=btn.textContent; btn.disabled=true; btn.textContent="…";
+  const p=run?post("/api/command",{text}):post("/api/groups/route",{text});
+  p.then(d=>{
+    cmdShowMatch(d,run?"run":"try");
+    if(run&&d.ok){ saveState("ok","已开始："+d.group); toast(d.message||"开始跑"); refreshNow(); }
+    else if(run) saveState("warn","没开始");
+  }).catch(e=>{ toast(e.message,true); $("cmdMatch").className="mres bad";
+    $("cmdMatch").innerHTML=esc(e.message); })
+   .finally(()=>{ btn.disabled=false; btn.textContent=old; CMD_BUSY=false; });
+}
+
+
 /* ============ 二次进化 ============ */
-/* 这一页回答三个问题：我现在是第几代、材料够不够学、学坏了怎么退。
-   刻意不在这里放"手改阈值"——那是参数页的事。这里的动作只有两个：
-   把我给的材料学一遍（过回归才生效），或者退回去。 */
-let EV=null;
+/* 这一页回答四个问题：我现在是第几代、它自己有没有在学、材料够不够、学坏了怎么退。
+   刻意不在这里放"手改阈值"——那是参数页的事。 */
+let EV=null, EV_TIMER=null, EV_RUNNING=false;
+
+/* 状态条里的"还有 32 秒"会过时，所以停在这一页时轮询一次。
+   20 秒是拿捏过的：比自动学习的 15 秒间隔略长，够看到变化，又不至于每几秒打一次后端。 */
+function startEvTimer(){
+  stopEvTimer();
+  EV_TIMER=setInterval(()=>{ if(!EV_RUNNING) refreshEvolve(); },20000);
+}
+function stopEvTimer(){ if(EV_TIMER){clearInterval(EV_TIMER);EV_TIMER=null;} }
+
+function fmtAgo(s){
+  if(s==null) return "";
+  if(s<90) return Math.round(s)+" 秒前";
+  if(s<3600) return Math.round(s/60)+" 分钟前";
+  if(s<86400) return (s/3600).toFixed(1)+" 小时前";
+  return Math.round(s/86400)+" 天前";
+}
+
+/* 待学清单：告诉人"我还没看你给的哪几个文件"。
+   比指纹友好得多——指纹变了不是人话，"refs/bag.png 还没看"才是。 */
+function evPending(l){
+  const d=l.delta||{};
+  if(!d.n_files) return "";
+  // 上一代没存材料清单时，"新增"其实是"全部"，列出来只有噪音，直接说清楚口径。
+  if(!d.tracked){
+    return `<div class="pend"><span class="k">上一代没记材料清单，先按全部 ${d.n_files} 个文件算；这一代起会记</span></div>`;
+  }
+  if(d.empty) return "";
+  const grp=(label,arr)=>{
+    if(!arr||!arr.length) return "";
+    const head=arr.slice(0,5).map(f=>`<span class="f">${esc(f)}</span>`).join("");
+    const tail=arr.length>5?`<span>… 共 ${arr.length} 个</span>`:"";
+    return `<span class="k">${label}</span>${head}${tail}`;
+  };
+  const s=grp("新增",d.added)+grp("改了",d.changed)+grp("删了",d.removed);
+  return s?`<div class="pend">${s}</div>`:"";
+}
+
+function evLearner(l){
+  if(!l) return;
+  const code=l.code||"";
+  const cls={up_to_date:"ok",ready:"busy",waiting:"busy",cooling:"busy",
+             running:"busy",blocked:"warn",tried_out:"bad",off:""}[code]||"";
+  $("evPulse").className="pulse "+cls;
+  let txt=esc(l.text||"");
+  if(l.last_ts){
+    const res={promoted:"已上线",rejected:"未上线",error:"出错",
+               skipped:"没出代",duplicate:"没出代"}[l.last_result]||l.last_result||"";
+    txt+=` <span style="color:var(--muted)">· 上次${esc(fmtAgo(l.last_ago_s))}${res?`，${esc(res)}`:""}</span>`;
+  }
+  if(l.code==="tried_out"){
+    const why=(l.tried&&l.tried.message)||l.last_message;
+    if(why) txt+=`<div class="sub">上次没过：${esc(why)}</div>`;
+  }
+  $("evLearnTxt").innerHTML=txt;
+  $("evAuto").checked=!!l.enabled;
+  $("evPending").innerHTML=evPending(l);
+  $("evAutoHint").textContent=l.enabled
+    ? `每 ${Math.round(l.interval_s||15)} 秒看一眼材料` : "自动学习已关";
+}
 
 function evNeeds(audit){
   const rows=(audit.needs||[]).map(n=>{
@@ -940,22 +1300,28 @@ function evNeeds(audit){
 }
 
 function refreshEvolve(){
-  $("evGen").textContent="读取中…";
+  if(!EV) $("evGen").textContent="读取中…";
   api("/api/evolve").then(d=>{
     if(!d.ok){ $("evGen").textContent="不可用"; toast(d.error||"没有绑定 profile",true); return; }
     EV=d;
     const cur=(d.generations||[]).find(g=>g.status==="active");
-    const same=!!(cur&&cur.digest&&cur.digest===d.audit.digest);
     $("evGen").innerHTML=(d.active
       ? `当前 <b>${esc(d.active)}</b>　·　${esc(d.audit_summary)}`
-      : `还没进化过　·　${esc(d.audit_summary)}`)
-      + (same?`　<span style="color:var(--muted)">· 材料和这一代一致，改了再学</span>`:"");
+      : `还没进化过　·　${esc(d.audit_summary)}`);
     evNeeds(d.audit||{});
-    // 材料没变就别让人白点一次：指纹一样必然出不了新代，按钮直接说明。
-    $("evRun").disabled=!(d.audit&&d.audit.ready)||same;
+    evLearner(d.learner);
+    // 手册改了但没多认任何东西：说明格式没被认出来（比如术语写成了 `- 别名:`，
+    // 它只认表格）。不说的话，用户会以为"我补了描述，它已经会了"。
+    if(cur&&cur.delta&&cur.delta.blind){
+      $("evPending").innerHTML+=`<div class="pend" style="color:var(--bad)">
+        上次改了手册，但没有新增或改动任何认识 —— 多半是格式没被认出来。
+        界面/物体条目要写「- 图:」「- 判定:」，术语要写成表格。</div>`;
+    }
+    // 手动那一下不该被材料状态卡住：人点了就是想跑（比如刚换了模型想重跑一次回归）。
+    // 材料不够时仍然拦住 —— 那种情况跑了一定白跑。
+    $("evRun").disabled=EV_RUNNING||!(d.audit&&d.audit.ready);
     $("evRun").title=!d.audit||!d.audit.ready?"材料还不够，先按上面的提示补齐"
-      :(same?"材料指纹和当前这代一样，改了截图或手册再来":"");
-    if(same) $("evGen").innerHTML+="";
+      :"马上跑一次（不等自动学习的节奏）";
     $("evRollback").disabled=!(d.generations||[]).some(g=>g.status==="active"&&g.parent);
 
     $("evWanted").innerHTML=(d.wanted&&d.wanted.length)
@@ -967,8 +1333,17 @@ function refreshEvolve(){
           const sc=g.score||{};
           const frac=sc.strict_total?`${sc.strict_pass}/${sc.strict_total}`:"未验证";
           const st={active:"在用",rejected:"被拒",retired:"已退役",candidate:"待验证",baseline:"基线"}[g.status]||g.status;
+          // 这一代吃了什么、知识变了什么：持续学习最需要的不是"第几代"，
+          // 而是"这次比上次多认了什么、少认了什么"。
+          const dd=g.delta||{};
+          const bits=[];
+          if(dd.ma||dd.mc||dd.mr){
+            bits.push(`材料 ${dd.ma?`+${dd.ma}`:""}${dd.mc?` 改${dd.mc}`:""}${dd.mr?` -${dd.mr}`:""}`);
+          }
+          if(dd.ka||dd.kr) bits.push(`知识 +${dd.ka||0}${dd.kr?` / -${dd.kr}`:""}`);
           return `<li><span class="t">${esc(g.id)}</span>
-            <span><b>${esc(st)}</b>　台账 ${esc(frac)}${g.rules_source==="model"?"　· 有规则":""}</span>
+            <span><b>${esc(st)}</b>　台账 ${esc(frac)}${g.rules_source==="model"?"　· 有规则":""}${
+              bits.length?`　<span class="badge">${esc(bits.join("　"))}</span>`:""}</span>
             <span class="m">${esc((g.note||"").slice(0,60))}</span></li>`;
         }).join("")
       : '<li class="muted">还没有任何一代</li>';
@@ -976,29 +1351,71 @@ function refreshEvolve(){
 }
 
 function evBusy(on,text){
-  const b=$("evRun"); b.disabled=on; b.textContent=on?(text||"正在学…"):"学一遍";
+  EV_RUNNING=!!on;
+  const b=$("evRun"); b.disabled=on; b.textContent=on?(text||"正在学…"):"现在学";
 }
 
 $("evRefresh").onclick=refreshEvolve;
+
+/* 指令页：回车就等于"只听"，看清楚再点"开始"。手滑回车就跑起来太危险。 */
+$("cmdTry").onclick=()=>tryCmd(false);
+$("cmdRun").onclick=()=>tryCmd(true);
+$("cmdStop").onclick=()=>{
+  post("/api/task/stop",{}).then(r=>{
+    toast(r.stopped?("已停："+r.stopped):"手里没有在跑的任务");
+    saveState("","已停");
+    $("cmdMatch").className="mres"; $("cmdMatch").innerHTML="已停下，引擎也一起停了。";
+    refreshNow();
+  }).catch(e=>toast(e.message,true));
+};
+$("cmdText").addEventListener("keydown",e=>{
+  if(e.key==="Enter"){ e.preventDefault(); tryCmd(false); }
+});
+/* 开关：写进数据根的 learner.json，重启和换引擎都不丢。 */
+$("evAuto").onchange=e=>{
+  const on=e.target.checked;
+  post("/api/evolve/auto",{enabled:on}).then(r=>{
+    if(!r.ok){ toast(r.error||"改不了",true); e.target.checked=!on; return; }
+    toast(on?"自动学习已打开：材料变了就自己学":"自动学习已关：只在点「现在学」时动",false);
+    refreshEvolve();
+  }).catch(err=>{ toast(err.message,true); e.target.checked=!on; });
+};
 
 $("evRun").onclick=()=>{
   evBusy(true,"体检 + 回归中…（几十秒）");
   saveState("","正在跑回归");
   post("/api/evolve/run",{}).then(r=>{
-    if(r.stage && r.stage!=="promote"){
-      toast(r.message||"没出代",true);
-    }else{
+    const kind=r.kind||"";
+    if(kind==="promoted"){
       const sc=r.score||{};
-      const line=`台账 ${sc.strict_pass}/${sc.strict_total}`;
-      toast((r.promoted?("已上线："+line):("未上线："+(r.message||line))),!r.promoted);
+      toast(`已上线：台账 ${sc.strict_pass}/${sc.strict_total}`,false);
+    }else if(kind==="rejected"){
+      toast("未上线："+(r.message||"回归没过"),true);
+    }else{
+      toast(r.message||"没出代",true);
     }
-    if((r.fail||[]).length){
-      console.warn("回归失败项",r.fail);
-    }
-    saveState(r.promoted?"ok":"warn", r.promoted?"已换到新的一代":"停在原地");
+    if((r.fail||[]).length) console.warn("回归失败项",r.fail);
+    saveState(kind==="promoted"?"ok":"warn",
+      kind==="promoted"?"已换到新的一代":"停在原地");
     refreshEvolve();
   }).catch(e=>{ toast(e.message,true); saveState("err","失败"); })
     .finally(()=>evBusy(false));
+};
+
+$("evNoteSave").onclick=()=>{
+  const when=($("evNoteWhen").value||"").trim();
+  const todo=($("evNoteTodo").value||"").trim();
+  if(when.length<2||todo.length<2){ toast("两句话都要写，各自至少两个字",true); return; }
+  const b=$("evNoteSave"); b.disabled=true; b.textContent="记下…";
+  post("/api/evolve/note",{when,todo}).then(r=>{
+    if(!r.ok){ toast(r.error||"没写进去",true); return; }
+    $("evNoteWhen").value=""; $("evNoteTodo").value="";
+    $("evNoteHint").innerHTML=`<div class="sub fix">已写进 ${esc(r.file)}。
+      材料变了，它会自己学一遍；想过回归才生效，不过就停在原地。</div>`;
+    toast("记下了：材料变了，它自己会学",false);
+    refreshEvolve();
+  }).catch(e=>toast(e.message,true))
+    .finally(()=>{ b.disabled=false; b.textContent="记下来"; });
 };
 
 $("evRollback").onclick=()=>{
@@ -1009,6 +1426,55 @@ $("evRollback").onclick=()=>{
   }).catch(e=>toast(e.message,true));
 };
 
+/* ============ 引擎版本 ============ */
+/* 和上面那页的区别就一句话：上面退配方，这里退代码。
+   引擎升级不在网页上做 —— 装包要 sudo、要重启进程，网页点一下最多只能"切指针"，
+   而用户会以为已经换好了。宁可不给这个按钮，也不给一个骗人的按钮。 */
+function refreshUpgrade(){
+  $("upVer").textContent="读取中…";
+  api("/api/upgrade").then(d=>{
+    const running=d.running||"?";
+    const ptr=d.engine_version;
+    $("upVer").innerHTML= ptr
+      ? `引擎 <b>${esc(running)}</b>　·　数据 schema ${esc(d.data_schema)}`
+        + (d.pending?`　<span style="color:var(--warn,#b45309)">已切到 ${esc(ptr)}，重启后生效</span>`:"")
+      : `引擎 <b>${esc(running)}</b>　·　目录直跑（没有 release 指针）`;
+
+    let rows="";
+    if(d.pending){
+      rows+=`<li><span class="badge">待重启</span> 指针已经是 ${esc(ptr)}，
+        但正在跑的还是 ${esc(running)}。执行 <code>sudo systemctl restart autogame</code> 生效。</li>`;
+    }
+    if((d.releases||[]).length){
+      rows+=`<li><span class="badge">已装</span> `+(d.releases||[]).map(r=>
+        `<code>${esc(r.version)}</code>${r.version===ptr?"（在用）":""}`).join("　")+`</li>`;
+    }
+    if(d.verify){
+      rows+= d.verify.ok
+        ? `<li><span class="badge ok">一致</span> 引擎 ${d.verify.count} 个文件与发布清单完全一致</li>`
+        : `<li><span class="badge bad">被改过</span> ${(d.verify.modified||[]).length} 个文件与清单不一致
+             <div class="sub">设备上的引擎本该只读。这些改动在下次升级时会被覆盖 —— 要留就先提交到仓库再发包。</div></li>`;
+    }
+    if((d.snapshots||[]).length){
+      rows+=`<li><span class="badge">快照</span> ${esc((d.snapshots||[]).slice(0,3).map(s=>s.name).join("　"))}</li>`;
+    }
+    $("upDetail").innerHTML=rows?`<ul class="hist">${rows}</ul>`:"";
+    $("upRollback").disabled=!d.can_rollback;
+    $("upRollback").title=d.can_rollback
+      ? `退回到 ${d.previous}。重启服务后生效。`
+      : "没有上一版可退";
+  }).catch(e=>{ $("upVer").textContent="读不到引擎版本"; });
+}
+
+$("upRefresh").onclick=refreshUpgrade;
+$("upRollback").onclick=()=>{
+  if(!confirm("退回上一版引擎？切完要重启服务才生效。配方（学出来的规则和模板）不受影响。")) return;
+  post("/api/upgrade/rollback",{}).then(r=>{
+    toast(r.ok?("已切回 "+r.version+"，重启服务后生效"):(r.error||"退回失败"),!r.ok);
+    refreshUpgrade();
+  }).catch(e=>toast(e.message,true));
+};
+
 /* ============ 页面切换 / 启动 ============ */
 function switchPage(p){
   $$("#nav button").forEach(x=>x.classList.toggle("on",x.dataset.page===p));
@@ -1016,7 +1482,10 @@ function switchPage(p){
   const el=$("page-"+p); if(el)el.classList.add("on");
   if(p==="camera"){startStream();refreshCalib();}
   if(p==="alert")refreshAlerts();
-  if(p==="evolve")refreshEvolve();
+  if(p==="cmd"){refreshCmd();refreshNow();if(!CMD_TIMER)CMD_TIMER=setInterval(refreshNow,3000);}
+  else if(CMD_TIMER){clearInterval(CMD_TIMER);CMD_TIMER=null;}
+  if(p==="evolve"){refreshEvolve();refreshUpgrade();startEvTimer();}
+  else{stopEvTimer();}
   if(location.hash!=="#"+p) history.replaceState(null,"","#"+p);
 }
 $$("#nav button").forEach(b=>b.onclick=()=>switchPage(b.dataset.page));

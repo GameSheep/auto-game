@@ -495,7 +495,7 @@ def test_collect_wanted_turns_logs_into_asks(tmp_profile, monkeypatch, tmp_path)
         json.dumps({"verdict": "panic", "reason": "画面完全陌生", "scene": "?"}) + "\n"
         + json.dumps({"verdict": "hold", "reason": "拿不准该不该点"}) + "\n",
         encoding="utf-8")
-    doc = evolve.collect_wanted(tmp_profile)
+    doc = evolve.collect_wanted(tmp_profile, logs_dir=tmp_path / "logs")
     assert doc["signals"]["supervisor:panic"] == 1
     assert any("急停" in a for a in doc["asks"])
     assert any("反例图" in a for a in doc["asks"])
@@ -504,7 +504,7 @@ def test_collect_wanted_turns_logs_into_asks(tmp_profile, monkeypatch, tmp_path)
 
 def test_collect_wanted_is_quiet_without_logs(tmp_profile, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    doc = evolve.collect_wanted(tmp_profile)
+    doc = evolve.collect_wanted(tmp_profile, logs_dir=tmp_path / "logs")
     assert doc["signals"] == {}
     assert not any("急停" in a for a in doc["asks"])
 

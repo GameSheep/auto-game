@@ -1,0 +1,36 @@
+[Unit]
+Description=autogame vision/decision server (upgradeable release layout)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=autogame
+Group=autogame
+WorkingDirectory=/opt/autogame
+Environment=AUTOGAME_HOME=/opt/autogame
+Environment=AUTOGAME_DATA=/var/lib/autogame
+Environment=AUTOGAME_SUPERVISED=1
+ExecStart=/opt/autogame/bin/autogame
+Restart=always
+RestartSec=3
+# 升级工具切完指针后由它自己重启；这里兜住"进程意外退出"
+StartLimitIntervalSec=0
+
+# ---- 硬约束：引擎目录只读，只有数据根可写 ----
+# 这不是提醒，是内核保证。"引擎绝对不能改"靠的就是这几行：
+# 进程根本没有写 /opt/autogame/releases 的权限，改不了自己的代码。
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/opt/autogame
+ReadWritePaths=/var/lib/autogame
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+# USB gadget / 串口执行器需要设备节点（按需保留，别给整机）
+DeviceAllow=/dev/ttyACM0 rw
+DeviceAllow=/dev/ttyUSB0 rw
+DeviceAllow=char-usb_device rw
+
+[Install]
+WantedBy=multi-user.target

@@ -17,7 +17,14 @@ from pydantic import BaseModel, Field
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    """可写根：token 这类"机器自己的状态"要落在数据根。
+
+    设备上引擎目录是只读的（升级靠整包换目录），写在那里会直接抛 EROFS；
+    而且换代码时 token 跟着换，所有配对过的浏览器/采集代理全部掉线。
+    """
+    from . import paths
+
+    return paths.data_root()
 
 
 # 拟人化默认开关：单元测试/排障要可复现，可用 AUTOGAME_HUMANIZE=0 全局关掉。
@@ -912,6 +919,27 @@ class ServerConfig(BaseModel):
     history_size: int = Field(300, ge=10)
 
 
+class LearnerConfig(BaseModel):
+    """持续学习：材料变了就自己学，不用人记得点按钮。
+
+    默认开着 —— 设备装到电视盒子上之后，没人会天天开网页点「学一遍」，而用户
+    确实会一直补截图和描述。风险由三道闸门兜住：防抖、同一份材料不重试、回归不过不上线。
+
+    参数都很保守（间隔/静默都按"人在打字"的节奏给），因为学一次的代价是几十秒
+    CPU：在 RK3566 上和采图抢核，会让画面卡一下。
+    """
+
+    enabled: bool = Field(True, description="总开关；页面上的开关会覆盖这里")
+    interval_s: float = Field(15.0, ge=5, le=600, description="多久看一眼材料有没有变")
+    quiet_s: float = Field(45.0, ge=0, le=3600,
+                           description="材料最后修改距今不足这个秒数就不学（防抖：连续截图时别学半截）")
+    min_gap_s: float = Field(180.0, ge=0, le=86400,
+                             description="两代之间至少隔多久，别把设备算力吃干")
+    max_tries: int = Field(1, ge=1, le=5,
+                           description="同一批材料最多自动试几次；失败说明是材料问题，等材料变了再试")
+    use_model: bool = Field(True, description="自动学习时是否调模型起草规则；关掉则只编手册")
+
+
 class AppConfig(BaseModel):
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
@@ -922,6 +950,7 @@ class AppConfig(BaseModel):
     ui_task: "UiTaskConfig" = Field(default_factory=lambda: UiTaskConfig())
     watchdog: "WatchdogConfig" = Field(default_factory=lambda: WatchdogConfig())
     notify: "NotifyConfig" = Field(default_factory=lambda: NotifyConfig())
+    learner: LearnerConfig = Field(default_factory=LearnerConfig)
 
 
 class SimConfig(BaseModel):

@@ -26,10 +26,13 @@ from pathlib import Path
 
 import yaml
 
+from . import paths
+
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
-PROFILES_DIR = ROOT / "profiles"
+ROOT = paths.code_root()
+#: profile 是**数据**（用户的图、手册、模板），住在数据根；引擎升级不该动它。
+PROFILES_DIR = paths.data("profiles")
 
 # 基准分辨率：光柱/HUD 排除区等像素坐标都按它书写，运行时按实际帧等比缩放。
 DEFAULT_REFERENCE_RESOLUTION = (1280, 720)
@@ -114,6 +117,20 @@ def list_profiles() -> list[str]:
     return sorted(p.name for p in PROFILES_DIR.iterdir()
                   if p.is_dir() and not p.name.startswith("_")
                   and (p / "profile.yaml").exists())
+
+
+def active_profile_id() -> str:
+    """这台机器当前玩哪个游戏 —— 数据根里的 `profile` 指针文件。
+
+    为什么是指针文件而不是命令行参数：设备上服务由 systemd 拉起，
+    改 unit 只为了换个游戏名，等于每次都要 sudo 编辑系统文件。
+    一行文本改起来跟改配置一样便宜，而且写临时文件再 rename 就不会读到半截。
+    """
+    p = paths.data("profile")
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def load_profile(id_or_path: str | Path) -> Profile:

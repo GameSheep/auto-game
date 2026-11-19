@@ -1,0 +1,28 @@
+id: 刷一局
+name: 刷一局
+say:
+- 再来一局
+- 继续刷
+start: 战斗
+steps:
+- kind: delegate
+  name: 交给引擎
+  target: farm
+  until: 结算
+  timeout_s: 300.0
+  jump: 0
+  builtin: ''
+  raw: 1. 清怪，沿途捡掉落，直到结算
+  note: ''
+- kind: click
+  name: 点再次挑战
+  target: 「再次挑战」按钮（视觉检出）
+  until: ''
+  timeout_s: 20.0
+  jump: 1
+  builtin: rechallenge
+  raw: 2. 点「再次挑战」，回到第 1 步
+  note: ''
+on_fail: 交回自由模式并报告卡在第几步
+source: tli.md
+origin: lesson
