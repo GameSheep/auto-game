@@ -135,6 +135,34 @@ class Pca9685Executor(BaseExecutor):
     def close(self) -> None:
         self._bus.close()
 
+    def probe(self) -> dict:
+        """读一次 MODE1 寄存器 —— 能读出来就说明 I2C 上有颗芯片在应答。
+
+        这条检查能挡掉最常见的一种"配好了但没接"：`pca9685_bus` 写错（树莓派上
+        I2C 总线号是 1，很多人填 0），或者 SDA/SCL 没接、芯片没供电。这些情况下
+        写寄存器不会报错（smbus 是"发出去就算成功"），舵机就是一秒不动，
+        而程序里一切正常 —— 只有读回来才能证明对面真的有东西。
+        """
+        base = {"backend": self.backend_name, "actuates": True}
+        read = getattr(self._bus, "_read", None)
+        if read is None:
+            # mock 总线：连的是字典不是芯片，别让人以为"探活通过 = 舵机会动"
+            return {**base, "ok": True, "actuates": False,
+                    "detail": "mock 总线（pca9685_mock=true）：不会真的驱动舵机",
+                    "hint": "上真机前把 executor.pca9685_mock 设成 false"}
+        try:
+            mode1 = int(read(_MODE1))
+        except Exception as e:  # noqa: BLE001
+            bus = getattr(self.cfg, "pca9685_bus", "?")
+            return {**base, "ok": False,
+                    "detail": f"I2C bus={bus} addr=0x{getattr(self.cfg, 'pca9685_addr', 0):02x} "
+                              f"读不到：{type(e).__name__}: {e}",
+                    "hint": "确认 `i2cdetect -y 1` 能在 0x40 看到芯片；"
+                            "没看到就是接线/供电问题，看到但读不了多半是总线号填错"}
+        return {**base, "ok": True,
+                "detail": f"I2C 上有应答（MODE1=0x{mode1:02x}），"
+                          f"{len(self._map)} 个通道已映射"}
+
 
 class _MockBus:
     """测试用 mock PCA9685 总线。"""

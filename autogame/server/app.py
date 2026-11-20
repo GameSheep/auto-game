@@ -17,8 +17,8 @@ from typing import Any
 
 import cv2
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
-from starlette.responses import StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.responses import Response, StreamingResponse
 
 from ..config import AppConfig, VisionConfig
 from ..protocol import AckMsg, HelloMsg, PongMsg, SetCaptureMsg, dumps, unpack_message
@@ -38,12 +38,48 @@ _HUB: Hub | None = None
 _CFG: AppConfig | None = None
 
 
+async def _push_capture(hub: Any, cfg: AppConfig) -> bool:
+    """把当前采集参数推给**正在连接的那个代理**。
+
+    为什么必须推：代理只在 hello 时拉一次参数（见 agent_ws 里的 SetCaptureMsg）。
+    页面改完 fps 如果不推，服务端配置写着 10fps、代理还按 2fps 采图 ——
+    决策看着"变快了"，其实一直在反复用旧帧。这种假生效比不生效更糟：
+    用户会得出"调了没用"的结论，然后把本来有效的开关关掉。
+
+    没有代理连接时返回 False（这是正常状态，不是错误）。
+    """
+    ws = getattr(hub, "agent_ws", None)
+    if ws is None:
+        return False
+    try:
+        await ws.send_text(dumps(SetCaptureMsg(
+            fps=cfg.capture.fps, jpeg_quality=cfg.capture.jpeg_quality)))
+        return True
+    except Exception:  # noqa: BLE001
+        log.warning("推送采集参数失败（代理可能已断开）")
+        return False
+
+
 def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
                config_path: str = "", profile: Any = None) -> FastAPI:
     global _HUB, _CFG
     _HUB = hub
     _CFG = cfg
     token = cfg.server.token or ""
+
+    # 对话助手：装配时就把动作闸门装到执行器上 —— 这样"先停下"从服务起来
+    # 的第一毫秒就有效，而不是等第一次请求进来。
+    from ..assistant import build as _build_assistant
+    if profile is not None:
+        # 体检发现退化时要知道该回滚谁 —— 没有 profile 就没有可回滚的配方，
+        # 那时候监控只报不修（报总比假装正常好）。
+        hub.profile = profile
+    asst = _build_assistant(cfg, profile, hub, config_path=config_path)
+    # 换代（promote / rollback）时让运行中的进程跟上：重载规则 + 重置体检基线。
+    # 不注册的话，"学完一代"在运行上等于没发生，直到下次重启。
+    from ..evolve import set_generation_hook
+
+    set_generation_hook(hub.on_generation_change)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -234,7 +270,7 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
 
     @app.post("/api/capture")
     async def set_capture(request: Request) -> JSONResponse:
-        """调整代理采集参数（代理 hello 时会拉取最新值）。"""
+        """调整代理采集参数。**会立刻推给已连接的代理**，不用等它重连。"""
         _require_token_header(request)
         body = await request.json()
         m = SetCaptureMsg.model_validate({**body, "type": "set_capture"})
@@ -242,7 +278,9 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
             cfg.capture.fps = m.fps
         if m.jpeg_quality is not None:
             cfg.capture.jpeg_quality = m.jpeg_quality
-        return JSONResponse({"ok": True})
+        pushed = await _push_capture(hub, cfg)
+        return JSONResponse({"ok": True, "pushed": pushed,
+                             "note": "" if pushed else "当前没有代理连接，参数会在它连上时下发"})
 
     @app.post("/api/locate")
     async def locate(request: Request) -> JSONResponse:
@@ -620,6 +658,329 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
                     "message": f"开始跑「{r.group.name}」，共 {len(r.group.steps)} 步"})
         return JSONResponse(out)
 
+    # ---------------- 对话助手 ----------------
+    # 四个入口对应四种东西：说话、切模式、看现场、改规则。
+    # 注意 `/api/command`（喊组名）和这里不是一回事：那个是发起任务，
+    # 这里是"和人交流并把结论变成可回滚的改动"。
+
+    @app.get("/api/assistant")
+    async def assistant_state(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from ..assistant import voice
+
+        snap = asst.modes.snapshot()
+        return JSONResponse({
+            "ok": True,
+            "mode": snap,
+            "dialog": asst.dialog.snapshot(limit=12),
+            "recent": asst.recent.snapshot(seconds=60, limit=20),
+            "patches": (asst.patches.history(limit=8) if asst.patches else []),
+            "voice": voice.capabilities(cfg),
+            "suppressed": int(getattr(getattr(hub, "executor", None),
+                                      "suppressed", 0) or 0),
+            "model_ready": asst._model_ready(),
+            "health": hub.health.status(),
+            "experience": (hub.experience.summary()
+                           if getattr(hub, "experience", None) else None),
+        })
+
+    @app.get("/api/health")
+    async def health_state(request: Request) -> JSONResponse:
+        """上线后体检：现在跟基线比是快了还是慢了、卡没卡、有没有自己回滚过。"""
+        _require_token_header(request)
+        return JSONResponse({"ok": True, **hub.health.status(),
+                             "incidents": list(hub._health_incidents)})
+
+    # ---------------- 上真机前自检 ----------------
+    # doctor 管"能不能起来"，这里管"起来之后会不会真的动手、动得对不对"。
+    # 两者在页面上放在一起看，但结论分开说 —— 混成一个"通过/不通过"会让人
+    # 以为 dryrun 跑通就等于真机验证过了。
+
+    @app.get("/api/preflight")
+    async def preflight(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from .. import preflight as pf
+
+        # 在跑的时候不碰串口：探活插一句 ping 会抢走正在下发命令的回显，
+        # 既可能把好固件误判成故障，也会打乱那条命令的 ack。
+        running = hub.fsm.state.value != "PAUSED"
+        res = await asyncio.to_thread(
+            pf.run, hub.cfg, hub, hub.executor, "", allow_io=not running)
+        res["text"] = pf.as_text(res)
+        return JSONResponse(res)
+
+    # ---------------- 经验闭环（候选 → 晋升 / 驳回） ----------------
+    # 体检发现问题只是"候选"，不直接改手册：同一个问题要复现够了才算规律。
+    # 晋升走的是补丁那条路（预览/校验/留原件/可回滚），没有特权通道。
+
+    @app.get("/api/experience")
+    async def experience_list(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        if hub.experience is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile",
+                                 "items": [], "summary": {}})
+        return JSONResponse({"ok": True,
+                             "items": hub.experience.as_public(limit=30),
+                             "rules": hub.experience.rules_learned(),
+                             "summary": hub.experience.summary()})
+
+    @app.post("/api/experience/promote")
+    async def experience_promote(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from ..experience import ExperienceError
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        if hub.experience is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        try:
+            res = await asyncio.to_thread(hub.experience.promote,
+                                          str(body.get("id") or ""), asst.patches)
+        except ExperienceError as e:
+            return JSONResponse({"ok": False, "error": str(e)})
+        # 规则/配置刚写进文件，正在跑的那套还是旧的 —— 不推一遍就等于没学。
+        live_msgs: list[str] = []
+        if res.get("rule_patch"):
+            live_msgs.append(str(await asyncio.to_thread(asst.make_live, "rule", {})))
+        if res.get("config_patch"):
+            # 配置补丁要带 payload 才对：apply_patch 是"把这份值套进内存"，
+            # 不是"重读文件"。传空字典等于什么都没做，却会回"当场生效"。
+            cfg_payload = (res["candidate"] or {}).get("config") or {}
+            live_msgs.append(str(await asyncio.to_thread(
+                asst.make_live, "config", cfg_payload)))
+        live = "；".join(x for x in live_msgs if x)
+
+        msg = "已经写进手册，编号 " + res["patch"]["id"]
+        if res.get("rule_patch"):
+            msg += f"；同时加了一条规则（{res['rule_patch']['id']}）"
+        elif res.get("rule_error"):
+            msg += "；" + str(res["rule_error"])
+        if res.get("config_patch"):
+            msg += f"；另外改了配置（{res['config_patch']['id']}）"
+        elif res.get("config_error"):
+            msg += "；" + str(res["config_error"])
+        if live:
+            msg += "。" + live
+        return JSONResponse({"ok": True, **res, "live": live, "message": msg})
+
+    @app.post("/api/experience/reject")
+    async def experience_reject(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from ..experience import ExperienceError
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        if hub.experience is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        try:
+            row = await asyncio.to_thread(hub.experience.reject,
+                                          str(body.get("id") or ""),
+                                          str(body.get("why") or ""))
+        except ExperienceError as e:
+            return JSONResponse({"ok": False, "error": str(e)})
+        return JSONResponse({"ok": True, "item": row, "message": "已驳回，不再自动提"})
+
+    @app.post("/api/assistant/interpret", include_in_schema=False)
+    @app.post("/api/assistant/ask")
+    async def assistant_ask(request: Request) -> JSONResponse:
+        """说一句话。本地命令会立刻生效，其余交给模型（模型不可用时离线回答）。
+
+        `/api/assistant/interpret` 是别名：对话里给的接口清单用的是这个名字。
+        """
+        _require_token_header(request)
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"ok": False, "error": "说点什么"})
+        use_model = bool(body.get("use_model", True))
+        res = await asyncio.to_thread(asst.handle, text, source="text",
+                                      use_model=use_model)
+        return JSONResponse(res)
+
+    @app.post("/api/assistant/mode")
+    async def assistant_mode(request: Request) -> JSONResponse:
+        """页面上四选一。和语音说"先停下"走的是同一个 set_mode。"""
+        _require_token_header(request)
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        name = str(body.get("mode") or "").strip()
+        try:
+            st = await asyncio.to_thread(
+                asst.set_mode, name, seconds=body.get("seconds"),
+                reason=str(body.get("reason") or "页面切换"))
+        except ValueError:
+            return JSONResponse({"ok": False, "error": f"没有这个模式: {name}"})
+        return JSONResponse({"ok": True, "mode": st})
+
+    @app.post("/api/voice/transcribe", include_in_schema=False)
+    @app.post("/api/assistant/voice")
+    async def assistant_voice(request: Request) -> JSONResponse:
+        """上行一段录音 → 文字 → 走同一套对话。
+
+        `/api/voice/transcribe` 是同一条路的别名：对话里给的接口清单用的是
+        这个名字，页面上用的是 `/api/assistant/voice`。两个都留着，
+        免得接第三方客户端时为了一个路径名改代码。
+
+        服务端没装 sherpa 时返回 `unsupported=True`，页面据此改用浏览器识别。
+        这里**不**尝试"降级识别"：把 webm 硬喂给识别器只会得到一段看着像话的错字。
+        """
+        _require_token_header(request)
+        from ..assistant import voice
+
+        audio = await request.body()
+        if not audio:
+            return JSONResponse({"ok": False, "error": "没收到音频"})
+        try:
+            text = await asyncio.to_thread(voice.transcribe, cfg, audio)
+        except voice.VoiceUnavailable as e:
+            return JSONResponse({"ok": False, "unsupported": True,
+                                 "error": str(e), "hint": e.hint})
+        if not text:
+            return JSONResponse({"ok": False, "error": "没听清，再说一遍？"})
+        res = await asyncio.to_thread(asst.handle, text, source="voice")
+        res["heard"] = text
+        return JSONResponse(res)
+
+    @app.post("/api/assistant/tts")
+    async def assistant_tts(request: Request):  # noqa: ANN201 - 返回 wav 或 JSON
+        """文字 → wav。页面在浏览器没有 SpeechSynthesis 时才用这条。"""
+        _require_token_header(request)
+        from ..assistant import voice
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        try:
+            wav = await asyncio.to_thread(voice.synthesize, cfg,
+                                          str(body.get("text") or ""))
+        except voice.VoiceUnavailable as e:
+            return JSONResponse({"ok": False, "unsupported": True,
+                                 "error": str(e), "hint": e.hint})
+        return StreamingResponse(iter([wav]), media_type="audio/wav")
+
+    @app.get("/api/assistant/context")
+    async def assistant_context(request: Request) -> JSONResponse:
+        """最近 N 秒的现场（页面画时间线用，也是"刚才"的原样）。"""
+        _require_token_header(request)
+        seconds = float(request.query_params.get("seconds") or 60)
+        return JSONResponse({"ok": True, **asst.recent.snapshot(seconds=seconds, limit=80)})
+
+    @app.get("/api/assistant/frame")
+    async def assistant_frame(request: Request):
+        """"刚才那一帧"到底是哪一帧 —— 按时间戳取最近的一张关键帧。
+
+        存的是**画面变化点**，不是每一帧：1Hz 全存一天下来能把 eMMC 写穿。
+        取不到就退回当前这一帧（还活着的话），再没有就是 404。
+        """
+        _require_token_header(request)
+        raw = request.query_params.get("ts") or ""
+        ts: float | None = None
+        with contextlib.suppress(ValueError):
+            ts = float(raw) if raw else None
+        path = await asyncio.to_thread(hub.keyframe, ts)
+        if path is not None:
+            return FileResponse(str(path), media_type="image/jpeg")
+        jpeg = hub._latest_jpeg_bytes()
+        if jpeg:
+            return Response(content=jpeg, media_type="image/jpeg")
+        return JSONResponse({"ok": False, "error": "还没有画面"}, status_code=404)
+
+    # ---------------- 改规则（预览 / 应用 / 回滚） ----------------
+
+    @app.post("/api/scripts/patch/preview", include_in_schema=False)
+    @app.post("/api/assistant/patch/preview")
+    async def patch_preview(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from ..assistant.patch import PatchError
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        if asst.patches is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        try:
+            pv = await asyncio.to_thread(
+                asst.patches.preview, str(body.get("kind") or ""),
+                body.get("payload") or {}, note=str(body.get("note") or ""),
+                text=str(body.get("text") or ""))
+        except PatchError as e:
+            return JSONResponse({"ok": False, "error": str(e)})
+        return JSONResponse({"ok": pv["ok"], **pv})
+
+    @app.post("/api/scripts/patch/apply", include_in_schema=False)
+    @app.post("/api/assistant/patch/apply")
+    async def patch_apply(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from ..assistant.patch import PatchError
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        if asst.patches is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        try:
+            rec = await asyncio.to_thread(
+                asst.patches.apply, str(body.get("kind") or ""),
+                body.get("payload") or {}, note=str(body.get("note") or ""),
+                text=str(body.get("text") or ""), stamp=str(body.get("stamp") or ""))
+        except PatchError as e:
+            return JSONResponse({"ok": False, "error": str(e)})
+        live = await asyncio.to_thread(asst.make_live, rec["kind"],
+                                       body.get("payload") or {})
+        return JSONResponse({"ok": True, "patch": rec, "live": live})
+
+    @app.post("/api/scripts/rollback", include_in_schema=False)
+    @app.post("/api/scripts/patch/rollback", include_in_schema=False)
+    @app.post("/api/assistant/patch/rollback")
+    async def patch_rollback(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        from ..assistant.patch import PatchError
+
+        body = {}
+        with contextlib.suppress(Exception):
+            body = await request.json() or {}
+        if asst.patches is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        try:
+            rec = await asyncio.to_thread(asst.patches.rollback, str(body.get("id") or ""))
+        except PatchError as e:
+            return JSONResponse({"ok": False, "error": str(e)})
+        # 回滚写回了文件，也要让正在跑的东西跟上（规则能重载；配置要重启）
+        live = ""
+        if rec.get("kind") == "rule":
+            live = await asyncio.to_thread(asst.make_live, "rule", {})
+        elif rec.get("kind") == "config":
+            live = "配置文件已退回；当前进程里还是改过的那套，重启服务后彻底恢复。"
+        return JSONResponse({"ok": True, "patch": rec, "live": live})
+
+    @app.get("/api/assistant/patch/{pid}")
+    async def patch_detail(pid: str, request: Request) -> JSONResponse:
+        """看某一次改动到底改了什么（页面点开那一条时用）。
+
+        账本里每条都存了 diff 和校验结果 —— 只给人看，不给它自己回读，
+        免得"上次这样改过就照着来"变成一条隐形的规则。
+        """
+        _require_token_header(request)
+        if asst.patches is None:
+            return JSONResponse({"ok": False, "error": "没有绑定 profile"})
+        rec = await asyncio.to_thread(asst.patches.get, pid)
+        if rec is None:
+            return JSONResponse({"ok": False, "error": f"没有这个补丁: {pid}"})
+        return JSONResponse({"ok": True, "patch": rec})
+
+    @app.get("/api/assistant/history")
+    async def assistant_history(request: Request) -> JSONResponse:
+        _require_token_header(request)
+        limit = int(request.query_params.get("limit") or 30)
+        return JSONResponse({"ok": True,
+                             "turns": asst.dialog.snapshot(limit=limit)["turns"],
+                             "patches": asst.patches.history(limit) if asst.patches else []})
+
     @app.delete("/api/groups/{gid}")
     async def groups_forget(gid: str, request: Request) -> JSONResponse:
         """忘掉一组。只由人触发 —— 学习过程永远不删组。"""
@@ -682,6 +1043,47 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
                 log.warning("预设已生效但写盘失败: %s", e)
         log.info("已应用预设 %s（%d 项生效）", name, len(res["changed"]))
         return JSONResponse({"ok": True, "preset": name, "saved": saved, **res})
+
+    # ---------------- 放行度：所有"慢一点/不许动"的开关 ----------------
+    # 三档只动节奏类字段（tick_hz、轨迹时长、休息阈值…），安全铁律不在任何
+    # 档位的 patch 里 —— 见 limits.SAFETY，那些放宽不会变快，只会变错。
+
+    @app.get("/api/limits")
+    async def limits_state(request: Request) -> JSONResponse:
+        """当前档位 + 全部限制的当前值/三档值 + 安全铁律 + 被拦计数。"""
+        _require_token_header(request)
+        from .. import limits as lm
+
+        return JSONResponse(lm.report(hub.cfg, hub.fsm.stats, hub.executor))
+
+    @app.post("/api/limits/{tier}")
+    async def limits_apply(tier: str, request: Request) -> JSONResponse:
+        """切档。和改配置走同一条路：校验 → 原地生效 → 写覆盖文件。"""
+        from .settings import ConfigError, apply_patch, save_overlay
+        from .. import limits as lm
+
+        _require_token_header(request)
+        try:
+            patch = lm.tier_patch(tier)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        try:
+            res = apply_patch(hub.cfg, patch)
+        except ConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        saved = ""
+        if config_path:
+            try:
+                saved = save_overlay(config_path, patch)
+            except OSError as e:
+                log.warning("放行度已生效但写盘失败: %s", e)
+        # 采集帧率是"决策频率"的真正上限：配置改了必须推到代理，否则就是假生效
+        pushed = await _push_capture(hub, hub.cfg)
+        log.info("放行度切到 %s（%d 项生效，采集参数已推送=%s）",
+                 tier, len(res["changed"]), pushed)
+        body = lm.report(hub.cfg, hub.fsm.stats, hub.executor)
+        return JSONResponse({"ok": True, "saved": saved, "pushed": pushed,
+                             **res, "state": body})
 
     @app.delete("/api/config/overlay")
     async def drop_overlay(request: Request) -> JSONResponse:

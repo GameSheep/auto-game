@@ -18,6 +18,7 @@ import numpy as np
 from ..config import AppConfig
 from ..decision.fsm import DecisionEngine, State
 from ..executor import BaseExecutor
+from ..monitor import HealthMonitor, append_incident, incident_path
 from ..protocol import SceneState
 from ..vision.pipeline import VisionPipeline
 from .notify import Notifier
@@ -51,8 +52,10 @@ class Hub:
         # 事件持久化（JSONL 审计日志）：FSM 事件回调直写，无索引、不因内存裁剪丢事件
         self._event_log_path = cfg.server.event_log
         self._event_log_warned = False
-        if self._event_log_path:
-            self.fsm.on_event = self._append_event_log
+        # 不管写不写审计文件，FSM 事件都要进"最近一分钟" —— 急停、卡死、进恢复
+        # 这些恰恰是"刚才为什么"最该被看到的几件事，之前只在开了 event_log
+        # 的时候才顺带写盘，助手的现场里根本看不到。
+        self.fsm.on_event = self._on_fsm_event
         # 当前代理连接（新连接踢旧连接，防断线风暴下双路帧交错）
         self.agent_ws = None
         # 视觉看门狗 + 告警（"看不到游戏就停" / "刷够了提醒我"）
@@ -68,11 +71,162 @@ class Hub:
         # UI 任务（交易行/装备/天赋/技能 —— 配方引擎，激活时接管决策循环）
         self.ui_task: Any | None = None
         self.ui_task_ends: deque = deque(maxlen=20)  # 已结束任务的完成记录
+        # 对话助手的现场记录（最近 60 秒）。装配时由 assistant.build 挂上来；
+        # 没装配就是 None，这两个方法什么都不做 —— 不装助手也要能跑。
+        self.recent: Any | None = None
+        self.modes: Any | None = None
+        self._last_scene_key: tuple | None = None
+        # 上线后的体检（卡住/变慢/烧模型/空转）+ 自动退化回滚。
+        # profile 由装配方挂上；没有 profile 时监控照样算，只是回滚无处可回。
+        self.health = HealthMonitor()
+        self.profile: Any | None = None
+        self._health_incidents: list[dict] = []
+        # 经验候选（由 assistant.build 挂上；没装助手就是 None）。
+        self.experience: Any | None = None
+        # 关键帧：只存"画面变了"和"出事了"这两类时刻的图，给"看那一帧"用。
+        # 1Hz 全存的话一小时就是几百 MB 写 eMMC，板和卡都受不了；可"刚才"
+        # 又必须有东西可指 —— 所以存变化点，环形保留最近 N 张。
+        self._frame_dir: Path = (Path(self._event_log_path).parent / "frames"
+                                 if self._event_log_path else Path("logs") / "frames")
+        self._keyframe_limit = 80
+        self._keyframe_min_gap_s = 3.0
+        self._last_keyframe_ts = 0.0
+        self._keyframe_warned = False
+
+    # ---------------- 现场记录（给"刚才"用的） ----------------
+
+    def _note_event(self, event: dict) -> None:
+        """把 FSM/看门狗的事件折成一行给助手看。
+
+        只留**标量**字段：嵌套结构在 prompt 里既占地方又难读，模型需要的是
+        "什么时候、什么状态、因为什么"，不是完整 JSON。
+        """
+        recent = self.recent
+        if recent is None:
+            return
+        detail = {k: v for k, v in event.items()
+                  if k not in ("ts", "event", "state")
+                  and isinstance(v, (str, int, float, bool))}
+        recent.add(str(event.get("event") or "event"),
+                   f"状态={event.get('state', '')}", **dict(list(detail.items())[:6]))
+
+    def _note_scene(self, scene: Any) -> None:
+        """视觉事实**只在变化时**记一行。
+
+        1Hz × 60 秒 = 60 条，如果每帧都记，真正要紧的事件（切状态、被拦下、
+        卡壳）会被淹没。所以按"有意义的组合"去重：界面/光柱数/A框/门禁。
+        """
+        recent = self.recent
+        if recent is None or scene is None:
+            return
+        pillars = len(getattr(scene, "pillars", []) or [])
+        key = (bool(getattr(scene, "in_game", True)), pillars,
+               bool(getattr(scene, "aframe", None)),
+               str(getattr(scene, "gate_reason", "") or ""))
+        if key == self._last_scene_key:
+            return
+        self._last_scene_key = key
+        # 画面变了 = 值得留一张。限制最小间隔，避免"光柱数来回跳"时把盘写满。
+        self.save_keyframe("scene")
+        recent.add("vision",
+                   "画面=" + ("游戏内" if key[0] else "未识别到游戏"),
+                   光柱=pillars, 怪物=len(getattr(scene, "monsters", []) or []),
+                   A框="有" if key[2] else "无",
+                   门禁=(key[3] or "无"))
+
+    # ---------------- 关键帧（"那一帧"到底是哪一帧） ----------------
+
+    def save_keyframe(self, tag: str = "", *, force: bool = False) -> dict | None:
+        """把最新一帧存成 jpg，并让现场记录记住它。返回 {"path","ts"}。
+
+        **不是每帧都存**：只在画面有意义地变化、或者出事时存。1Hz 全存一小时
+        几百 MB，eMMC 受不了，而"刚才为什么"通常指的是那几次变化。
+        """
+        now = time.time()
+        if not force and now - self._last_keyframe_ts < self._keyframe_min_gap_s:
+            return None
+        # 没有装助手就不存图：关键帧唯一的用途是回答"你刚才说的是哪一帧"，
+        # 没装助手时没人会去取它 —— 那样只会白写盘（测试里尤其明显）。
+        if self.recent is None:
+            return None
+        jpeg = self._latest_jpeg_bytes()
+        if not jpeg:
+            return None
+        tag = "".join(ch for ch in str(tag or "frame") if ch.isalnum() or ch in "-_")[:24]
+        try:
+            self._frame_dir.mkdir(parents=True, exist_ok=True)
+            path = self._frame_dir / f"f-{int(now * 1000)}-{tag or 'frame'}.jpg"
+            path.write_bytes(jpeg)
+        except OSError as e:  # 盘满了/没权限：不能因为截图把决策链拖死
+            if not self._keyframe_warned:
+                log.warning("关键帧写入失败（不影响运行）: %s", e)
+                self._keyframe_warned = True
+            return None
+        self._last_keyframe_ts = now
+        self._prune_keyframes()
+        if self.recent is not None:
+            with self._lock:
+                scene = self._latest_scene
+            size = None
+            if scene is not None:
+                size = (int(getattr(scene, "w", 0) or 0) or None,
+                        int(getattr(scene, "h", 0) or 0) or None)
+                if not size[0]:
+                    size = None
+            try:
+                self.recent.note_frame(str(path), now, size=size)
+            except Exception:  # noqa: BLE001
+                log.debug("记录关键帧引用失败", exc_info=True)
+        return {"path": str(path), "ts": now, "tag": tag}
+
+    def _prune_keyframes(self) -> None:
+        try:
+            files = sorted(self._frame_dir.glob("f-*.jpg"),
+                           key=lambda p: p.stat().st_mtime)
+        except OSError:
+            return
+        for old in files[:-self._keyframe_limit] if len(files) > self._keyframe_limit else []:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    def keyframe(self, ts: float | None = None) -> Path | None:
+        """取离 `ts` 最近的一张关键帧；不传就是最近一张。
+
+        文件名里带毫秒时间戳，所以不用读文件内容就能定位 —— 这是它唯一
+        需要被快速回答的问题（"你刚才说的那一帧，给我看"）。
+        """
+        try:
+            files = list(self._frame_dir.glob("f-*.jpg"))
+        except OSError:
+            return None
+        if not files:
+            return None
+
+        def stamp(p: Path) -> float:
+            try:
+                return int(p.name.split("-")[1]) / 1000.0
+            except (IndexError, ValueError):
+                return 0.0
+
+        if ts is None:
+            return max(files, key=stamp)
+        return min(files, key=lambda p: abs(stamp(p) - float(ts)))
+
+    def _on_fsm_event(self, event: dict) -> None:
+        """FSM 事件：写审计（如果开了）+ 进现场记录 + 出事时留一张图。"""
+        if self._event_log_path:
+            self._append_event_log(event)
+        else:
+            self._maybe_keyframe_for_event(event)
+        self._note_event(event)
 
     def _emit_event_log(self, event: dict) -> None:
         event = {"ts": time.time(), **event}
         if self._event_log_path:
             self._append_event_log(event)
+        self._note_event(event)
 
     def _append_event_log(self, event: dict) -> None:
         try:
@@ -87,6 +241,21 @@ class Hub:
             if not self._event_log_warned:
                 log.warning("事件日志写入失败（已降级为仅内存）", exc_info=True)
                 self._event_log_warned = True
+        self._maybe_keyframe_for_event(event)
+
+    #: 这些事件发生时留一张图 —— 事后"当时画面长什么样"基本都在这几类里。
+    _KEYFRAME_EVENTS = frozenset({
+        "panic", "supervisor_panic", "stuck_alarm", "gate_escape", "human_break",
+        "recovery_cycle", "vision_lost", "frame_stall", "degrade_rollback",
+    })
+
+    def _maybe_keyframe_for_event(self, event: dict) -> None:
+        name = str(event.get("event") or "")
+        if name not in self._KEYFRAME_EVENTS:
+            return
+        # 急停/卡死这类事故不设最小间隔：可能几帧连着发生，每一帧都是证据
+        self.save_keyframe(name, force=name in ("panic", "supervisor_panic",
+                                                 "degrade_rollback"))
 
     def _drain_event_log(self) -> None:
         """兼容保留：事件已通过 on_event 回调直写，无需再排空。"""
@@ -231,7 +400,9 @@ class Hub:
             self._auto_stopped = True
             self._manual_needed += 1
             try:
-                self.fsm.stop()
+                # 走和页面/语音同一个停车路径：只停 FSM 不停模式的话，
+                # 正在跑的指令组还能继续点（闸门只认模式）。
+                self.control("stop")
             except Exception:  # noqa: BLE001
                 log.exception("自动停止失败")
             self.notifier.alert(
@@ -285,6 +456,20 @@ class Hub:
         self._manual_needed += 1
         self.notifier.alert("需要人工判断", reason, level="warn")
 
+    def _may_decide(self) -> bool:
+        """这一帧要不要跑决策。只在"暂停"时为假（观察照样想，只是不动手）。
+
+        没装助手（`modes is None`）时一律为真 —— 这套开关不该成为运行的硬依赖。
+        """
+        modes = self.modes
+        if modes is None:
+            return True
+        try:
+            return bool(modes.allows_decision())
+        except Exception:  # noqa: BLE001
+            log.debug("读模式失败，按可决策处理", exc_info=True)
+            return True
+
     async def decision_loop(self) -> None:
         """决策循环：每个新帧 tick 一次 FSM（默认 1Hz 由代理 fps 决定）。
 
@@ -297,7 +482,13 @@ class Hub:
                 scene = self._latest_scene
             if scene is None:
                 continue
+            if not self._may_decide():
+                # 暂停模式：连决策都不做。动作闸门管的是"发不发得出去"，
+                # 这里管的是"要不要想" —— 想出来的东西没人看，只是白烧 CPU。
+                continue
+            self._note_scene(scene)
             loop = asyncio.get_running_loop()
+            t0 = time.perf_counter()
             try:
                 if self.ui_task is not None:
                     # UI 任务激活：配方引擎接管（FSM 暂停），解码最新帧推进
@@ -327,6 +518,113 @@ class Hub:
                 log.exception("决策 tick 异常")
             finally:
                 self._drain_event_log()
+                # 体检放在 finally 里：tick 抛异常的那几帧恰恰最该被算进"变慢"
+                self.health_tick(time.perf_counter() - t0)
+
+    # ------------- 上线后体检（性能监控 → 退化回滚） -------------
+
+    def _health_stats(self) -> dict:
+        """把散落在各处的计数器摊平成一份。体检只认这几项，别的它不看。"""
+        st: dict[str, Any] = dict(self.fsm.stats or {})
+        arb = getattr(self.fsm, "arbiter", None)
+        if arb is not None:
+            ast = getattr(arb, "stats", {}) or {}
+            st["llm_calls"] = int(ast.get("asks", 0) or 0)
+        st["sent"] = int(getattr(self.executor, "sent", 0) or 0)
+        return st
+
+    def health_tick(self, tick_s: float | None = None) -> list:
+        """每 tick 一次（只做加法），窗口到了才结算。返回结算出的结论。"""
+        findings = self.health.observe(stats=self._health_stats(),
+                                       journal=getattr(self.executor, "journal", None),
+                                       tick_s=tick_s)
+        for f in findings:
+            self._emit_event_log({"event": "health", "code": f.code,
+                                  "level": f.level, "detail": f.detail,
+                                  "metric": f.metric})
+            # 闭环的第二段：体检结论 → 经验候选。只累加证据，绝不直接写手册 ——
+            # 一次发作就改规则，等于在噪声上训练。
+            if self.experience is not None:
+                try:
+                    self.experience.observe(f)
+                except Exception:  # noqa: BLE001
+                    log.exception("记录经验候选失败（忽略）")
+        bad = self.health.should_rollback()
+        if bad is not None:
+            self._degrade(bad)
+        return findings
+
+    def _degrade(self, finding: Any) -> dict:
+        """退化回滚。**这是唯一一处"程序自己改自己"**，所以全部留痕：
+
+        改了哪一代、因为哪条指标、回滚成不成，都要能在页面上、事件流里、
+        `profiles/<id>/health/incidents.jsonl` 里找到。
+        """
+        prof = self.profile
+        if prof is None:
+            # 没有配方就没有可回滚的东西（还没进化过）。只记一笔，不动手。
+            self.health.mark_rollback(finding)
+            self._emit_event_log({"event": "degrade_skipped", "code": finding.code,
+                                  "reason": "没有绑定 profile，没有可回滚的配方"})
+            return {"ok": False, "reason": "没有绑定 profile"}
+
+        from .. import evolve as ev
+
+        cur = None
+        try:
+            g = ev.active_generation(prof)
+            cur = g.id if g else None
+            ok, msg = ev.rollback(prof)
+        except Exception as e:  # noqa: BLE001
+            ok, msg = False, f"{type(e).__name__}: {e}"
+            log.exception("退化回滚失败")
+
+        self.health.mark_rollback(finding)
+        if ok:
+            # 规则是数据，进程不会自己知道它变了 —— 换了代必须当场重载，
+            # 否则"回滚成功"只是文件回滚了，跑的还是旧那套。
+            self._reload_rules()
+
+        row = {"action": "rollback", "ok": bool(ok), "reason": msg,
+               "trigger": finding.to_dict(), "from_gen": cur,
+               "to_gen": ev.active_id(prof) if ok else cur}
+        append_incident(incident_path(prof), row)
+        self._health_incidents = (self._health_incidents + [row])[-20:]
+        self._emit_event_log({"event": "degrade_rollback", "ok": bool(ok),
+                              "code": finding.code, "detail": finding.detail,
+                              "message": msg})
+        log.warning("体检触发退化回滚：%s → %s", finding.code, msg)
+        return {"ok": bool(ok), "message": msg}
+
+    def _reload_rules(self) -> None:
+        arb = getattr(self.fsm, "arbiter", None)
+        if arb is None or not hasattr(arb, "reload_rules"):
+            return
+        try:
+            arb.reload_rules()
+        except Exception:  # noqa: BLE001
+            log.exception("重载规则失败（回滚已生效，重启后也会生效）")
+
+    def on_generation_change(self, profile: Any, action: str, gen_id: str) -> None:
+        """配方换了一代 —— 正在跑的这个进程必须当场跟上。
+
+        两件事，缺一件都会出怪事：
+
+        1. **重载规则**。`Arbiter.rules` 是启动时读进内存的；换代只改了文件和
+           `active` 指针，不重载的话"学完了"和"没学"在运行上完全一样。
+        2. **重置体检基线**（只在晋升时）。基线描述的是旧配方每 tick 多久、
+           问模型多频繁；拿旧基线判新配方，头一分钟必然报"变慢了"，
+           然后把刚学出来的一代退回去 —— 越学越不敢学。
+        """
+        mine = getattr(self.profile, "id", None) if self.profile is not None else None
+        theirs = getattr(profile, "id", None) if profile is not None else None
+        if mine is not None and theirs is not None and mine != theirs:
+            return
+        self._reload_rules()
+        if action == "promote":
+            self.health.reset()
+        self._emit_event_log({"event": "generation_changed", "action": action,
+                              "gen": gen_id})
 
     # ------------- 仪表盘数据 -------------
 
@@ -347,8 +645,14 @@ class Hub:
                 "sent": self.executor.sent,
                 "dropped": self.executor.dropped,
                 "panicked": self.executor.panicked,
+                # 固件拒绝过的命令（含 watchdog_release：主机卡了 5 秒，键是固件松的）
+                "ack_errors": list(getattr(self.executor, "ack_errors", []))[-5:],
             },
             "stats": dict(self.fsm.stats),
+            # 人在哪一层：这是"为什么它不动"的第一现场（暂停 / 观察 / 自动）
+            "mode": (self.modes.snapshot() if self.modes is not None else None),
+            "suppressed": int(getattr(self.executor, "suppressed", 0) or 0),
+            "health": self.health.status(),
             "autonomy": self.fsm.autonomy_snapshot(),
             "scene": scene.model_dump() if scene else None,
             "events": self.fsm.events[-40:],
@@ -582,7 +886,15 @@ class Hub:
     # ------------- 控制命令（REST/WS 调用） -------------
 
     def control(self, action: str) -> dict:
+        """页面上的启动/暂停/急停 —— **和语音走同一个开关**。
+
+        只动 FSM 不动模式，会出现"页面上显示在跑、动作全被闸门拦下"的假运行；
+        反过来只动模式不动 FSM，会出现"模式说暂停、引擎还在想"。两者必须一起。
+        """
         if action == "start":
+            if self.modes is not None and not self.modes.allows_action():
+                # 人在页面上点「启动」= 明确要求动起来，所以从暂停/观察里拉出来
+                self.modes.resume(reason="页面：启动")
             self.fsm.start()
             self._started_at = time.time()
             self._auto_stopped = False
@@ -591,8 +903,14 @@ class Hub:
             self._last_pick_ts = 0.0
             self._no_pick_since = 0.0
         elif action == "stop":
+            self.ui_task = None      # 正在跑的指令组也要停，否则它还能继续点
+            if self.modes is not None:
+                self.modes.pause(reason="页面：暂停")
             self.fsm.stop()
         elif action == "panic":
+            self.ui_task = None
+            if self.modes is not None:
+                self.modes.pause(reason="页面：急停")
             self.fsm.panic()
         elif action == "reset":
             self.fsm.reset_panic()

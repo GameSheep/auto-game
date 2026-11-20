@@ -70,6 +70,13 @@ _PLANNER_SYSTEM = (
 )
 
 
+#: `trigger: stall` 的规则命中后，至少隔这么久才允许再拦一次（默认值）。
+#: 它治的是"卡住"，不是"接管" —— 每帧都拦会把 FSM 挤成只剩这一个动作。
+#: 实际取值走 `cfg.rule_stall_gap_s`：不同游戏的"卡住"持续时间差一个量级，
+#: 写死常量会让某些游戏里救场来不及、另一些里救场太频繁。
+_RULE_STALL_GAP_S = 10.0
+
+
 class Stage(str, Enum):
     KNOWLEDGE = "l0_knowledge"   # 经验直出
     RULE = "l05_rule"            # 本代规则命中（二次进化的产物）
@@ -123,7 +130,8 @@ class Arbiter:
         # 二次进化产出的规则。加载失败只会得到空集（并大声报错），不会抛 ——
         # 规则坏了不该把整个决策链拖down，退化成"只用经验 + 模型"照样能跑。
         from ..evolve import RuleSet
-        self.rules = RuleSet.load(getattr(cfg, "rules_path", "") or "")
+        self._rules_path = str(getattr(cfg, "rules_path", "") or "")
+        self.rules = RuleSet.load(self._rules_path)
 
         self._busy = False
         self._queue: list[Call] = []
@@ -135,6 +143,9 @@ class Arbiter:
         self._unmatched_since: float | None = None
         self._idle_since: float | None = None
         self._keepalive_at = 0.0
+        # None = 从没被 stall 规则拦过（不能用 0.0：帧时间就是从 0 开始的，
+        # 那会让开跑前 10 秒的规则被白白抑制）
+        self._rule_stall_at: float | None = None
         self._history: list[dict[str, Any]] = []   # 最近做过的（给模型看）
         self._fail_streak = 0
         self._open_until = 0.0
@@ -143,7 +154,45 @@ class Arbiter:
             "l2_rejected": 0, "executed": 0, "verified_hit": 0,
             "verified_miss": 0, "keepalive": 0, "shadow_would_run": 0,
             "expired": 0, "fail": 0, "tripped": 0, "rule_hits": 0,
+            "rule_stall_hits": 0,
         }
+
+    # ---------------- 规则热重载 ----------------
+
+    def reload_rules(self, path: str = "") -> str:
+        """（重新）加载规则，返回实际读的那个文件。
+
+        **为什么必须有这一条**：`cfg.rules_path` 是在 `load_config` 时算好的
+        绝对路径，指向当时 active 那一代。程序跑起来之后，`evolve` 出了新代、
+        或者体检触发了退化回滚，文件换了、指针换了，可这个进程里还是旧那一套 ——
+        于是"回滚成功"变成"文件回滚了，但它在跑的还是坏的"。
+
+        不传 path 时从 `evolve/active` 指针现算，所以调用方不需要额外传 profile。
+        """
+        from ..evolve import RuleSet
+
+        # 先取 cfg 里现在的值：配置补丁可能刚把 rules_path 指到别处，而
+        # `self._rules_path` 是构造时抄下来的旧值。两者都要看，否则"配置改完
+        # 重载一下"会重载回旧那一代 —— 比不重载更迷惑。
+        cur = path or str(getattr(self.cfg, "rules_path", "") or "") or self._rules_path
+        p = self._active_rules_path(cur)
+        self.rules = RuleSet.load(p)
+        self._rules_path = p
+        return p
+
+    def _active_rules_path(self, cur: str = "") -> str:
+        cur = cur or self._rules_path
+        if not cur:
+            return ""
+        # evolve/<代>/rules.yaml → evolve；指针就在它旁边
+        ev_root = Path(cur).parent.parent
+        ptr = ev_root / "active"
+        try:
+            gid = ptr.read_text(encoding="utf-8").strip()
+        except OSError:
+            return cur
+        cand = ev_root / gid / "rules.yaml"
+        return str(cand) if gid and cand.exists() else cur
 
     # ---------------- 主入口（每帧，非阻塞） ----------------
 
@@ -175,16 +224,16 @@ class Arbiter:
         # 为什么不无条件优先于 FSM：规则写错会让整个角色行为跑偏，而 FSM 的
         # 启发式是跑过大量回归的。让规则只在 FSM 停手时接上，是"补位"不是"夺权"。
         #
+        # 唯一的例外是 `on: stall` 的规则（见 evolve.TRIGGERS）：它治的是
+        # "同一个动作按了十几次"这种 FSM 正忙着的情况，如果也要求它等 FSM 停手，
+        # 那它永远等不到 —— 写进去等于没写。这类规则单独限流，
+        # 免得每帧都拦一次。
+        #
         # 规则也不受 cooldown_s / _open_until 限制：那两个是保护模型带宽的，
         # 而规则不占带宽。用它们卡规则只会让"我刚写的规则怎么没反应"更难解释。
-        if self.rules and idle_s >= float(getattr(self.cfg, "rule_idle_s", 1.5)):
-            hit = self.rules.decide(probe)
-            if hit is not None:
-                with self._lock:
-                    self.stats["rule_hits"] += 1
-                return self._may_return(self._emit(
-                    hit["action"], hit["params"], Stage.RULE, "",
-                    f"规则 {hit['rule_id']}（FSM 停手 {idle_s:.1f}s）", now))
+        hit = self._decide_by_rules(probe, idle_s, now)
+        if hit is not None:
+            return self._may_return(hit)
 
         trigger = self._need_help(probe, idle_s, now)
         if not trigger:
@@ -220,6 +269,35 @@ class Arbiter:
                     due=now + float(self.cfg.verify_horizon_s), stage=call.stage))
 
     # ---------------- 触发判断 ----------------
+
+    def _decide_by_rules(self, probe: dict[str, Any], idle_s: float,
+                         now: float) -> Call | None:
+        """规则求值。没命中返回 None。"""
+        if not self.rules:
+            return None
+        idle_ok = idle_s >= float(getattr(self.cfg, "rule_idle_s", 1.5))
+        gap = float(getattr(self.cfg, "rule_stall_gap_s", _RULE_STALL_GAP_S) or 0.0)
+        if (not idle_ok and self._rule_stall_at is not None
+                and now - self._rule_stall_at < gap):
+            # 刚被 stall 规则拐过一次。不设这个间隔，一条 `repeat >= 12` 的规则
+            # 会在卡住的那十几秒里每帧都拦一次 —— 它本来是来救场的，结果变成
+            # 一直抢着发只有它想发的那个动作。
+            return None
+        hit = self.rules.decide(probe, include_idle=idle_ok)
+        if hit is None:
+            return None
+        with self._lock:
+            self.stats["rule_hits"] += 1
+            if not idle_ok:
+                self.stats["rule_stall_hits"] += 1
+        if idle_ok:
+            reason = f"规则 {hit['rule_id']}（FSM 停手 {idle_s:.1f}s）"
+        else:
+            self._rule_stall_at = now
+            reason = (f"规则 {hit['rule_id']}（没用空闲门槛："
+                      f"同一个动作最近重复了 {int(probe.get('repeat') or 0)} 次）")
+        log.info("规则命中 %s → %s", hit["rule_id"], hit["action"])
+        return self._emit(hit["action"], hit["params"], Stage.RULE, "", reason, now)
 
     def _need_help(self, probe: dict[str, Any], idle_s: float, now: float) -> str:
         """什么时候才允许打扰模型。返回触发原因，空串表示不需要。"""

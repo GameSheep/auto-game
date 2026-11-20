@@ -72,6 +72,7 @@
         <tr><th>已发送</th><td id="exec-sent">-</td></tr>
         <tr><th>已丢弃(限速)</th><td id="exec-dropped">-</td></tr>
         <tr><th>急停状态</th><td id="exec-panic">-</td></tr>
+        <tr><th>模式</th><td id="dash-mode">-</td></tr>
         <tr><th>场景光柱</th><td id="sc-pillars">-</td></tr>
         <tr><th>A框</th><td id="sc-aframe">-</td></tr>
         <tr><th>掉落列表</th><td id="sc-list">-</td></tr>
@@ -125,6 +126,13 @@ function refresh() {
       $("exec-sent").textContent = d.executor.sent;
       $("exec-dropped").textContent = d.executor.dropped;
       $("exec-panic").textContent = d.executor.panicked ? "已急停!" : "正常";
+      // 模式是"为什么它不动"的第一现场：FSM 还在跑、模式是观察时，
+      // 光看 state 会以为一切正常。
+      const md = d.mode || null;
+      $("dash-mode").textContent = md
+        ? `${md.label}（${md.reason}）` + (md.allows_action ? "" :
+            ` · 已拦下 ${d.suppressed || 0} 个动作`)
+        : "-";
       const sc = d.scene;
       $("sc-pillars").textContent = sc ? sc.pillars.length : "-";
       $("sc-aframe").textContent = sc && sc.aframe ? `(${sc.aframe.x},${sc.aframe.y})` : "无";

@@ -7,7 +7,7 @@ import logging
 import random
 import threading
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 from ..config import ExecutorConfig
 from ..humanize import PathPoint, build_mouse_path
@@ -58,6 +58,33 @@ class BaseExecutor(abc.ABC):
         # 本次点击手势参数（execute 里定，后端只管执行）
         self.click_hover_ms = 0
         self.click_press_ms = 0
+        #: 动作闸门（观察/暂停模式）。返回 False 时动作一律不下发，但照常计数。
+        #: None = 总是放行（没装助手的时候就是这个状态）。
+        self.action_gate: Callable[[], bool] | None = None
+        #: 被闸门拦下的动作数。页面上要能看出"它想动但没动"，否则观察模式
+        #: 看起来和"什么都不做"一模一样。
+        self.suppressed = 0
+
+    #: 后端名（子类覆盖）。放基类是为了探活的默认失败信息能说清是哪个后端。
+    backend_name: str = "base"
+
+    #: 这个后端会不会真的动手（dryrun = 不会）。自检要靠它判断"这台机器上
+    #: 到底有没有人在按键盘"，否则联调通过 = 真机上没验证，是最常见的翻车方式。
+    actuates: bool = True
+
+    def probe(self) -> dict:
+        """探活：**这台机器上动作能不能真的发出去**。
+
+        返回 `{ok, backend, actuates, detail, hint}`。`ok=False` 的意思是
+        "现在上真机，动作会石沉大海"，`hint` 给出具体该查什么 —— 比把
+        `SerialException` 原样抛给人有用得多。
+
+        默认实现刻意返回失败而不是 True：新加的后端如果忘了实现探活，
+        自检应该拦下来（或至少说"这个后端没有探活"），不能默默放行。
+        """
+        return {"ok": False, "backend": self.backend_name, "actuates": self.actuates,
+                "detail": f"{self.backend_name} 还没实现探活",
+                "hint": "这个后端没有探活接口，无法确认动作能不能发出去"}
 
     @property
     def panicked(self) -> bool:
@@ -80,6 +107,20 @@ class BaseExecutor(abc.ABC):
     def execute(self, cmd: Command) -> bool:
         if self._panic.is_set() and cmd.op != "stop_all":
             self.dropped += 1
+            return False
+        if cmd.op != "stop_all" and self.action_gate is not None \
+                and not self.action_gate():
+            # 观察/暂停模式：想动，但不动。丢掉的计数要留着 —— 复盘时要能说
+            # "我当时想做 A 但被暂停了"，而不是看起来整段什么都没发生。
+            self.suppressed += 1
+            with self._lock:
+                self.journal.append(
+                    {"ts": time.time(), "op": cmd.op, "key": cmd.key,
+                     "x": cmd.x, "y": cmd.y, "button": cmd.button,
+                     "hold_ms": cmd.hold_ms, "path": 0, "press_ms": 0,
+                     "suppressed": True})
+                if len(self.journal) > 500:
+                    del self.journal[:-300]
             return False
         if cmd.op != "stop_all":
             # 限速参数每帧跟随 config（配置页热更新后立即生效，不用重启）

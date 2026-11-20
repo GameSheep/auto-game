@@ -34,15 +34,16 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import yaml
+
+from .atomic import atomic_write_json, atomic_write_text, file_lock, load_json_tolerant
 
 log = logging.getLogger(__name__)
 
@@ -598,31 +599,46 @@ def save_group(profile: Any, g: Group) -> Path:
     p = root / f"{g.id}.yaml"
     body = yaml.safe_dump(g.to_dict(), allow_unicode=True, sort_keys=False,
                           default_flow_style=False)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(body, encoding="utf-8")
-    tmp.replace(p)
+    atomic_write_text(p, body)
     return p
 
 
+def world_path(profile: Any) -> Path:
+    return groups_root(profile) / "_world.json"
+
+
 def load_world(profile: Any) -> World:
-    p = groups_root(profile) / "_world.json"
-    if not p.exists():
+    d = load_json_tolerant(world_path(profile), None)
+    if not isinstance(d, dict):
         return World()
     try:
-        return World.from_dict(json.loads(p.read_text(encoding="utf-8")))
+        return World.from_dict(d)
     except Exception:  # noqa: BLE001
-        log.warning("世界层文件坏了，按空的算: %s", p, exc_info=True)
+        log.warning("世界层结构不对，按空的算", exc_info=True)
         return World()
 
 
 def save_world(profile: Any, w: World) -> Path:
-    root = groups_root(profile)
-    root.mkdir(parents=True, exist_ok=True)
-    p = root / "_world.json"
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(w.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    """整份覆盖写。要"读-改-写"请用 `update_world` —— 否则会盖掉别人刚并进来的词。"""
+    p = world_path(profile)
+    atomic_write_json(p, w.to_dict(), indent=2)
     return p
+
+
+def update_world(profile: Any, fn: Callable[[World], World],
+                 timeout: float = 10.0) -> World:
+    """读 → 合并 → 写，整段在锁里。
+
+    世界层是"全游戏唯一一份"的知识，合并逻辑是"只增不删"。两个人（或两个进程：
+    服务里的 sync 和命令行的 sync）同时学一句话，谁后写谁赢的话，先学的那个人的
+    词就没了 —— 而且没有任何冲突记录，看起来像"它忘了我教过的东西"。
+    """
+    p = world_path(profile)
+    with file_lock(p, timeout=timeout):
+        cur = load_world(profile)
+        new = fn(cur)
+        atomic_write_json(p, new.to_dict(), indent=2)
+    return new
 
 
 def sync_from_lessons(profile: Any) -> dict:
@@ -652,8 +668,15 @@ def sync_from_lessons(profile: Any) -> dict:
         for alias, std, _note in getattr(ls, "terms", []) or []:
             if alias and std:
                 fresh.terms[alias] = std
-    world, conflicts = merge_world(load_world(profile), fresh)
-    save_world(profile, world)
+    box: dict[str, Any] = {}
+
+    def merge(cur: World) -> World:
+        w, cf = merge_world(cur, fresh)
+        box["conflicts"] = cf
+        return w
+
+    world = update_world(profile, merge)
+    conflicts = box.get("conflicts") or []
 
     parsed = parse_groups(claims, world)
     existing = {g.id: g for g in load_groups(profile)}
@@ -682,10 +705,7 @@ def sync_from_lessons(profile: Any) -> dict:
 
 
 def _write_json(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, obj, indent=2)
 
 
 def forget_group(profile: Any, gid: str) -> bool:

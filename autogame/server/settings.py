@@ -26,6 +26,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ValidationError
 
+from ..atomic import atomic_write_text
 from ..config import AppConfig, runtime_overlay_path
 
 log = logging.getLogger(__name__)
@@ -143,10 +144,11 @@ def save_overlay(config_path: str, patch: dict) -> str:
             cur = cur[p]
         if isinstance(cur, dict):
             cur.pop(parts[-1], None)
-    path.write_text(
+    # 原子写：半份 YAML 会让服务下次起不来，而页面上没有任何地方能看出"配置文件坏了"
+    atomic_write_text(
+        path,
         "# 页面改过的配置（自动生成，可删除以回滚到 config.yaml）\n"
         + yaml.safe_dump(merged, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
     )
     return str(path)
 

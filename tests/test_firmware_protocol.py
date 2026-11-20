@@ -81,3 +81,40 @@ def test_firmware_declares_tinyusb_stack(ino: str):
     """固件必须声明 TinyUSB（否则 USB HID 描述符不生效）。"""
     assert "Adafruit_TinyUSB.h" in ino
     assert "Adafruit_USBD_HID" in ino
+
+
+# ---------------- 安全：卡住的键必须自己松开 ----------------
+
+def test_hold_watchdog_exists_and_polls_in_loop(ino: str):
+    """`key_down` 之后主机崩了，键会一直按着 —— 只有固件自己能救。
+
+    主机侧的 stop_all 只能救"主机还活着"的场合；进程被 kill、USB 松一下，
+    那条 stop_all 永远发不出来。所以固件必须有一个纯本地的超时释放。
+    """
+    assert "HOLD_WATCHDOG_MS" in ino, "固件缺少按键看门狗"
+    assert "static void watchdog_tick" in ino
+    # 必须在主循环里被调用，否则等于没写
+    loop = ino[ino.index("void loop()"):]
+    assert "watchdog_tick()" in loop
+
+
+def test_hold_flag_set_on_key_down_and_cleared_by_release(ino: str):
+    """看门狗只该在"有键按着"时动手；抬起/停全部要清掉这个标记。"""
+    body = ino[ino.index('op == "key_down"'):]
+    body = body[:body.index("} else if")] if "} else if" in body else body
+    assert "hold_dirty = true" in body
+
+    rel = ino[ino.index("static void release_all"):]
+    rel = rel[:rel.index("static void watchdog_tick")]
+    assert "hold_dirty = false" in rel, "release_all 必须清掉按下标记"
+
+
+def test_watchdog_reports_itself(ino: str):
+    """它自己松的手要主动报一句，否则现场只会看到"莫名少走一步"。"""
+    assert "watchdog_release" in ino
+
+
+def test_every_command_refreshes_last_rx(ino: str):
+    """任何一条命令都算"主机还活着"，否则长时间只发 mouse_move 会被误判超时。"""
+    body = ino[ino.index("static bool handle_line"):]
+    assert "last_rx_ms = millis()" in body[:400]

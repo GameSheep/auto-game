@@ -252,9 +252,15 @@ class SimWorld:
             if len(self.pillars) > 8:
                 self.pillars.pop(0)
 
-    def tick(self) -> None:
-        """每帧调用：推进世界。"""
-        self._advance(time.monotonic())
+    def tick(self, now: float | None = None) -> None:
+        """每帧调用：推进世界。
+
+        `now` 可注入。默认用真实时钟（实机演示、tools/stuck_demo.py 都走这条）；
+        测试里给一个**固定步长的合成时钟**，否则"每帧走多远"取决于机器负载：
+        慢机器上 dt 顶到 0.5s 的上限，一帧走 130px，正好等于拾取半径，
+        角色会一步跨过去 —— 测试于是只在跑全量、CPU 被其他用例占满时才红。
+        """
+        self._advance(time.monotonic() if now is None else now)
         self.check_objective()
 
     # ------------- 渲染 -------------

@@ -11,6 +11,11 @@
 用法：
   python tools/e2e_real_screen.py --seconds 12
   python tools/e2e_real_screen.py --seconds 20 --out assets/real_screen_e2e.json
+  python tools/e2e_real_screen.py --backend rp2040 --seconds 60   # 真的会按键
+
+默认 dryrun（零真实输入）。要验证"真机上到底动不动"，用 `--backend`
+显式指定 —— 它会先跑一遍上机自检，自检不过就不开始，免得白等一分钟才发现
+是分辨率对不上。
 """
 
 from __future__ import annotations
@@ -54,6 +59,11 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=12.0)
     ap.add_argument("--out", default=str(ROOT / "assets" / "real_screen_e2e.json"))
     ap.add_argument("--config", default=str(ROOT / "config.yaml"))
+    ap.add_argument("--backend", default="dryrun",
+                    choices=["dryrun", "rp2040", "rpi5_hidg", "pca9685"],
+                    help="执行器后端。默认 dryrun（零真实输入）；选真后端就真的会按键")
+    ap.add_argument("--yes", action="store_true",
+                    help="真后端自检有硬伤时仍然继续（不建议）")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -62,12 +72,13 @@ def main() -> None:
     cfg.server.token = cfg.server.token or "real-screen-token"
     cfg.capture.fps = 2.0
     cfg.decision.tick_hz = 2.0
-    # 真机验证用 dryrun：只验证"看到→判断→决策"链路，不产生任何键鼠输出
-    cfg.executor.backend = "dryrun"
+    cfg.executor.backend = args.backend
 
     executor = build_executor(cfg.executor)
     hub = Hub(cfg, executor, VisionPipeline(cfg.vision))
-    app = create_app(cfg, hub, "<html>real-screen</html>")
+    # 传 config_path：不传的话配置补丁会写到数据根，而这个工具读的是 --config
+    app = create_app(cfg, hub, "<html>real-screen</html>",
+                     config_path=args.config)
     server = uvicorn.Server(uvicorn.Config(app, host=cfg.server.host, port=cfg.server.port,
                                           log_level="error", access_log=False,
                                           ws="websockets"))
@@ -79,7 +90,9 @@ def main() -> None:
     if not server.started:
         raise SystemExit("服务端启动失败")
     url = f"http://{cfg.server.host}:{cfg.server.port}"
-    print(f"服务端已启动 {url}（dryrun 执行器，零真实输入）")
+    actuates = args.backend != "dryrun"
+    print(f"服务端已启动 {url}（执行器 {args.backend}"
+          + ("，**会真的按键**" if actuates else "，零真实输入") + "）")
 
     capture = build_capture(cfg.capture.backend, cfg.capture.region)
     print(f"采集后端: {type(capture).__name__}")
@@ -92,6 +105,25 @@ def main() -> None:
         raise SystemExit("真实屏幕抓帧失败（屏幕锁定？）")
     h, w = frame.shape[:2]
     print(f"真实帧: {w}x{h}  抓取 {grab_ms:.1f}ms")
+
+    # 坐标一致性：**必须在真按键之前查**。帧是 w×h，而 HID 绝对坐标按
+    # executor.screen_w/h 归一化 —— 两者不一致时点击整体偏位，而所有环节
+    # 都"成功"，日志里一个字都看不出来。
+    sw, sh = cfg.executor.screen_w, cfg.executor.screen_h
+    if (w, h) != (sw, sh):
+        print(f"[失败] 帧是 {w}x{h}，而 executor 按 {sw}x{sh} 归一化 —— "
+              f"点画面中心 ({w // 2},{h // 2}) 会落到屏幕 "
+              f"({int(w / 2 * sw / w)},{int(h / 2 * sh / h)})")
+        print(f"       → 把 config 里的 executor.screen_w/screen_h 改成 {w}/{h}")
+        if actuates and not args.yes:
+            capture.close()
+            raise SystemExit("先改分辨率再来（确认没问题可加 --yes 继续）")
+    else:
+        print(f"坐标一致: 帧 {w}x{h} == executor {sw}x{sh}")
+
+    if actuates:
+        print("提醒：接下来会产生真实键鼠输入。确认游戏窗口在前台、"
+              "角色不在重要界面，随时可在页面上点「急停」。")
 
     det_pipeline = VisionPipeline(cfg.vision)
     lat = []
@@ -180,6 +212,28 @@ def main() -> None:
           f"(非游戏画面应为 0)")
     print(f" 铁律: blind_tap_violations={stats.get('blind_tap_violations')}")
     print(f" 证据: {args.out}")
+
+    # 跑完再给一次上机自检：这时帧流是真的在流，能查出"链路通但动作发不出去"
+    # 这类只靠告警发现不了的问题。它不影响上面的结论，只多一段说明。
+    try:
+        from autogame import preflight as pf
+
+        pf_res = pf.run(cfg=cfg, hub=hub, executor=executor, allow_io=False)
+        print("-" * 62)
+        print(" 上机自检（运行中，串口探活已跳过）: "
+              + {"ok": "可以上真机", "dry": "能跑但不会动手",
+                 "blocked": "有硬伤"}.get(pf_res["verdict"], pf_res["verdict"]))
+        for c in pf_res["checks"]:
+            if c["level"] in ("fail", "warn"):
+                print(f"  [{c['level']}] {c['name']}  {c['detail']}")
+        evidence["preflight"] = {"verdict": pf_res["verdict"],
+                                 "blockers": pf_res["blockers"],
+                                 "warns": pf_res["warns"]}
+        Path(args.out).write_text(json.dumps(evidence, ensure_ascii=False, indent=1),
+                                  encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        print(f" 上机自检没跑成（不影响上面的结论）：{type(e).__name__}: {e}")
+
     print("=" * 62)
     ok = all(evidence["verdict"].values())
     print(" 结论: " + ("PASS（真实屏幕链路可用）" if ok else "CHECK（见 verdict 明细）"))

@@ -15,6 +15,8 @@ from typing import Literal, Optional
 import yaml
 from pydantic import BaseModel, Field
 
+from .atomic import atomic_write_text
+
 
 def _project_root() -> Path:
     """可写根：token 这类"机器自己的状态"要落在数据根。
@@ -525,6 +527,13 @@ class ArbiterConfig(BaseModel):
     # 也不能接近 0 —— 那会变成规则跟 FSM 抢每一帧，写错一条就整体跑偏。
     rule_idle_s: float = 1.5
 
+    # `trigger: stall` 的规则命中后多久才允许再拦一次。
+    # 太小 = 卡住那十几秒里每帧都被它抢走，FSM 等于被架空；
+    # 太大 = 这条规则写完要等很久才轮到第二次，用户会以为没生效。
+    rule_stall_gap_s: float = Field(
+        10.0, ge=1.0, le=120.0,
+        description="卡住类规则命中后的最小间隔（秒）")
+
     # 当前生效那代的可执行规则（profiles/<id>/evolve/gen-XXX/rules.yaml）。
     # 空 = 没有进化过，只用经验 + 模型。这里由 profile 注入，不要手写死路径：
     # 换 profile 时手写路径会指向上一款游戏的规则，那比没有规则更糟。
@@ -969,6 +978,40 @@ class ServerConfig(BaseModel):
     history_size: int = Field(300, ge=10)
 
 
+class AssistantConfig(BaseModel):
+    """对话助手：把"说话"变成一个能改进系统的入口，而不是一个语音遥控器。
+
+    三个刻意的默认值：
+
+    - `enabled=True` 但 `provider` 跟着 `decision.arbiter.model` 那套走，
+      没配模型时**仍然可用**（本地命令 + 离线回答），不会变成一个点不动的按钮。
+    - `window_s=60`：只把最近一分钟的事实塞给模型。更长的历史交给 lessons，
+      那是已经被人确认过的东西。
+    - `allow_patch=True`：能改数据（配置、手册、规则）。**代码不在这条路上** ——
+      改 Python 要走 `upgrade`（整包换代，可回到上一版），不是对话。
+      这里刻意**不提供** `allow_code` 开关：一个设了 true 也不会生效的开关，
+      比没有这个开关更让人误会。
+    """
+
+    enabled: bool = Field(True, description="对话入口总开关（关掉后不影响本地停止命令）")
+    provider: Literal["ollama", "openai"] = Field(
+        "openai", description="ollama=内网；openai=任意 OpenAI 兼容接口（DeepSeek 走这个）")
+    base_url: str = Field("https://api.deepseek.com")
+    model: str = Field("deepseek-chat")
+    api_key: Optional[str] = Field(None, description="留空则读环境变量")
+    api_key_env: str = Field("AUTOGAME_ASSISTANT_KEY")
+    timeout_s: float = Field(30.0, ge=3.0, le=180.0)
+    #: 送给模型的事件条数与时间窗
+    window_s: float = Field(60.0, ge=10.0, le=600.0)
+    max_events: int = Field(40, ge=5, le=200)
+    #: 允许它改什么。代码永远不在这里 —— 改代码是整包换代，不是对话。
+    allow_patch: bool = Field(True, description="允许按你的话改配置/手册/规则（带预览与回滚）")
+    #: 语音。sherpa-onnx 没装时自动降级为"网页端识别 + 网页端朗读"。
+    asr_model_dir: str = Field("", description="sherpa-onnx 模型目录；空=用网页端识别")
+    tts_model_dir: str = Field("", description="sherpa-onnx 模型目录；空=用网页端朗读")
+    tts_speaker: int = Field(0, ge=0)
+
+
 class LearnerConfig(BaseModel):
     """持续学习：材料变了就自己学，不用人记得点按钮。
 
@@ -1001,6 +1044,7 @@ class AppConfig(BaseModel):
     watchdog: "WatchdogConfig" = Field(default_factory=lambda: WatchdogConfig())
     notify: "NotifyConfig" = Field(default_factory=lambda: NotifyConfig())
     learner: LearnerConfig = Field(default_factory=LearnerConfig)
+    assistant: AssistantConfig = Field(default_factory=AssistantConfig)
 
 
 class SimConfig(BaseModel):
@@ -1034,6 +1078,7 @@ ExecutorConfig.model_rebuild()
 VisionConfig.model_rebuild()
 WatchdogConfig.model_rebuild()
 NotifyConfig.model_rebuild()
+AssistantConfig.model_rebuild()
 AppConfig.model_rebuild()
 
 
@@ -1048,14 +1093,27 @@ def _deep_merge(base: dict, extra: dict) -> dict:
     return out
 
 
-def runtime_overlay_path(path: str | os.PathLike) -> Path:
+def runtime_overlay_path(path: str | os.PathLike | None) -> Path:
     """运行时覆盖文件路径：`config.yaml` → `config.runtime.yaml`。
 
     为什么不直接改写 config.yaml：那个文件是手写的、带注释、按节组织。
     程序回写会把注释和排版全部碾平，用户下次打开就认不出来了。
     所以页面上的修改单独存一个覆盖文件，加载时叠加在 config.yaml 之上。
+
+    没给路径时退到**数据根**下的 `config.yaml`，不抛异常、也不落到当前目录：
+    `Path("")` 是 `Path(".")`，对它调 `with_name` 会直接 ValueError ——
+    而这条路径会在"经验想把配置写进 overlay"时被走到，抛异常的表现是
+    "配置补丁写不进去"，原因却是一句 WindowsPath 报错，没人看得懂。
+
+    落在数据根而不是 cwd 同样重要：从别处启动进程时，cwd 下会凭空多出一份
+    `config.runtime.yaml`，而加载时读的是数据根那份 —— 配置补丁看起来
+    "写成功了"，实际一次都没被读过。
     """
-    p = Path(path)
+    p = Path(path) if path else Path("")
+    if not p.name:                       # 空串 / "." / 目录
+        from . import paths
+
+        p = paths.data("config.yaml")
     return p.with_name(f"{p.stem}.runtime{p.suffix}")
 
 
@@ -1134,9 +1192,12 @@ def load_config(path: str | os.PathLike | None = None,
         token_file = _project_root() / ".token"
         if token_file.exists():
             cfg.server.token = token_file.read_text(encoding="utf-8").strip()
-        else:
+        # 文件在但内容是空的 = 上次写一半掉电了。这时候不能用空 token 凑合：
+        # 打开 require_token 的话是页面直接进不去，关着的话是"token 显示为空"，
+        # 两种都查不出原因。直接重新生成一份。
+        if not cfg.server.token:
             cfg.server.token = secrets.token_urlsafe(32)
-            token_file.write_text(cfg.server.token, encoding="utf-8")
+            atomic_write_text(token_file, cfg.server.token)
             try:
                 if os.name == "nt":
                     os.system(f'attrib +h "{token_file}"')

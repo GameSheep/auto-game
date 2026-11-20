@@ -55,6 +55,8 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from .atomic import atomic_write_json, atomic_write_text, load_json_tolerant
+
 # ---------------- 类型与别名 ----------------
 
 KIND_SCENE = "scene"
@@ -837,12 +839,12 @@ def compile_lessons(lessons: list[Lesson], prof: Any, cfg: Any,
 def write_glossary(res: TeachResult, knowledge_dir: Path) -> Path:
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     p = knowledge_dir / "glossary.json"
-    p.write_text(json.dumps({
+    atomic_write_text(p, json.dumps({
         "version": 1,
         "updated": time.strftime("%Y-%m-%d"),
         "note": "用户的黑话/简称对照表。由 tools/teach.py 从 lessons/ 生成。",
         "terms": res.glossary,
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    }, ensure_ascii=False, indent=2) + "\n")
     return p
 
 
@@ -865,7 +867,8 @@ def write_game_md(res: TeachResult, knowledge_dir: Path) -> Path:
     else:
         sep = "\n\n" if old.strip() else ""
         new = old.rstrip() + sep + block + "\n"
-    p.write_text(new, encoding="utf-8")
+    # 原子写：这个文件里有人手写的段落，写一半等于把人写的东西切掉一半
+    atomic_write_text(p, new)
     return p
 
 
@@ -908,28 +911,26 @@ def append_note(profile: Any, when: str, todo: str, *,
         path = files[0]
     else:
         path = d / "补充.md"
-        path.write_text("# 玩家补充\n\n", encoding="utf-8")
+        atomic_write_text(path, "# 玩家补充\n\n")
 
     stamp = _time.strftime("%Y-%m-%d %H:%M")
     block = f"\n## 流程 · 补充 {stamp}\n- 一眼认出: {w}\n- 该做什么: {t}\n"
     old = path.read_text(encoding="utf-8")
-    path.write_text(old.rstrip() + "\n" + block, encoding="utf-8")
+    atomic_write_text(path, old.rstrip() + "\n" + block)
     return path, block.strip()
 
 
 def write_labels(res: TeachResult, labels_path: Path) -> tuple[int, Path]:
-    data: dict = {"version": 1, "howto": [], "items": []}
-    if labels_path.exists():
-        try:
-            data = json.loads(labels_path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            data = {"version": 1, "howto": [], "items": []}
+    empty = {"version": 1, "howto": [], "items": []}
+    # 台账是人标出来的、不可再生的那部分数据。坏了必须留下原件（.corrupt-*），
+    # 不能"读不出来就当空的"—— 那样一次教学编译就把人的答案全抹了，而且日志干净。
+    data = load_json_tolerant(labels_path, empty)
+    if not isinstance(data, dict):
+        data = dict(empty)
     items = data.setdefault("items", [])
     items.extend(res.labels_new)
     data["updated"] = time.strftime("%Y-%m-%d")
-    labels_path.parent.mkdir(parents=True, exist_ok=True)
-    labels_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                           encoding="utf-8")
+    atomic_write_json(labels_path, data, indent=2)
     return len(res.labels_new), labels_path
 
 
@@ -980,14 +981,13 @@ def write_report(res: TeachResult, out_dir: Path, profile_id: str) -> Path:
               "核对一致：`py -3.12 tools/teach.py --profile " + profile_id + " --check`",
               "把「界面」段变成模板（不用手写坐标，出 preview.html 供核对）："
               "`py -3.12 tools/teach_crop.py --profile " + profile_id + "`"]
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(p, "\n".join(lines) + "\n")
     return p
 
 
 def write_pending(res: TeachResult, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     p = out_dir / "pending.json"
-    p.write_text(json.dumps({"updated": time.strftime("%Y-%m-%d %H:%M"),
-                             "items": res.pending}, ensure_ascii=False, indent=2) + "\n",
-                 encoding="utf-8")
+    atomic_write_json(p, {"updated": time.strftime("%Y-%m-%d %H:%M"),
+                          "items": res.pending}, indent=2)
     return p

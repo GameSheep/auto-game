@@ -181,3 +181,112 @@ def test_tap_recheck_blocks_rapid_second_press():
     # A框消失（拾取成功）
     eng.on_scene(_scene([], ts_ms=ts + 100))
     assert eng.stats["picks"] == 1
+
+
+# ═══════════ 规则要吃的事实：真的在 probe 里 ═══════════
+
+def test_probe_reports_repeat_and_recoveries():
+    """`repeat` / `repeat_key` / `recoveries` 必须真的产出。
+
+    这三个字段以前 probe 里根本没有，于是引用它们的规则会求值成 unknown、
+    静默不生效 —— 而页面/手册上看起来"已经学会了"。
+    """
+    import time
+
+    eng, ex = _mk_engine()
+    eng.start()
+    sc = _scene([_pillar()], ts_ms=1000)
+    eng.on_scene(sc)
+
+    ex.journal.clear()          # 先把 FSM 自己刚发的命令清掉，只看注入的这几条
+    now = time.time()
+    for _ in range(9):
+        ex.journal.append({"ts": now - 1, "op": "mouse_click", "x": 640, "y": 360,
+                           "button": "left"})
+    probe = eng._arb_probe(sc)
+    assert probe["repeat"] == 9
+    assert probe["repeat_key"] == "mouse_click(640,360)"
+    assert probe["recoveries"] == 0
+
+
+def test_probe_ignores_stale_and_suppressed_actions():
+    """10 秒前的那次点击不算"还在重复"；被模式闸门拦下的也不算。"""
+    import time
+
+    eng, ex = _mk_engine()
+    eng.start()
+    sc = _scene([_pillar()], ts_ms=1000)
+    eng.on_scene(sc)
+
+    ex.journal.clear()
+    now = time.time()
+    ex.journal.extend([
+        {"ts": now - 30, "op": "mouse_click", "x": 640, "y": 360},
+        {"ts": now - 1, "op": "key_tap", "key": "a", "suppressed": True},
+        {"ts": now - 1, "op": "key_tap", "key": "d"},
+    ])
+    probe = eng._arb_probe(sc)
+    assert probe["repeat"] == 1 and probe["repeat_key"] == "key_tap(d)"
+
+
+def test_probe_counts_recoveries_inside_the_last_minute():
+    """累计恢复次数不能当条件用（跑一小时之后它必然大于任何阈值）。"""
+    from autogame.decision.recovery import StallSignals
+
+    eng, _ = _mk_engine()
+    eng.start()
+    sc = _scene([_pillar()], ts_ms=1000)
+    eng.on_scene(sc)
+
+    eng._recovery_ts.extend([100.0, 110.0, 120.0])
+    eng._recovery_ts.append(eng._now - 200.0)      # 三分钟前那次不算
+    probe = eng._arb_probe(sc)
+    assert probe["recoveries"] == 3
+    # 真进一次恢复也要记上（走的是 _enter_recovery 这条唯一入口）
+    eng._enter_recovery(sc, eng._now, StallSignals(verdict="stalled", stall_for=6.0))
+    assert eng._arb_probe(sc)["recoveries"] == 4
+
+
+def test_window_facts_are_absent_when_the_supervisor_is_off():
+    """没在测的时候不能填 0：`picks_delta == 0` 会因此命中，规则就治错病了。"""
+    from autogame.config import SupervisorConfig
+
+    eng, _ = _mk_engine(supervisor=SupervisorConfig(mode="off"))
+    eng.start()
+    sc = _scene([_pillar()], ts_ms=1000)
+    eng.on_scene(sc)
+    probe = eng._arb_probe(sc)
+    for k in ("picks_delta", "no_progress_for", "intent_churn", "cmds"):
+        assert k not in probe, k
+
+
+def test_rule_written_from_experience_matches_a_real_probe():
+    """经验生成的规则 + 真 probe → 必须命中。
+
+    这条是整条链的接缝：规则里的条件字段、probe 里的字段名、求值口径，
+    三处任何一处对不上，写出来的规则都是"能过校验、永不命中"。
+    """
+    import time
+
+    from autogame import evolve as ev
+    from autogame import experience as xp
+
+    eng, ex = _mk_engine()
+    eng.start()
+    sc = _scene([_pillar()], ts_ms=1000)
+    eng.on_scene(sc)
+
+    ex.journal.clear()
+    now = time.time()
+    for _ in range(14):
+        ex.journal.append({"ts": now - 1, "op": "mouse_click", "x": 640, "y": 360,
+                           "button": "left"})
+    probe = eng._arb_probe(sc)
+
+    rule, blocked = xp.rule_for("repeat", {"repeat": 14, "key": "mouse_click(640,360)"})
+    assert rule and not blocked
+    rules, errors = ev.validate_rules({"rules": [rule]})
+    assert not errors, errors
+    hit = ev.evaluate(rules, ev.facts_from_probe(probe))
+    assert hit["hit"] is True, f"规则没命中；事实={ev.facts_from_probe(probe)}"
+    assert hit["action"] == "explore"

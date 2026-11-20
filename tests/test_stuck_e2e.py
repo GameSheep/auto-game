@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import time
+
 from autogame.config import DecisionConfig, ExecutorConfig, VisionConfig
 from autogame.decision.fsm import DecisionEngine, State
 from autogame.executor import DryRunExecutor
@@ -30,6 +32,11 @@ def _rig():
     eng.start()
 
     state = {"ts": 1000, "keys": []}
+    # 物理时钟从 monotonic 起算（SimWorld 内部用它初始化 _last_update），
+    # 之后每帧固定推进 1/16 秒 —— 和"决策时间戳每帧 +1 秒"互不影响，
+    # 但保证每帧走多远是常数，跟机器快慢无关。
+    clock = {"t": time.monotonic()}
+    SUBSTEPS, DT = 16, 1.0 / 16
 
     def tick() -> None:
         frame = world.render()
@@ -43,7 +50,9 @@ def _rig():
             world.on_command(j["op"], key=j["key"], button=j["button"],
                              x=j["x"], y=j["y"], hold_ms=j["hold_ms"])
         ex.journal.clear()
-        world.tick()
+        for _ in range(SUBSTEPS):
+            clock["t"] += DT
+            world.tick(clock["t"])
 
     return world, eng, ex, state, tick
 

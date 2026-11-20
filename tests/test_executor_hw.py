@@ -148,7 +148,18 @@ def test_rp2040_json_framing(fake_serial_module):
     # 鼠标命令可能是多点轨迹（WindMouse），最后一帧必须落在点击上
     line2 = json.loads(ex._ser.lines[-1])
     assert line2["op"] == "mouse_click" and line2["button"] == "left"
-    assert abs(line2["x"] - 800) <= 2 and abs(line2["y"] - 600) <= 2, "落点偏差应很小"
+    # 固件要的是 0..32767 的绝对尺度（描述符里 Logical Max 32767），**不是像素**。
+    # 这里以前断言的是 800，等于把"像素直发"这个错误固化成了规格 ——
+    # 真机上那样发出去，光标只会落在屏幕 2% 处，而主机日志一切正常。
+    assert line2["x"] > 1000, "发出去的必须是绝对尺度，不是像素"
+    exp_x = 800 * 32767 / (cfg.screen_w - 1)
+    exp_y = 600 * 32767 / (cfg.screen_h - 1)
+    # 轨迹抖动会挪几个像素，换算到 32767 尺度会被放大 (32767/屏幕宽) 倍，
+    # 所以容差按"允许 3 像素"来算，而不是拍一个绝对数。
+    tol_x = 3 * 32767 / (cfg.screen_w - 1)
+    tol_y = 3 * 32767 / (cfg.screen_h - 1)
+    assert abs(line2["x"] - exp_x) <= tol_x and abs(line2["y"] - exp_y) <= tol_y, \
+        f"落点应落在 ({exp_x:.0f},{exp_y:.0f}) 附近，实际 ({line2['x']},{line2['y']})"
     # 急停帧
     ex.panic()
     assert json.loads(ex._ser.lines[-1]) == {"op": "stop_all"}
@@ -192,3 +203,112 @@ def test_rate_limit_follows_config_hot_update():
         assert abs(ex._limiter.min_interval - 0.09) < 1e-9
     finally:
         ex.close()
+
+
+def test_rp2040_watchdog_release_is_visible(fake_serial_module, monkeypatch):
+    """固件自己松手这件事必须能被看见，否则现场只会看到"莫名少走一步"。
+
+    5 秒没收到命令 → 固件 `release_all()` 并回 `{"ok":false,"error":"watchdog_release"}`。
+    主机如果只把它写进 debug 日志，这个事故就等于隐身。
+    """
+    from autogame.executor import RP2040Executor
+
+    class _WdSerial(_FakeSerial):
+        def readline(self) -> bytes:
+            return b'{"ok":false,"error":"watchdog_release"}\n'
+
+    monkeypatch.setattr(fake_serial_module, "Serial", _WdSerial)
+    cfg = ExecutorConfig(backend="rp2040", serial_port="FAKE", serial_baud=115200)
+    ex = RP2040Executor(cfg)
+    ex.execute(Command(op="key_down", key="w"))
+    assert ex.ack_errors, "固件拒了命令却什么都没留下"
+    assert "watchdog_release" in ex.ack_errors[-1]["ack"]
+    assert ex.ack_errors[-1]["op"] == "key_down"
+
+
+def test_rp2040_ack_error_list_is_bounded(fake_serial_module, monkeypatch):
+    from autogame.executor import RP2040Executor
+
+    class _BadSerial(_FakeSerial):
+        def readline(self) -> bytes:
+            return b'{"ok":false,"error":"unknown key"}\n'
+
+    monkeypatch.setattr(fake_serial_module, "Serial", _BadSerial)
+    cfg = ExecutorConfig(backend="rp2040", serial_port="FAKE", serial_baud=115200)
+    ex = RP2040Executor(cfg)
+    for _ in range(40):
+        ex._write({"op": "key_down", "key": "a"})
+    assert len(ex.ack_errors) == 20, "只留最近 20 条，别让错误列表变成内存泄漏"
+
+
+def test_rp2040_watchdog_release_is_visible(fake_serial_module, monkeypatch):
+    """固件自己松手这件事必须能被看见，否则现场只会看到"莫名少走一步"。
+
+    5 秒没收到命令 → 固件 `release_all()` 并回 `{"ok":false,"error":"watchdog_release"}`。
+    主机如果只把它写进 debug 日志，这个事故就等于隐身。
+    """
+    from autogame.executor import RP2040Executor
+
+    class _WdSerial(_FakeSerial):
+        def readline(self) -> bytes:
+            return b'{"ok":false,"error":"watchdog_release"}\n'
+
+    monkeypatch.setattr(fake_serial_module, "Serial", _WdSerial)
+    cfg = ExecutorConfig(backend="rp2040", serial_port="FAKE", serial_baud=115200)
+    ex = RP2040Executor(cfg)
+    ex.execute(Command(op="key_down", key="w"))
+    assert ex.ack_errors, "固件拒了命令却什么都没留下"
+    assert "watchdog_release" in ex.ack_errors[-1]["ack"]
+    assert ex.ack_errors[-1]["op"] == "key_down"
+
+
+def test_rp2040_ack_error_list_is_bounded(fake_serial_module, monkeypatch):
+    from autogame.executor import RP2040Executor
+
+    class _BadSerial(_FakeSerial):
+        def readline(self) -> bytes:
+            return b'{"ok":false,"error":"unknown key"}\n'
+
+    monkeypatch.setattr(fake_serial_module, "Serial", _BadSerial)
+    cfg = ExecutorConfig(backend="rp2040", serial_port="FAKE", serial_baud=115200)
+    ex = RP2040Executor(cfg)
+    for _ in range(40):
+        ex._write({"op": "key_down", "key": "a"})
+    assert len(ex.ack_errors) == 20, "只留最近 20 条，别让错误列表变成内存泄漏"
+
+
+def test_rp2040_and_hidg_map_a_pixel_to_the_same_place(monkeypatch):
+    """两个后端必须把同一份像素坐标落到屏幕的同一个地方。
+
+    以前 RP2040 把像素直接当 0..32767 发，hidg 却做了归一化 —— 于是同一份
+    标定换个执行器就整体偏位，而两边日志都显示正常。这条用例就是把
+    "两个后端的坐标语义必须一致"钉住。
+    """
+    from autogame.executor import RP2040Executor, build_abs_mouse_report
+
+    cfg = ExecutorConfig(backend="rp2040", serial_port="FAKE",
+                         screen_w=1280, screen_h=720)
+    ex = RP2040Executor.__new__(RP2040Executor)
+    ex.cfg = cfg
+
+    for x, y in ((0, 0), (640, 360), (1279, 719)):
+        ax, ay = ex._to_abs(x, y)
+        rep = build_abs_mouse_report(x, y, cfg.screen_w, cfg.screen_h)
+        hx = rep[1] | (rep[2] << 8)
+        hy = rep[3] | (rep[4] << 8)
+        assert (ax, ay) == (hx, hy), f"({x},{y}) → rp2040 {(ax, ay)} vs hidg {(hx, hy)}"
+
+
+def test_rp2040_abs_scale_covers_the_whole_screen(monkeypatch):
+    """右下角必须落在 32767，否则屏幕边缘永远点不到。"""
+    from autogame.executor import RP2040Executor
+
+    cfg = ExecutorConfig(backend="rp2040", screen_w=1920, screen_h=1080)
+    ex = RP2040Executor.__new__(RP2040Executor)
+    ex.cfg = cfg
+    assert ex._to_abs(1919, 1079) == (32767, 32767)
+    assert ex._to_abs(0, 0) == (0, 0)
+    # 中心落在半程附近：0 和 w-1 钉在两个端点，中点必然略高于 16384
+    # （32767/2 * w/(w-1)），差几十个单位在 1920 宽上只有零点几个像素。
+    cx, cy = ex._to_abs(960, 540)
+    assert abs(cx - 16384) <= 16 and abs(cy - 16384) <= 16

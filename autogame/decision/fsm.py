@@ -23,6 +23,7 @@ import logging
 import math
 import random
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +38,7 @@ from ..decision.supervisor import Supervisor, Verdict
 from ..decision.vlm import VisionAdvisor
 from ..executor import BaseExecutor
 from ..humanize import Humanizer, softmax_choice
+from ..monitor import recent_repeat
 from ..protocol import Command, Pillar, SceneState
 
 log = logging.getLogger(__name__)
@@ -62,6 +64,13 @@ TARGET_MATCH_TOL_PX = 70
 BLACKLIST_RADIUS_PX = 90
 # A框确认窗下限（毫秒）：低于该值不动作，防单帧误检闪烁
 AFRAME_CONFIRM_MS = 150
+
+# 规则要用的事实窗口。都取得比体检窗口（20s）短：规则的用处是**当场**把动作
+# 拐回来，等 20 秒窗口结算完，那 20 秒已经按完了。
+#: "同一个动作重复了几次"看最近 5 秒
+_REPEAT_WINDOW_S = 5.0
+#: "最近进了几次恢复"看最近 60 秒
+_RECOVERY_WINDOW_S = 60.0
 
 
 class State(str, enum.Enum):
@@ -143,6 +152,10 @@ class DecisionEngine:
         self._recovery_picks = 0
         self._recovery_targets0 = 0
         self._recovery_ok_ticks = 0
+        # 进入恢复的时刻（只留最近一两分钟）。规则要用的 `recoveries` 事实是
+        # "最近 60 秒进了几次恢复"，而 stats 里的 recoveries 是**累计值**——
+        # 累计值当条件用毫无意义（跑一小时之后它必然大于任何阈值）。
+        self._recovery_ts: deque[float] = deque(maxlen=64)
         self._recovery_pause_until = 0.0
         self._recovery_started = 0.0
         self._last_recovery_step = ""
@@ -204,6 +217,7 @@ class DecisionEngine:
         self._ignored.clear()
         self._recent.clear()
         self.recovery.reset()
+        self._recovery_ts.clear()
         self._recovery_reason = ""
         self._recovery_pause_until = 0.0
         self._emit_event("started")
@@ -231,6 +245,7 @@ class DecisionEngine:
         # 复位后每帧又被拦，看起来像"复位没用"。
         self.supervisor.reset()
         self.arbiter.reset()
+        self._recovery_ts.clear()
         self._last_action_at = 0.0
         self._emit_event("panic_reset")
 
@@ -415,9 +430,17 @@ class DecisionEngine:
         同一个界面在不同帧的像素完全不同，唯一稳定的匹配依据就是这些定性特征。
         """
         p = self._sup_probe(scene)
+        now = self._now
+        # 注意时钟：`self._now` 是**帧时间**（scene.ts_ms/1000，从关卡开始算），
+        # 而执行器 journal 里的 ts 是 time.time()（墙钟）。拿帧时间去筛 journal
+        # 一条都筛不出来，`repeat` 会恒为 0 —— 规则于是"写了也不命中"。
+        # 这里按 journal 自己的口径取"最近 5 秒"。
+        repeat, repeat_key = recent_repeat(
+            getattr(self.exec, "journal", None) or [],
+            time.time() - _REPEAT_WINDOW_S)
         p.update({
             "gate_reason": str(getattr(scene, "gate_reason", "") or ""),
-            # 这三个是二次进化的规则要用的。必须在这里显式给：规则引用的事实
+            # 这几个是二次进化的规则要用的。必须在这里显式给：规则引用的事实
             # 若在 probe 里不存在，会求值成 unknown 然后静默不生效，人只会看到
             # "我写的规则没反应"，而原因藏在这一层。
             "in_game": bool(scene.in_game),
@@ -430,7 +453,26 @@ class DecisionEngine:
             "rechallenge_visible": self._last_rechallenge is not None,
             "intent": self.last_intent,
             "miss_streak": int(self.supervisor.last_health.get("miss_streak", 0) or 0),
+            # "同一个动作在重复"和"一直在恢复"是体检能判出来、也是人最想写规则
+            # 治住的两件事。窗口取最近 5s / 60s：规则要能**当场**命中，不能用
+            # 体检那个 20 秒结算窗口（等它结算完，那 20 秒已经白按了）。
+            "repeat": int(repeat),
+            "repeat_key": str(repeat_key),
+            "recoveries": sum(1 for t in self._recovery_ts
+                              if now - t <= _RECOVERY_WINDOW_S),
         })
+        # 监督层的窗口指标（捡到几个、在动但没结果多久、意图切了几次）。
+        # **只在真算出过结论时才给**：监督层关掉时这里是空的，缺字段让规则
+        # 求值成 unknown（日志里会说哪条没求值），而不是填 0 ——
+        # 填 0 会让 `picks_delta == 0` 这类条件在"根本没在测"的情况下命中。
+        health = self.supervisor.last_health or {}
+        if health:
+            p.update({
+                "picks_delta": int(health.get("picks_delta") or 0),
+                "no_progress_for": int(health.get("no_progress_for") or 0),
+                "intent_churn": int(health.get("intent_churn") or 0),
+                "cmds": int(health.get("cmds") or 0),
+            })
         return p
 
     def action_table(self) -> dict[str, Callable[[], bool]]:
@@ -591,6 +633,7 @@ class DecisionEngine:
         self.recovery.begin(now)
         self._drop_target("recovery")
         self.stats["recoveries"] += 1
+        self._recovery_ts.append(now)
         self._emit_event("recovery_start", reason=signals.verdict, signals=signals.as_dict())
         self._intent(f"自主恢复启动（{signals.verdict}）")
         self._tick_recovery(scene, now, signals)

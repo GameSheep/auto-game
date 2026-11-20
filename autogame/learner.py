@@ -32,15 +32,15 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import evolve as ev
+from .atomic import atomic_write_json, file_lock, load_json_tolerant
 
 log = logging.getLogger(__name__)
 
@@ -78,13 +78,15 @@ def state_path(profile: Any) -> Path:
 
 
 def load_state(profile: Any) -> State:
+    """读状态。文件坏了会备份成 `learner.json.corrupt-<时间戳>` 再按全新处理。
+
+    备份这件事不是可有可无：这份状态决定了"同一份材料还试不试第二次"。
+    静默清空的表现是"学过的材料又重学了一遍"，既费设备算力，又让人怀疑
+    "它到底记不记得学过什么" —— 而没有原件就没法查它原来写了什么。
+    """
     p = state_path(profile)
-    if not p.exists():
-        return State()
-    try:
-        d = json.loads(p.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001
-        log.warning("learner.json 读不出，按全新处理: %s", p, exc_info=True)
+    d = load_json_tolerant(p, None)
+    if not isinstance(d, dict):
         return State()
     return State(enabled=d.get("enabled"), last_ts=float(d.get("last_ts") or 0),
                  last_digest=str(d.get("last_digest") or ""),
@@ -95,12 +97,25 @@ def load_state(profile: Any) -> State:
 
 
 def save_state(profile: Any, st: State) -> None:
+    """整份覆盖写。要"读-改-写"请用 `mutate_state`，否则会盖掉别人的改动。"""
+    atomic_write_json(state_path(profile), st.to_dict(), indent=2)
+
+
+def mutate_state(profile: Any, fn: Callable[[State], Any],
+                 timeout: float = 10.0) -> State:
+    """读 → 改 → 写，整段在**跨进程**锁里。
+
+    谁需要它：后台 tick 在写 `tries`，页面同时点了开关写 `enabled`。
+    两条路都是"读一份、改一个字段、写回去"，不锁的话后写的那个把前一个
+    字段一起盖成旧值 —— 表现是"开关点了一下又跳回去了"或"学过的材料又学一遍"，
+    而且两边各自的日志都正常。
+    """
     p = state_path(profile)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st.to_dict(), ensure_ascii=False, indent=2),
-                   encoding="utf-8")
-    tmp.replace(p)          # 原子换：断电不会留下半份状态
+    with file_lock(p, timeout=timeout):
+        st = load_state(profile)
+        fn(st)
+        atomic_write_json(p, st.to_dict(), indent=2)
+    return st
 
 
 def _cfg_num(cfg: Any, name: str, default: float) -> float:
@@ -120,9 +135,8 @@ def is_enabled(profile: Any, cfg: Any) -> bool:
 
 
 def set_enabled(profile: Any, cfg: Any, on: bool) -> State:
-    st = load_state(profile)
-    st.enabled = bool(on)
-    save_state(profile, st)
+    """开关一次，只改 `enabled` 一个字段，不碰别人刚写的 tries/last_ts。"""
+    st = mutate_state(profile, lambda s: setattr(s, "enabled", bool(on)))
     log.info("自动学习 %s", "打开" if on else "关闭")
     return st
 
@@ -209,7 +223,6 @@ def learn(profile: Any, cfg: Any, *, source: str = "auto",
         return {"ok": False, "busy": True,
                 "message": "已经在学了，等这一轮跑完"}
 
-    st = load_state(profile)
     digest = ""
     try:
         digest = ev.materials_digest(profile)
@@ -241,26 +254,34 @@ def learn(profile: Any, cfg: Any, *, source: str = "auto",
             digest = ""
 
     now = time.time()
-    st.last_ts = now
-    st.last_digest = digest
-    st.last_result = result
-    st.last_message = msg
-    st.last_source = source
-    if result in ("rejected", "error"):
-        # 只对"真的跑过并没过"计数。skipped 不计数：那是材料没变，不是失败。
-        slot = st.tries.get(digest) or {"ts": now, "result": result, "n": 0}
-        slot["ts"] = now
-        slot["result"] = result
-        slot["message"] = msg[:200]
-        slot["n"] = int(slot.get("n") or 0) + 1
-        st.tries[digest] = slot
-    else:
-        st.tries.pop(digest, None)
-    # 只留最近 20 个指纹的计数，别让这个文件无界长
-    if len(st.tries) > 20:
-        keep = sorted(st.tries.items(), key=lambda kv: kv[1].get("ts") or 0)[-20:]
-        st.tries = dict(keep)
-    save_state(profile, st)
+
+    def apply(s: State) -> None:
+        """在锁里重新读一份再改：这一轮学了几十秒，期间可能有人点过开关。
+
+        直接写回开头读到的那份 `st` 会把别人的改动盖掉 —— 这就是"点了一下开关
+        又跳回去了"的来源。所以这里按**刚读到的**内容改，只动自己那几个字段。
+        """
+        s.last_ts = now
+        s.last_digest = digest
+        s.last_result = result
+        s.last_message = msg
+        s.last_source = source
+        if result in ("rejected", "error"):
+            # 只对"真的跑过并没过"计数。skipped 不计数：那是材料没变，不是失败。
+            slot = dict(s.tries.get(digest) or {"ts": now, "result": result, "n": 0})
+            slot["ts"] = now
+            slot["result"] = result
+            slot["message"] = msg[:200]
+            slot["n"] = int(slot.get("n") or 0) + 1
+            s.tries[digest] = slot
+        else:
+            s.tries.pop(digest, None)
+        # 只留最近 20 个指纹的计数，别让这个文件无界长
+        if len(s.tries) > 20:
+            keep = sorted(s.tries.items(), key=lambda kv: kv[1].get("ts") or 0)[-20:]
+            s.tries = dict(keep)
+
+    mutate_state(profile, apply)
 
     out["source"] = source
     out["digest"] = digest

@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from . import paths
+from .atomic import atomic_write_json, atomic_write_text
 from .version import DATA_SCHEMA, MIN_DATA_SCHEMA, SCHEMA_FILE
 
 MANIFEST = "RELEASE.json"
@@ -97,11 +98,13 @@ def _read_pointer(p: Path) -> str | None:
 
 
 def _write_pointer(p: Path, value: str) -> None:
-    """写临时文件再 rename：断电时要么是旧值，要么是新值，不会读到半个版本号。"""
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(f".{p.name}.tmp")
-    tmp.write_text(str(value).strip() + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    """原子写 + fsync。
+
+    这是整套东西里最要紧的几十字节：`current` 空了，启动器就不知道跑哪一版；
+    `previous` 空了，退不回去。rename 只保证"名字"换得干净，不保证内容落盘 ——
+    eMMC 上掉电完全可能得到一个空文件，而它看起来只是"没装过"。
+    """
+    atomic_write_text(p, str(value).strip() + "\n")
 
 
 # --------------------------------------------------------------------------- 哈希/清单
@@ -225,11 +228,7 @@ def read_schema(data_root: Path) -> int:
 
 
 def write_schema(data_root: Path, value: int = DATA_SCHEMA) -> None:
-    p = Path(data_root) / SCHEMA_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(f".{p.name}.tmp")
-    tmp.write_text(f"{int(value)}\n", encoding="utf-8")
-    os.replace(tmp, p)
+    atomic_write_text(Path(data_root) / SCHEMA_FILE, f"{int(value)}\n")
 
 
 def check_compat(manifest: dict, data_root: Path) -> tuple[bool, str]:
@@ -280,9 +279,8 @@ def snapshot(data_root: Path, tag: str) -> dict:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, target)
         files[rel.as_posix()] = sha256_file(p)
-    (dst / MANIFEST).write_text(
-        json.dumps({"tag": tag, "at": time.time(), "files": files}, ensure_ascii=False, indent=2),
-        encoding="utf-8")
+    atomic_write_json(dst / MANIFEST,
+                      {"tag": tag, "at": time.time(), "files": files}, indent=2)
     _prune_snapshots(data_root, keep=5)
     return {"path": str(dst), "files": len(files)}
 

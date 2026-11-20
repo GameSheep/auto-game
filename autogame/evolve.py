@@ -62,11 +62,13 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
 import yaml
+
+from .atomic import atomic_write_json, atomic_write_text
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +84,33 @@ FACTS: dict[str, tuple[str, str]] = {
     "ground_labels": ("int", "地面物品文字标签数"),
     "intent": ("str", "当前意图（FSM 阶段名，如 explore / attack / loot）"),
     "miss_streak": ("int", "连续失败次数（监督层体检结果）"),
+    # —— 下面这组是"它现在是不是在空转"，都来自 probe 里已有的实测字段 ——
+    "repeat": ("int", "最近 5 秒里最热的那个动作重复了几次"),
+    "repeat_key": ("str", "那个动作长什么样，如 mouse_click(640,360) / key_tap(a)"),
+    "recoveries": ("int", "最近 60 秒进入自主恢复的次数"),
+    "picks_delta": ("int", "监督窗口里捡到了几个"),
+    "no_progress_for": ("int", "在动但没结果的持续秒数"),
+    "intent_churn": ("int", "意图来回切换的次数（摇摆/空转）"),
+    "cmds": ("int", "监督窗口里发出多少条命令"),
 }
+
+#: 规则什么时候被求值。
+#:
+#: - `idle`（默认）：FSM 停手 ≥ `rule_idle_s` 才看。规则是**补位**，不夺权。
+#: - `stall`：不管 FSM 闲不闲都看。它天生就是为了治"同一个动作按了十几次"
+#:   这种局面 —— 那时候 FSM 一点都不闲（每帧都在发命令），`idle` 类的规则
+#:   永远轮不到求值，写进去等于没写。
+#:
+#: 字段名**故意不叫 `on`**：YAML 1.1 会把裸写的 `on` 读成布尔 `True`，
+#: 于是 `on: stall` 变成 {True: "stall"}，规则静默降级成 idle —— 又一个
+#: "我明明写了却没生效"。校验里对这个写法单独报错，见 `validate_rules`。
+TRIGGERS: dict[str, str] = {
+    "idle": "FSM 停手时才看（默认）：规则补位，不抢正在跑的逻辑",
+    "stall": "一直在看：用来抓『同一个动作在原地重复』这类 FSM 忙着的坏局面",
+}
+
+#: 规则对象里认识哪些字段（拼错一个等于那条设置没写）。
+_RULE_FIELDS = ("id", "when", "then", "trigger", "why", "confidence")
 
 OPS: dict[str, str] = {
     "==": "等于", "!=": "不等于",
@@ -193,8 +221,8 @@ def _read_gen(profile: Any, path: Path) -> Generation | None:
 def _write_gen(gen: Generation) -> None:
     gen.root.mkdir(parents=True, exist_ok=True)
     doc = gen.to_dict()
-    (gen.root / "gen.yaml").write_text(
-        yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    atomic_write_text(gen.root / "gen.yaml",
+                      yaml.safe_dump(doc, allow_unicode=True, sort_keys=False))
 
 
 def list_generations(profile: Any) -> list[Generation]:
@@ -228,12 +256,12 @@ def active_generation(profile: Any) -> Generation | None:
 
 
 def set_active(profile: Any, gen_id: str) -> None:
-    """切换指针。写临时文件再 rename —— 断电时要么是旧的、要么是新的，不留半代。"""
-    root = evolve_root(profile)
-    root.mkdir(parents=True, exist_ok=True)
-    tmp = root / ".active.tmp"
-    tmp.write_text(gen_id + "\n", encoding="utf-8")
-    os.replace(tmp, root / "active")
+    """切换指针。写临时文件再 rename —— 断电时要么是旧的、要么是新的，不留半代。
+
+    加 fsync 是因为"读到空 active"的表现是**没有配方**：页面不看得出它坏了，
+    只会表现成"什么都没学会"。而这个文件只有几十字节，多一次 fsync 不值一提。
+    """
+    atomic_write_text(evolve_root(profile) / "active", gen_id + "\n")
 
 
 def _history_append(profile: Any, row: dict) -> None:
@@ -364,8 +392,7 @@ def write_materials_snapshot(profile: Any, gen: "Generation") -> None:
     """把这一代"看到的是哪些材料"存下来，下次才能说出差在哪。"""
     p = Path(gen.root) / "materials.json"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(material_files(profile), ensure_ascii=False,
-                            indent=0, sort_keys=True), encoding="utf-8")
+    atomic_write_json(p, material_files(profile), indent=0, sort_keys=True)
 
 
 def knowledge_delta(prev: "Generation | None", cur: "Generation") -> dict:
@@ -679,6 +706,13 @@ def validate_rules(doc: Any) -> tuple[list[dict], list[RuleError]]:
         else:
             _check_cond(r["when"], "when", catalog, problems)
 
+        on = str(r.get("trigger") or "idle")
+        if on not in TRIGGERS:
+            problems.append(f"trigger 只能是 {sorted(TRIGGERS)}，现在写的是 {on!r}")
+        if True in r:
+            # YAML 把裸写的 on: 读成了布尔键 —— 说清楚，别让人自己猜
+            problems.append("字段名是 trigger，不是 on（YAML 会把 on 读成布尔 true）")
+
         then = r.get("then")
         if not isinstance(then, dict):
             problems.append("then 必须是对象 {action: ...}")
@@ -717,6 +751,7 @@ def validate_rules(doc: Any) -> tuple[list[dict], list[RuleError]]:
             "when": r["when"],
             "then": {"action": then["action"],
                      "params": dict(then.get("params") or {})},
+            "trigger": on,
             "why": str(r.get("why") or ""),
             "confidence": float(r.get("confidence") or 0.5),
         })
@@ -776,14 +811,19 @@ def _match(cond: dict, facts: dict) -> bool | None:
     return None
 
 
-def evaluate(rules: list[dict], facts: dict) -> dict:
+def evaluate(rules: list[dict], facts: dict, *, include_idle: bool = True) -> dict:
     """按文件顺序取第一条命中。顺序即优先级 —— 人不用去猜 confidence 谁大。
+
+    `include_idle=False` 时不看 `on: idle` 的规则（它们要求"FSM 停手"这个前提，
+    而现在它并没收手）。`on: stall` 的规则两边都看。
 
     返回 {hit, rule_id, action, params, unknown}。unknown 列的是"因为字段缺失
     而求值不出结果"的规则 id，用来在日志里说清"这条为什么不生效"。
     """
     unknown: list[str] = []
     for r in rules:
+        if not include_idle and str(r.get("trigger") or "idle") != "stall":
+            continue
         m = _match(r["when"], facts)
         if m is True:
             return {"hit": True, "rule_id": r["id"],
@@ -848,8 +888,11 @@ class RuleSet:
     def __bool__(self) -> bool:
         return bool(self.rules)
 
-    def decide(self, probe: dict) -> dict | None:
+    def decide(self, probe: dict, *, include_idle: bool = True) -> dict | None:
         """命中的规则 → {action, params, rule_id, unknown}；没命中 → None。
+
+        `include_idle=False` 只让 `on: stall` 的规则参与 —— FSM 正忙着的时候
+        走这条路（见 `TRIGGERS` 里为什么必须有它）。
 
         动作合法性在这里再查一次：规则是数据，但动作 id 可能过期
         （比如某次重构把 dodge 改名了）。宁可这一步拒掉，也不要让 FSM 拿到
@@ -860,7 +903,7 @@ class RuleSet:
         facts = facts_from_probe(probe)
         if not facts:
             return None
-        hit = evaluate(self.rules, facts)
+        hit = evaluate(self.rules, facts, include_idle=include_idle)
         if not hit["hit"]:
             if hit["unknown"]:
                 log.debug("规则因字段缺失未求值: %s", hit["unknown"])
@@ -1178,8 +1221,8 @@ def build(profile: Any, cfg: Any, *, force: bool = False,
                "顺序即优先级：第一条命中的规则生效。",
                "没有标答的材料不会进这里，只进 knowledge/ 的文字。"],
            "rules": rules}
-    (root / "rules.yaml").write_text(
-        yaml.safe_dump(top, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    atomic_write_text(root / "rules.yaml",
+                      yaml.safe_dump(top, allow_unicode=True, sort_keys=False))
 
     prev_active = active_id(profile)
     gen = Generation(id=gid, root=root, status="candidate", parent=prev_active,
@@ -1189,8 +1232,8 @@ def build(profile: Any, cfg: Any, *, force: bool = False,
     _write_gen(gen)
 
     if rule_errors:
-        (root / "rule_errors.txt").write_text(
-            "\n".join(str(e) for e in rule_errors), encoding="utf-8")
+        atomic_write_text(root / "rule_errors.txt",
+                          "\n".join(str(e) for e in rule_errors))
 
     # 3) 记下"这一代吃的是哪些材料"以及"相对上一代变了什么"。
     #    没有这份，下一页就只能说"材料指纹变了"，说不出"你新给了两张图"。
@@ -1205,8 +1248,7 @@ def build(profile: Any, cfg: Any, *, force: bool = False,
     touched_lesson = any(k.startswith("lessons/")
                          for k in delta["added"] + delta["changed"])
     delta["blind"] = bool(touched_lesson and not (kd["n_added"] or kd["n_removed"]))
-    (root / "delta.json").write_text(
-        json.dumps(delta, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(root / "delta.json", delta, indent=2)
 
     return gen, gen.note
 
@@ -1270,7 +1312,36 @@ def promote(profile: Any, gen: Generation, *, score: dict | None = None) -> tupl
     set_active(profile, gen.id)
     _history_append(profile, {"ts": time.time(), "gen": gen.id, "action": "promote",
                               "reason": reason, "score": gen.score})
+    _notify_change(profile, "promote", gen.id)
     return True, reason
+
+
+#: 配方换代时的回调。装配层（服务端）拿它做两件事：**重载规则**、**重置体检基线**。
+#:
+#: 为什么非要有这个钩子：规则是启动时加载进 `Arbiter` 的，换代之后文件换了、
+#: 指针换了，进程里还是旧那一套 —— 学习完不重启等于没学。而体检基线描述的是
+#: 旧配方，拿它去判新配方，第一分钟就会报"变慢了"。
+#:
+#: 只留一个槽：一个进程只服务一个游戏，多个 hook 只会让"到底哪个生效"变模糊。
+_CHANGE_HOOK: Callable[[Any, str, str], None] | None = None
+
+
+def set_generation_hook(fn: Callable[[Any, str, str], None] | None) -> None:
+    """注册"换代"回调。`fn(profile, action, gen_id)`，action 是 promote / rollback。"""
+    global _CHANGE_HOOK
+    _CHANGE_HOOK = fn
+
+
+def _notify_change(profile: Any, action: str, gen_id: str) -> None:
+    fn = _CHANGE_HOOK
+    if fn is None:
+        return
+    try:
+        fn(profile, action, gen_id)
+    except Exception:  # noqa: BLE001
+        # 钩子是"顺手做"的事：重载失败不该让晋升本身失败（文件已经切过去了，
+        # 重启也能生效），但必须留下日志。
+        log.exception("换代回调失败（action=%s gen=%s）", action, gen_id)
 
 
 def rollback(profile: Any) -> tuple[bool, str]:
@@ -1294,6 +1365,7 @@ def rollback(profile: Any) -> tuple[bool, str]:
     set_active(profile, prev.id)
     _history_append(profile, {"ts": time.time(), "gen": prev.id,
                               "action": "rollback", "reason": f"从 {cur.id} 退回"})
+    _notify_change(profile, "rollback", prev.id)
     return True, f"已退回 {prev.id}"
 
 
@@ -1346,9 +1418,8 @@ def _write_groups_snapshot(profile: Any, gen: "Generation", info: dict) -> None:
         gaps = g.gaps(world, tpl_dir)
         rows.append({"id": g.id, "name": g.name, "say": g.say, "start": g.start,
                      "steps": len(g.steps), "ready": not gaps, "gaps": gaps})
-    (gen.root / "groups.json").write_text(
-        json.dumps({"synced": info, "groups": rows}, ensure_ascii=False, indent=2),
-        encoding="utf-8")
+    atomic_write_json(gen.root / "groups.json", {"synced": info, "groups": rows},
+                      indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -1431,5 +1502,5 @@ def collect_wanted(profile: Any, *, limit: int = 200,
            "signals": signals, "samples": samples, "asks": asks}
     out = evolve_root(profile) / "wanted.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(out, doc, indent=2)
     return doc

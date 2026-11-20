@@ -611,3 +611,206 @@ def test_model_draft_rejects_bad_rules_and_stays_empty(tmp_profile, monkeypatch)
     assert doc["rules"] == []
     # 错误要落盘，人才能看到"模型写了什么被拒了"
     assert (gen.root / "rule_errors.txt").exists()
+
+
+# ---------------- 8. 卡住类规则：不能等 FSM 停手才生效 ----------------
+
+def _stall_cfg(tmp_path, rules_yaml: str):
+    from autogame.config import ArbiterConfig
+
+    rules_file = tmp_path / "rules.yaml"
+    rules_file.write_text(rules_yaml, encoding="utf-8")
+    return ArbiterConfig(mode="enforce", rules_path=str(rules_file))
+
+
+_STALL_RULE = """rules:
+  - id: xp-repeat
+    trigger: stall
+    when:
+      all:
+        - {fact: in_game, op: "==", value: true}
+        - {fact: repeat, op: ">=", value: 10}
+        - {fact: repeat_key, op: "==", value: "mouse_click(640,360)"}
+    then: {action: explore}
+"""
+
+
+def test_stall_rule_fires_while_the_fsm_is_busy(tmp_path):
+    """反复点同一个地方 = FSM 一点都不闲。
+
+    这类规则如果也要求"FSM 停手 1.5 秒"，它永远轮不到求值 —— 用户会看到
+    "我加了规则一点用没有"，而规则本身完全正确。
+    """
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    arb = Arbiter(_stall_cfg(tmp_path, _STALL_RULE), ActionRegistry(),
+                  KnowledgeBase(tmp_path / "knowledge"))
+    probe = {"in_game": True, "gate_reason": "skillbar", "repeat": 12,
+             "repeat_key": "mouse_click(640,360)", "pillars": 0, "monsters": 0}
+    call = arb.tick(probe, now=10.0, idle_s=0.0)
+    assert call is not None and call.action_id == "explore"
+    assert arb.stats["rule_stall_hits"] == 1
+
+
+def test_stall_rule_is_throttled_after_it_fires(tmp_path):
+    """救场，不是接管：命中后要隔一会儿才允许再拦，否则每帧都被它抢走。"""
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    arb = Arbiter(_stall_cfg(tmp_path, _STALL_RULE), ActionRegistry(),
+                  KnowledgeBase(tmp_path / "knowledge"))
+    probe = {"in_game": True, "gate_reason": "skillbar", "repeat": 30,
+             "repeat_key": "mouse_click(640,360)", "pillars": 0, "monsters": 0}
+    assert arb.tick(probe, now=10.0, idle_s=0.0) is not None
+    assert arb.tick(probe, now=11.0, idle_s=0.0) is None
+    assert arb.tick(probe, now=25.0, idle_s=0.0) is not None
+
+
+def test_stall_rule_does_not_match_another_action(tmp_path):
+    """条件里的 repeat_key 必须真的比 —— 否则"点墙"的经验会去治"按 A"。"""
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    arb = Arbiter(_stall_cfg(tmp_path, _STALL_RULE), ActionRegistry(),
+                  KnowledgeBase(tmp_path / "knowledge"))
+    probe = {"in_game": True, "gate_reason": "skillbar", "repeat": 40,
+             "repeat_key": "key_tap(a)", "pillars": 0, "monsters": 0}
+    assert arb.tick(probe, now=10.0, idle_s=0.0) is None
+
+
+def test_default_trigger_is_still_idle(tmp_path):
+    """不写 on 的规则保持原语义（补位不夺权）。"""
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    rules = """rules:
+  - id: r_pick
+    when: {fact: pillars, op: ">=", value: 1}
+    then: {action: pickup}
+"""
+    arb = Arbiter(_stall_cfg(tmp_path, rules), ActionRegistry(),
+                  KnowledgeBase(tmp_path / "knowledge"))
+    assert arb.rules.rules[0]["trigger"] == "idle"
+    assert arb.tick({"in_game": True, "pillars": 2, "repeat": 30},
+                    now=10.0, idle_s=0.1) is None
+
+
+def test_unknown_trigger_is_rejected(tmp_path):
+    ok, errors = evolve.validate_rules({"rules": [
+        {"id": "r", "trigger": "always",
+         "when": {"fact": "in_game", "op": "==", "value": True},
+         "then": {"action": "wait", "params": {"frames": 1}}}]})
+    assert not ok
+    assert any("trigger 只能是" in str(e) for e in errors)
+
+
+def test_stall_facts_are_known_to_the_rule_language():
+    """经验/模型写规则时会用到这些字段 —— 名字对不上就是永不命中。"""
+    for fact in ("repeat", "repeat_key", "recoveries", "picks_delta",
+                 "no_progress_for", "intent_churn", "cmds"):
+        assert fact in evolve.FACTS, fact
+    ok, errors = evolve.validate_rules({"rules": [
+        {"id": "r_space", "trigger": "stall",
+         "when": {"all": [
+             {"fact": "recoveries", "op": ">=", "value": 3},
+             {"fact": "picks_delta", "op": "==", "value": 0},
+             {"fact": "no_progress_for", "op": ">=", "value": 30},
+             {"fact": "intent_churn", "op": ">=", "value": 4},
+             {"fact": "cmds", "op": ">=", "value": 10}]},
+         "then": {"action": "explore"}}]})
+    assert not errors and ok, errors
+
+
+def test_facts_from_probe_passes_the_stall_fields():
+    facts = evolve.facts_from_probe({"in_game": True, "repeat": 7,
+                                     "repeat_key": "key_tap(a)", "recoveries": 2,
+                                     "picks_delta": 0, "no_progress_for": 44,
+                                     "intent_churn": 5, "cmds": 22, "h": 720})
+    assert facts["repeat"] == 7 and facts["repeat_key"] == "key_tap(a)"
+    assert facts["recoveries"] == 2 and facts["picks_delta"] == 0
+    assert facts["no_progress_for"] == 44 and facts["intent_churn"] == 5
+    assert facts["cmds"] == 22
+    # 没产出的字段就不出现（让规则求值成 unknown，而不是当成 0）
+    assert "pillars" not in facts
+
+
+def test_missing_fact_makes_the_rule_unknown_instead_of_firing(tmp_path):
+    """缺字段必须报 unknown 而不是"条件不成立"或"成立"。"""
+    rules, errors = evolve.validate_rules({"rules": [
+        {"id": "r_rep", "trigger": "stall",
+         "when": {"fact": "repeat", "op": ">=", "value": 5},
+         "then": {"action": "explore"}}]})
+    assert not errors
+    hit = evolve.evaluate(rules, {"in_game": True})
+    assert hit["hit"] is False and hit["unknown"] == ["r_rep"]
+
+
+def test_stall_rule_is_not_suppressed_at_the_start_of_a_run(tmp_path):
+    """帧时间从 0 开始 —— 限流不能用 0.0 当"从没拦过"，否则开跑前 10 秒被白白抑制。"""
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    arb = Arbiter(_stall_cfg(tmp_path, _STALL_RULE), ActionRegistry(),
+                  KnowledgeBase(tmp_path / "knowledge"))
+    probe = {"in_game": True, "repeat": 30, "repeat_key": "mouse_click(640,360)"}
+    assert arb.tick(probe, now=1.0, idle_s=0.0) is not None
+
+
+def test_stall_rule_is_not_suppressed_at_the_start_of_a_run(tmp_path):
+    """帧时间从 0 开始 —— 限流不能用 0.0 当"从没拦过"，否则开跑前 10 秒被白白抑制。"""
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    arb = Arbiter(_stall_cfg(tmp_path, _STALL_RULE), ActionRegistry(),
+                  KnowledgeBase(tmp_path / "knowledge"))
+    probe = {"in_game": True, "repeat": 30, "repeat_key": "mouse_click(640,360)"}
+    assert arb.tick(probe, now=1.0, idle_s=0.0) is not None
+
+
+def test_stall_gap_follows_the_config(tmp_path):
+    """救场间隔要能调：不同游戏"卡住"能持续的时间差一个量级。
+
+    写死 10 秒的结果是 —— 节奏慢的游戏里救场来不及（第二次卡住要等 10 秒），
+    节奏快的游戏里救场太频繁（同一段卡住被反复拐走）。
+    """
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    cfg = _stall_cfg(tmp_path, _STALL_RULE)
+    cfg.rule_stall_gap_s = 30.0
+    arb = Arbiter(cfg, ActionRegistry(), KnowledgeBase(tmp_path / "knowledge"))
+    probe = {"in_game": True, "repeat": 30, "repeat_key": "mouse_click(640,360)"}
+    assert arb.tick(probe, now=100.0, idle_s=0.0) is not None
+    assert arb.tick(probe, now=125.0, idle_s=0.0) is None, "30 秒内不该再拦"
+    assert arb.tick(probe, now=131.0, idle_s=0.0) is not None
+
+
+def test_stall_gap_defaults_to_ten_seconds(tmp_path):
+    from autogame.config import ArbiterConfig
+
+    assert ArbiterConfig().rule_stall_gap_s == 10.0
+
+
+def test_stall_gap_follows_the_config(tmp_path):
+    """救场间隔要能调：不同游戏"卡住"能持续的时间差一个量级。
+
+    写死 10 秒的结果是 —— 节奏慢的游戏里救场来不及（第二次卡住要等 10 秒），
+    节奏快的游戏里救场太频繁（同一段卡住被反复拐走）。
+    """
+    from autogame.decision.actions import ActionRegistry
+    from autogame.decision.arbiter import Arbiter
+
+    cfg = _stall_cfg(tmp_path, _STALL_RULE)
+    cfg.rule_stall_gap_s = 30.0
+    arb = Arbiter(cfg, ActionRegistry(), KnowledgeBase(tmp_path / "knowledge"))
+    probe = {"in_game": True, "repeat": 30, "repeat_key": "mouse_click(640,360)"}
+    assert arb.tick(probe, now=100.0, idle_s=0.0) is not None
+    assert arb.tick(probe, now=125.0, idle_s=0.0) is None, "30 秒内不该再拦"
+    assert arb.tick(probe, now=131.0, idle_s=0.0) is not None
+
+
+def test_stall_gap_defaults_to_ten_seconds(tmp_path):
+    from autogame.config import ArbiterConfig
+
+    assert ArbiterConfig().rule_stall_gap_s == 10.0

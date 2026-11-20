@@ -8,7 +8,9 @@
 //   {"op":"mouse_move","x":640,"y":400}
 //   {"op":"mouse_click","button":"left","x":640,"y":800}
 //   {"op":"stop_all"}
+//   {"op":"ping"}  → {"ok":true,"fw":"1.1.0","up_ms":...,"watchdog_ms":5000}
 // 每条命令回 {"ok":true} 或 {"ok":false,"error":"..."}
+// 命令解析顺序即优先级：ping 放在最后但**独立**，不受其它分支影响。
 //
 // Arduino IDE 设置：
 //   Board: Raspberry Pi Pico (Arduino Mbed OS RP2040 Boards 不支持 TinyUSB 时，
@@ -132,15 +134,59 @@ static void send_json(Stream& out, bool ok, const char* err = "") {
   out.print("\n");
 }
 
+// ---------------- 通信看门狗 ----------------
+// 为什么这一条必须在**固件**里，而不是主机里：
+//   主机侧的 stop_all 只能救"主机还活着"的场合。而 key_down 之后主机崩了、
+//   Python 进程被 kill、USB 线松了一下 —— 这时候键盘上那个键是**真的按着**的，
+//   游戏里的人物会一直往前走，撞墙也在走，直到有人去拔 USB。
+//   能救这种情况的只有对端：超时自己松手。
+//
+// 阈值取 5 秒的依据：本项目走位全是 key_tap + hold_ms（按压在固件里 delay 后抬起），
+// 没有"长按走路"的路径，所以正常运行时按下状态存在的时间是几百毫秒。5 秒足够宽松，
+// 只有真的断了才会触发。将来若加了长按走位，这个值要跟着调大。
+static const uint32_t HOLD_WATCHDOG_MS = 5000;
+static uint32_t last_rx_ms = 0;
+static bool hold_dirty = false;      // 有键/鼠标处于按下状态且没被抬起
+
 static void release_all() {
   kb_report[1] = 0;
   for (int i = 3; i < 9; i++) kb_report[i] = 0;
   usb_hid.sendReport(1, kb_report, sizeof(kb_report));
   ms_report[1] = 0;
   usb_hid.sendReport(2, ms_report, sizeof(ms_report));
+  hold_dirty = false;
+}
+
+// ---------------- 探活 ----------------
+// 主机的自检靠这一条区分三种完全不同的故障：
+//   回 {"ok":true,...}                   → 对面就是这套固件，版本够新
+//   回 {"ok":false,"error":"unknown op"} → 串口对面确实是这套固件，但太旧（要重刷）
+//   什么都不回 / 回乱码                   → 对面是别的 CDC 设备，或者固件卡死了
+// 没有这一条的话，串口号配错（打开了另一个 USB 串口设备）时的表现是
+// "命令全部石沉大海，主机以为一切正常" —— 上真机最难查的一类问题。
+//
+// 带上 fw / up_ms：同一台机器刷了两份固件时，能看出跑的是哪一份。
+static const char* FW_VERSION = "1.1.0";
+static void send_ping() {
+  Serial.print("{\"ok\":true,\"fw\":\"");
+  Serial.print(FW_VERSION);
+  Serial.print("\",\"up_ms\":");
+  Serial.print((unsigned long)millis());
+  Serial.print(",\"watchdog_ms\":");
+  Serial.print((unsigned long)HOLD_WATCHDOG_MS);
+  Serial.print("}\n");
+}
+
+static void watchdog_tick() {
+  if (!hold_dirty || last_rx_ms == 0) return;
+  if (millis() - last_rx_ms < HOLD_WATCHDOG_MS) return;
+  release_all();
+  // 主动报一句：主机重连后能看见"上一轮是我自己松的手"，而不是以为一切正常
+  send_json(Serial, false, "watchdog_release");
 }
 
 static bool handle_line(const String& line) {
+  last_rx_ms = millis();          // 看门狗的"还活着"信号：任何一条命令都算
   String op = json_get(line, "op");
   if (op.length() == 0) return false;
   String key = json_get(line, "key");
@@ -165,6 +211,7 @@ static bool handle_line(const String& line) {
     if (!code) { send_json(Serial, false, "unknown key"); return true; }
     kb_report[3] = code;
     usb_hid.sendReport(1, kb_report, sizeof(kb_report));
+    hold_dirty = true;            // 从这一刻起，主机不来消息就得我自己松手
     send_json(Serial, true);
   } else if (op == "key_up") {
     for (int i = 3; i < 9; i++) kb_report[i] = 0;
@@ -195,6 +242,10 @@ static bool handle_line(const String& line) {
   } else if (op == "stop_all") {
     release_all();
     send_json(Serial, true);
+  } else if (op == "ping") {
+    // 自检探活，见上面 send_ping() 的注释。**不碰键盘鼠标**：探活本身
+    // 不能产生任何输入，否则"自检一下"就等于按了一下键。
+    send_ping();
   } else {
     send_json(Serial, false, "unknown op");
   }
@@ -216,6 +267,7 @@ void setup() {
 }
 
 void loop() {
+  watchdog_tick();                 // 先看门狗：卡住的键比晚 1ms 收命令更要紧
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n') {
