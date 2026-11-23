@@ -154,3 +154,104 @@ def test_tall_thin_beam_is_a_pillar():
         cv2.rectangle(frame, (637, 296), (643, 396), (255, 255, 255), -1)
         got += len(det.process(frame, 1000 + i * 500).pillars)
     assert got >= 1, "竖直细条光柱必须被检出"
+
+
+def test_negative_template_survives_downscale(tmp_path):
+    """源帧宽 > max_detect_width 时，反例模板仍必须命中。
+
+    真实事故（2560×1380 的录屏）：`_check_negative_ui` 里模板缩放漏乘了
+    `scale`，模板被放大 2 倍去和半分辨率的整屏比对，星图/结算/过场**一次都没
+    匹配上**，门禁把这些界面全当战斗放行（71 条命令打在了选图界面上）。
+    源帧宽恰好等于 max_detect_width 时 scale=1，缺陷完全隐形——所以必须
+    用"同一画面放大 2 倍"来钉这个不变量。
+    """
+    rng = np.random.default_rng(0)
+    patch = rng.integers(0, 255, (60, 120, 3), dtype=np.uint8)
+    base = np.zeros((690, 1280, 3), dtype=np.uint8)
+    base[100:160, 200:320] = patch
+    big = cv2.resize(base, (2560, 1380), interpolation=cv2.INTER_NEAREST)
+
+    tpl_dir = tmp_path / "templates"
+    tpl_dir.mkdir()
+    cv2.imwrite(str(tpl_dir / "gate_neg_synth.png"), patch)   # 1280 宽基准
+
+    cfg = VisionConfig()
+    cfg.max_detect_width = 1280          # 2560 的帧会被缩到 1280 → scale=0.5
+    cfg.scene_gate.enabled = True
+    cfg.scene_gate.fail_closed = True
+    det = Detector(cfg, tpl_dir)
+    assert det._neg_templates, "反例模板没被加载，测试前提不成立"
+
+    st = det.process(big, 1000)
+    assert not st.in_game, "放大 2 倍的同一张界面必须仍被反例拦下"
+    assert det.diag["gate_reason"].startswith("negative:"), (
+        f"反例没命中，实际原因 {det.diag['gate_reason']}（缩放没跟着 max_detect_width 走）")
+
+
+def test_negative_template_survives_downscale(tmp_path):
+    """源帧宽 > max_detect_width 时，反例模板仍必须命中。
+
+    真实事故（2560×1380 的录屏）：`_check_negative_ui` 里模板缩放漏乘了
+    `scale`，模板被放大 2 倍去和半分辨率的整屏比对，星图/结算/过场**一次都没
+    匹配上**，门禁把这些界面全当战斗放行（71 条命令打在了选图界面上）。
+    源帧宽恰好等于 max_detect_width 时 scale=1，缺陷完全隐形——所以必须
+    用"同一画面放大 2 倍"来钉这个不变量。
+    """
+    rng = np.random.default_rng(0)
+    patch = rng.integers(0, 255, (60, 120, 3), dtype=np.uint8)
+    base = np.zeros((690, 1280, 3), dtype=np.uint8)
+    base[100:160, 200:320] = patch
+    big = cv2.resize(base, (2560, 1380), interpolation=cv2.INTER_NEAREST)
+
+    tpl_dir = tmp_path / "templates"
+    tpl_dir.mkdir()
+    cv2.imwrite(str(tpl_dir / "gate_neg_synth.png"), patch)   # 1280 宽基准
+
+    cfg = VisionConfig()
+    cfg.max_detect_width = 1280          # 2560 的帧会被缩到 1280 → scale=0.5
+    cfg.scene_gate.enabled = True
+    cfg.scene_gate.fail_closed = True
+    det = Detector(cfg, tpl_dir)
+    assert det._neg_templates, "反例模板没被加载，测试前提不成立"
+
+    st = det.process(big, 1000)
+    assert not st.in_game, "放大 2 倍的同一张界面必须仍被反例拦下"
+    assert det.diag["gate_reason"].startswith("negative:"), (
+        f"反例没命中，实际原因 {det.diag['gate_reason']}（缩放没跟着 max_detect_width 走）")
+
+
+def test_negative_beats_positive_when_hud_still_visible(tmp_path):
+    """反例必须压过正向：角色面板把 HUD 留在画面上时，门禁仍要拦。
+
+    真实事故（火炬之光 PC 录屏）：打开角色/装备面板时，底部技能栏、血条、
+    经验条**全都还在**（面板是半透明覆盖层），于是三张正向锚点全部命中
+    （0.83，阈值 0.60），门禁判"这是战斗"，12 帧里点了 5 下 —— 其中
+    (736,950)/(755,952) 正好落在「鉴定所有」上。这类面板一旦被放行，
+    点一下就是换装/洗点，比漏检更贵。
+
+    不变量：**反例优先于正向**，且与正向得分高低无关。
+    """
+    rng = np.random.default_rng(7)
+    hud = rng.integers(0, 255, (40, 120, 3), dtype=np.uint8)       # 模拟技能栏
+    panel = rng.integers(0, 255, (70, 150, 3), dtype=np.uint8)     # 模拟面板按钮行
+    frame = np.zeros((690, 1280, 3), dtype=np.uint8)
+    frame[600:640, 300:420] = hud          # 底部 HUD 在
+    frame[390:460, 960:1110] = panel       # 面板同时在
+
+    tpl_dir = tmp_path / "templates"
+    tpl_dir.mkdir()
+    cv2.imwrite(str(tpl_dir / "gate_pos_synth_hud.png"), hud)
+    cv2.imwrite(str(tpl_dir / "gate_neg_synth_panel.png"), panel)
+
+    cfg = VisionConfig()
+    cfg.scene_gate.enabled = True
+    cfg.scene_gate.fail_closed = True
+    cfg.scene_gate.threshold = 0.6
+    det = Detector(cfg, tpl_dir)
+    assert det._skillbar_templates and det._neg_templates, "两类模板都要加载到，测试前提不成立"
+
+    st = det.process(frame, 1000)
+    assert not st.in_game, "HUD 还在也不能放行——面板开着就不是战斗画面"
+    assert det.diag["gate_reason"].startswith("negative:"), (
+        f"反例没优先于正向，实际原因 {det.diag['gate_reason']}"
+        f"（正向 {det.diag['gate_best']:.3f} / 反例 {det.diag['gate_neg_best']:.3f}）")

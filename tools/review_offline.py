@@ -68,6 +68,8 @@ section.video .sub{color:var(--dim);font-size:12.5px;margin-bottom:12px;
 .ov .a{border-color:#22c55e}
 .ov .m{border-color:#c026d3;opacity:.75}
 .ov .l{border-color:#38bdf8;opacity:.6;border-width:1px}
+/* 角色位置：程序认为"我"在哪。走位点合不合理，看这个点和点击点的相对位置 */
+.ov .ch{background:#22c55e;border:1px solid #052e16;border-radius:50%;opacity:.9}
 .ov .r{border-color:#eab308}
 .ov .c{position:absolute;width:16px;height:16px;margin:-8px 0 0 -8px;border:0;
       border-radius:50%;box-shadow:0 0 0 1.5px #fff,0 0 0 3px rgba(0,0,0,.75)}
@@ -164,11 +166,19 @@ def _overlay(it: dict) -> str:
     fw, fh = it["frame_size"]
     parts: list[str] = []
     for p in it["pillars"]:
-        left = _pct(p["cx"] - p["w"] / 2, fw)
-        top = _pct(p["cy"] - p["h"] / 2, fh)
-        w = _pct(p["w"], fw)
-        h = _pct(p["h"], fh)
+        pw, ph = p.get("w") or 0, p.get("h") or 0
         cls = "p st" if p.get("stable") else "p"
+        if pw > 1 and ph > 1:
+            left = _pct(p["cx"] - pw / 2, fw)
+            top = _pct(p["cy"] - ph / 2, fh)
+            w = _pct(pw, fw)
+            h = _pct(ph, fh)
+        else:
+            # 旧产物只记了中心点、没记尺寸 —— 画个 10px 的点。假装知道它多大更糟。
+            left = _pct(p["cx"] - 5, fw)
+            top = _pct(p["cy"] - 5, fh)
+            w = _pct(10, fw)
+            h = _pct(10, fh)
         parts.append(f'<i class="{cls}" style="left:{left};top:{top};width:{w};height:{h}"></i>')
     for m in it["monsters"]:
         parts.append(
@@ -187,15 +197,24 @@ def _overlay(it: dict) -> str:
             f'height:{_pct(e["h"], fh)}"></i>')
     a = it.get("aframe")
     if a:
+        aw, ah = a.get("w") or 0, a.get("h") or 0
+        if aw <= 1 or ah <= 1:      # 旧产物只记了中心点
+            aw = ah = 10
         parts.append(
-            f'<i class="a" style="left:{_pct(a["x"] - a["w"] / 2, fw)};'
-            f'top:{_pct(a["y"] - a["h"] / 2, fh)};width:{_pct(a["w"], fw)};'
-            f'height:{_pct(a["h"], fh)}"></i>')
+            f'<i class="a" style="left:{_pct(a["x"] - aw / 2, fw)};'
+            f'top:{_pct(a["y"] - ah / 2, fh)};width:{_pct(aw, fw)};'
+            f'height:{_pct(ah, fh)}"></i>')
     r = it.get("rechallenge")
     if r:
         parts.append(f'<i class="r" style="left:{_pct(r["x"] - 60, fw)};'
                      f'top:{_pct(r["y"] - 18, fh)};width:{_pct(120, fw)};'
                      f'height:{_pct(36, fh)}"></i>')
+    ch = it.get("character")
+    if ch and len(ch) == 2:
+        # 角色标记画在点击点之前（点击点要压在最上层，方便看"点在哪"）
+        parts.append(f'<i class="ch" style="left:{_pct(ch[0] - 7, fw)};'
+                     f'top:{_pct(ch[1] - 7, fh)};width:{_pct(14, fw)};'
+                     f'height:{_pct(14, fh)}"></i>')
     for c in it["commands"]:
         if c.get("x") is not None and c.get("y") is not None and c["op"] != "mouse_move":
             parts.append(f'<i class="c" style="left:{_pct(c["x"], fw)};'
@@ -236,6 +255,9 @@ def _det_line(it: dict) -> str:
         bits.append("再次挑战 <b>有</b>")
     if it.get("loading"):
         bits.append("加载/黑场")
+    ch = it.get("character")
+    if ch and len(ch) == 2:
+        bits.append(f"角色 <b>({ch[0]},{ch[1]})</b>")
     bits.append(f"帧差 <b>{it.get('frame_delta', 0):.1f}%</b>")
     return " · ".join(bits)
 
@@ -265,6 +287,117 @@ def _cmd_table(it: dict) -> str:
             + "".join(rows) + "</table>")
 
 
+def _ts_to_ms(t: str) -> int:
+    """`MM:SS.ss` → 毫秒。旧产物只有这个字符串时间戳。"""
+    try:
+        m, s = str(t).split(":")
+        return int((int(m) * 60 + float(s)) * 1000)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _png_size(p: Path) -> tuple[int, int] | None:
+    """只读 PNG 头拿宽高（16~24 字节），不解码整图——200 帧也就几毫秒。"""
+    try:
+        with p.open("rb") as f:
+            head = f.read(24)
+        if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+            return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+    except OSError:
+        pass
+    return None
+
+
+def _norm_items(d: Path, man: dict) -> list[dict]:
+    """把旧版 manifest 的 items 升级成当前渲染器认识的形状。
+
+    旧产物（2026-11 之前）长这样：`{gate: "拦截", commands: ["..."], t: "00:12.50"}`，
+    没有 in_game / ms / monsters / frame_size。渲染器直接下标会 KeyError，
+    所以在这里一次性补齐，而不是让页面渲染处到处 `if "xxx" in it`。
+    """
+    out: list[dict] = []
+    for raw in man.get("items") or []:
+        if "in_game" in raw:
+            out.append(raw)
+            continue
+        gate = str(raw.get("gate", "") or "")
+        in_game = gate not in ("拦截", "blocked", "block")
+        cmds = [c if isinstance(c, dict)
+                else {"op": "", "key": None, "button": None, "x": None, "y": None,
+                      "hold_ms": None, "text": str(c)}
+                for c in (raw.get("commands") or [])]
+        # 旧产物把帧图直接放目录下，没有 frames/ 子目录；尺寸也没记，从 PNG 头补
+        img = str(raw.get("image", ""))
+        size = raw.get("frame_size")
+        if not size:
+            size = (_png_size(d / "frames" / img) or _png_size(d / img) or [960, 540])
+        pillars = []
+        for p in raw.get("pillars") or []:
+            if isinstance(p, dict):
+                pillars.append(p)
+            else:                      # 旧格式：[cx, cy, color]，没有宽高
+                pillars.append({"cx": p[0], "cy": p[1], "w": 0, "h": 0,
+                                "color": p[2] if len(p) > 2 else "?"})
+        af = raw.get("aframe")
+        if isinstance(af, (list, tuple)):
+            af = {"x": af[0], "y": af[1], "w": 0, "h": 0}   # 旧格式只记了中心点
+        out.append({
+            **raw,
+            "in_game": in_game,
+            "gate_reason": "" if in_game else "legacy",
+            "ms": _ts_to_ms(raw.get("t", "")),
+            "intent": raw.get("intent") or "",
+            "state": raw.get("state") or "",
+            "loading": bool(raw.get("loading")),
+            "pillars": pillars,
+            "aframe": af or None,
+            "monsters": raw.get("monsters") or [],
+            "ground_labels": raw.get("ground_labels") or [],
+            "item_list": raw.get("item_list") or [],
+            "rechallenge": raw.get("rechallenge"),
+            "frame_delta": raw.get("frame_delta") or 0.0,
+            "frame_size": list(size),
+            "commands": cmds,
+            "violations": raw.get("violations") or [],
+        })
+    return out
+
+
+def _norm_summary(d: Path, man: dict, items: list[dict]) -> dict:
+    """兼容旧版 manifest（只有 `video` + `items`，没有 `summary`）。
+
+    审查页的用途是"让人核对"，不该因为产物格式升级就打不开半年前录的那批帧。
+    能从 items 推出来的就推，推不出来的显式留 None，页面显示 "—"——
+    宁可写"不知道"，也不要填一个假的 0 让人以为"这帧没按 A"。
+    """
+    s = man.get("summary")
+    if isinstance(s, dict) and "ticks" in s:
+        return s
+    key_taps = [c for it in items for c in (it.get("commands") or [])
+                if c.get("op") == "key_tap"]
+    return {
+        "name": d.name,
+        "video": man.get("video", ""),
+        "src": {},
+        "hz": None,                       # 旧产物没记抽帧频率
+        "gate_unmatched": None,
+        "replay_s": None,
+        "ticks": len(items),
+        "gate_pass": sum(1 for it in items if it.get("in_game")),
+        "loading_ticks": sum(1 for it in items if it.get("loading")),
+        "ticks_with_commands": sum(1 for it in items if it.get("commands")),
+        "commands": sum(len(it.get("commands") or []) for it in items),
+        "per_op": {},
+        "a_press": sum(1 for c in key_taps if (c.get("key") or "") == "a"),
+        "ticks_with_pillars": sum(1 for it in items if it.get("pillars")),
+        "ticks_with_aframe": sum(1 for it in items if it.get("aframe")),
+        "ticks_with_monsters": sum(1 for it in items if it.get("monsters")),
+        "hsv": {},
+        "violations": [v for it in items for v in (it.get("violations") or [])],
+        "legacy": True,
+    }
+
+
 def build(out_root: Path) -> Path:
     vids = []
     for d in sorted(out_root.iterdir()):
@@ -279,7 +412,8 @@ def build(out_root: Path) -> Path:
     body: list[str] = []
     jump: list[str] = []
     for vi, (d, man) in enumerate(vids, 1):
-        s = man["summary"]
+        items = _norm_items(d, man)
+        s = _norm_summary(d, man, items)
         tot["ticks"] += s["ticks"]
         tot["cmds"] += s["commands"]
         tot["with"] += s["ticks_with_commands"]
@@ -290,7 +424,7 @@ def build(out_root: Path) -> Path:
         # 门禁原因分布：反例命中 / 未标定 必须一眼分得清，否则"为什么一帧命令都没有"
         # 只能靠猜（真实事故：门禁常开时反而看不出问题）。
         reasons: dict[str, int] = {}
-        for it in man["items"]:
+        for it in items:
             if it["in_game"]:
                 continue
             r = str(it.get("gate_reason", "") or "")
@@ -298,12 +432,13 @@ def build(out_root: Path) -> Path:
                    else "未标定" if r == "unmatched" else (r or "其他"))
             reasons[key] = reasons.get(key, 0) + 1
         gate_desc = " ".join(f"{k} {v}" for k, v in sorted(reasons.items()))
+        hz_txt = f'{s["hz"]}Hz 回放' if s.get("hz") else "旧产物（未记抽帧频率）"
         jump.append(f'<a href="#v{vi}">{s["name"]}</a>')
         body.append(
             f'<section class="video" id="v{vi}"><h2>{s["name"]}</h2>'
             f'<div class="sub"><span>{src.get("size", ["?", "?"])[0]}×'
             f'{src.get("size", ["?", "?"])[1]} · {src.get("duration_s", 0)}s · '
-            f'{s["hz"]}Hz 回放</span>'
+            f'{hz_txt}</span>'
             f'<span>{s["ticks"]} 帧</span><span>命令 {s["commands"]} 条</span>'
             f'<span>有指令 {s["ticks_with_commands"]} 帧</span>'
             f'<span>按A {s["a_press"]}</span>'
@@ -313,7 +448,7 @@ def build(out_root: Path) -> Path:
             f'{("（" + gate_desc + "）") if gate_desc else ""}</span>'
             f'<span style="color:{"#fca5a5" if s["violations"] else "var(--dim)"}">'
             f'违规 {len(s["violations"])}</span></div>')
-        for it in man["items"]:
+        for it in items:
             flags = ["all"]
             flags.append("cmd" if it["commands"] else "nocmd")
             if it.get("violations"):
@@ -325,6 +460,8 @@ def build(out_root: Path) -> Path:
             if not it["in_game"]:
                 flags.append("gated")
             img = f'{d.name}/frames/{it["image"]}'
+            if not (out_root / img).exists():      # 旧产物把帧图直接放目录下
+                img = f'{d.name}/{it["image"]}'
             tag_gate = ('<span class="tag on">战斗</span>' if it["in_game"]
                         else f'<span class="tag off">UI拦截{_gate_suffix(it)}</span>')
             vtag = ""

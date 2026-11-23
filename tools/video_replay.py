@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -75,6 +76,19 @@ def draw_judgment(frame: np.ndarray, lr: dict, ts: str) -> np.ndarray:
         cv2.putText(out, f">> {c}", (10, 52 + ci * 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return out
+
+
+
+def _pickup_evidence(scene, dec_cfg) -> bool:
+    """按拾取键有没有像素证据：A框出现，或（TLI 类）地面标签就在跟前。"""
+    if scene.aframe is not None:
+        return True
+    if not getattr(dec_cfg, "label_pickup_when_near", False) or not scene.ground_labels:
+        return False
+    near = float(dec_cfg.label_pickup_near_ratio) * min(scene.w, scene.h)
+    ch = scene.character
+    return any(math.hypot(g.x - ch[0], g.y - ch[1]) <= near
+               for g in scene.ground_labels)
 
 
 def main() -> None:
@@ -187,8 +201,8 @@ def main() -> None:
             if not scene.in_game and cmds:
                 violations.append(f"[{ts_str(video_ms)}] R3 门禁关闭却有命令 {cmds}")
             for c in cmds:
-                if c.startswith("KEY_TAP a") and scene.aframe is None:
-                    violations.append(f"[{ts_str(video_ms)}] R4 盲按A（无A框）")
+                if c.startswith("KEY_TAP a") and not _pickup_evidence(scene, eng.cfg):
+                    violations.append(f"[{ts_str(video_ms)}] R4 盲按A（无A框、也无近距标签）")
                 if "(" in c and c.rstrip().endswith(")"):
                     try:
                         xy = c[c.rfind("(") + 1 : c.rfind(")")].split(",")

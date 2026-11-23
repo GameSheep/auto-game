@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -51,6 +52,25 @@ def _journal_to_cmd(j: dict) -> Command:
 def _cmd_dict(c: Command) -> dict:
     return {"op": c.op, "key": c.key, "button": c.button, "x": c.x, "y": c.y,
             "hold_ms": c.hold_ms, "text": format_command(c)}
+
+
+def _pickup_evidence(scene, dec_cfg) -> bool:
+    """这一帧按拾取键有没有像素证据（R4 铁律的判定口径）。
+
+    "绝不盲按"的本意是"没有证据不许按"，不是"只有 A框能按"：
+      * 暗黑4 类：A框（近距交互提示）出现 = 证据；
+      * 火炬之光 PC 类：没有 A框，拾取提示就是地面标签 —— 标签落在跟前
+        （`label_pickup_near_ratio × 画面短边`）同样是证据。
+    两条都不满足才算盲按。
+    """
+    if scene.aframe is not None:
+        return True
+    if not getattr(dec_cfg, "label_pickup_when_near", False) or not scene.ground_labels:
+        return False
+    near = float(dec_cfg.label_pickup_near_ratio) * min(scene.w, scene.h)
+    ch = scene.character
+    return any(math.hypot(g.x - ch[0], g.y - ch[1]) <= near
+               for g in scene.ground_labels)
 
 
 def run_video(video: Path, out_root: Path, hz: float, max_min: float,
@@ -123,8 +143,8 @@ def run_video(video: Path, out_root: Path, hz: float, max_min: float,
                 v.append(f"R3 门禁关闭却有 {len(cmds)} 条命令")
             for c in cmds:
                 if c.op == "key_tap" and (c.key or "").lower() == dec_cfg.pickup_key.lower() \
-                        and scene.aframe is None:
-                    v.append("R4 盲按拾取键（该帧无 A框）")
+                        and not _pickup_evidence(scene, dec_cfg):
+                    v.append("R4 盲按拾取键（该帧既无 A框、也无近距标签）")
                 if c.x is not None and c.y is not None:
                     if not (0 <= c.x < scene.w and 0 <= c.y < scene.h):
                         v.append(f"R5 坐标越界 {format_command(c)}")
@@ -157,6 +177,9 @@ def run_video(video: Path, out_root: Path, hz: float, max_min: float,
                 "in_game": scene.in_game,
                 "loading": scene.loading,
                 "frame_delta": scene.frame_delta,
+                # 角色位置（原始帧坐标）：审查页要能核对"这次走位点离角色多远、
+                # 方向对不对"。之前没记，导致复核时只能猜角色在屏幕中心。
+                "character": [int(scene.character[0]), int(scene.character[1])],
                 "state": eng.state.value,
                 "intent": eng.last_intent,
                 "pillars": [{"x": p.x, "y": p.y, "cx": p.cx, "cy": p.cy, "w": p.w, "h": p.h,

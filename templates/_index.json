@@ -1,0 +1,142 @@
+{
+  "gate_pos_tli_pc_skillbar.png": {
+    "base_width": 1280,
+    "source": "f42.png",
+    "rect": [
+      448,
+      533,
+      772,
+      622
+    ]
+  },
+  "gate_pos_tli_pc_hp.png": {
+    "base_width": 1280,
+    "source": "f42.png",
+    "rect": [
+      320,
+      570,
+      370,
+      595
+    ]
+  },
+  "gate_pos_tli_pc_shield.png": {
+    "base_width": 1280,
+    "source": "f42.png",
+    "rect": [
+      260,
+      590,
+      310,
+      615
+    ]
+  },
+  "gate_pos_tli_pc_orbL.png": {
+    "base_width": 1280,
+    "source": "f42.png",
+    "rect": [
+      400,
+      540,
+      460,
+      620
+    ]
+  },
+  "gate_pos_tli_pc_orbR.png": {
+    "base_width": 1280,
+    "source": "f42.png",
+    "rect": [
+      700,
+      540,
+      760,
+      620
+    ]
+  },
+  "gate_pos_tli_pc_exp.png": {
+    "base_width": 1280,
+    "source": "f42.png",
+    "rect": [
+      660,
+      620,
+      730,
+      660
+    ]
+  },
+  "gate_neg_tli_pc_mapbtns.png": {
+    "base_width": 1280,
+    "source": "f12.png",
+    "rect": [
+      70,
+      485,
+      320,
+      540
+    ]
+  },
+  "gate_neg_tli_pc_mapaffix.png": {
+    "base_width": 1280,
+    "source": "f12.png",
+    "rect": [
+      55,
+      120,
+      305,
+      215
+    ]
+  },
+  "gate_neg_tli_pc_modal.png": {
+    "base_width": 1280,
+    "source": "f22.png",
+    "rect": [
+      395,
+      385,
+      700,
+      432
+    ]
+  },
+  "gate_neg_tli_pc_mapfull.png": {
+    "base_width": 1280,
+    "source": "f6.png",
+    "rect": [
+      20,
+      40,
+      320,
+      240
+    ]
+  },
+  "gate_neg_tli_pc_cutscene.png": {
+    "base_width": 1280,
+    "source": "f106.png",
+    "rect": [
+      380,
+      380,
+      900,
+      620
+    ]
+  },
+  "gate_neg_tli_pc_cave.png": {
+    "base_width": 1280,
+    "source": "f112.png",
+    "rect": [
+      250,
+      150,
+      750,
+      500
+    ]
+  },
+  "gate_neg_tli_pc_cave2.png": {
+    "base_width": 1280,
+    "source": "f108.png",
+    "rect": [
+      0,
+      300,
+      500,
+      600
+    ]
+  },
+  "gate_neg_tli_pc_charpanel.png": {
+    "base_width": 1280,
+    "source": "panel_228.png",
+    "rect": [
+      960,
+      390,
+      1110,
+      460
+    ]
+  }
+}

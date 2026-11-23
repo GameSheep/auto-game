@@ -36,6 +36,16 @@ def _box_overlap(cx1: float, cy1: float, w1: float, h1: float,
     return (abs(cx1 - cx2) * 2 < (w1 + w2)) and (abs(cy1 - cy2) * 2 < (h1 + h2))
 
 
+def _center_in_box(cx: float, cy: float,
+                   cx2: float, cy2: float, w2: float, h2: float) -> bool:
+    """候选中心是否落在框内。
+
+    比"任意重叠"宽松：怪物头顶有名字/等级文字，文字框常与怪身框相交，
+    但怪的**中心**不会落在文字框里。用重叠判会把带名字的怪整批误杀。
+    """
+    return abs(cx - cx2) * 2 < w2 and abs(cy - cy2) * 2 < h2
+
+
 def _tpl_usable(tpl: np.ndarray) -> bool:
     """模板是否可用于 NCC 匹配：需要真实结构（方差）且不是一条线。
 
@@ -58,6 +68,40 @@ class Detector:
     MONSTER_SIZE_TOL = 0.35     # 尺寸变化超过该比例也算"活了"（挥击/受击缩放）
     MONSTER_CONFIRM_HITS = 1    # 首次确认所需命中次数（0 → 需两帧都见过）
 
+    # 怪物血条（横条）判据：条必须在候选框正上方这一段里，且水平居中于候选。
+    # 火炬之光实测（2560 宽录像）：血条在怪身上方约 1.0~1.5 倍身高处，比 0.85
+    # 的原上限更远 —— 候选框常常只框住怪的下半身，写死 0.85 会把真怪全漏掉。
+    HPBAR_MIN_W = 14            # 条最小宽度（work 像素）
+    HPBAR_MAX_W = 220
+    HPBAR_MAX_H = 10            # 条最大高度（真实怪条 3~6px；13px 那种是地形亮边）
+    HPBAR_MIN_ASPECT = 2.2      # 宽/高下限（细长条，不是色块）
+    HPBAR_MIN_FILL = 0.45
+    # 血条只有一部分是彩色填充（剩余血量），其余是灰色空槽 → 彩色段会被切成
+    # 几截。先做横向闭运算把同一根条的碎片接回去，再按整条量尺寸。
+    HPBAR_MERGE_KERNEL = (9, 1)
+    # 血条色域（OpenCV H 0-179 / S,V 0-255）：只收纯红。
+    # 收橙黄会把金色建筑装饰一起收进来（真实录像实测：鎏金柱子被当血条）。
+    HPBAR_HSV_RANGES = (
+        (0, 150, 130, 10, 255, 255),       # 红
+        (170, 150, 130, 179, 255, 255),    # 红（跨 0 的另一半）
+    )
+    # 玩家自己头顶也有一条铭牌血条（绿 HP + 蓝 MP），而玩家永远在画面中心附近，
+    # 于是它成了全画面最"稳定"的条 —— 真实录像里它把角色旁边的岩石一块块
+    # 验证成了怪物（8 个检出里 4 个是它干的）。角色附近的条一律不算怪物证据。
+    PLAYER_BAR_BOX = (0.14, 0.30, 0.10)  # (左右容差×ww, 向上×wh, 向下×wh)
+    # 角色自身色块也不是怪（玩家精灵同样高饱和、尺寸落在怪物判据里）
+    PLAYER_SELF_RADIUS = 0.08            # ×画面高度
+    # 血条黑框校验（原始帧）：外圈平均亮度 / 填充平均亮度 的上限。
+    # 真条外圈是 1~2px 纯黑（实测 0.26），地形红色亮边 0.65~0.97。
+    HPBAR_RING_MAX_RATIO = 0.60
+    # 条宽 / 身体宽 的容许区间：头顶血条按怪物宽度画，不会只有身体宽的 1/4。
+    # 真实录像里"血条真、身体配到地形块"的误报，宽度比全落在 0.15~0.35。
+    HPBAR_BODY_W_RATIO = (0.45, 3.2)
+
+    # 反例粗筛余量：粗筛分数低于 (negative_threshold - 该值) 就不做精细匹配。
+    # 取 0.15 是实测留出的安全垫（真命中粗筛一般 ≥0.85，误检区 ≤0.6）。
+    NEG_COARSE_MARGIN = 0.15
+
     def __init__(self, cfg: VisionConfig, templates_dir: Path | None = None) -> None:
         self.cfg = cfg
         self._template: np.ndarray | None = None
@@ -78,7 +122,14 @@ class Detector:
         self._diag_gate_neg_name: str = ""
         self._diag_gate_pos_name: str = ""
         self._diag_gate_reason: str = ""
+        self._diag_monster_hpbar: int = 0
+        # 黑框校验前的条数（诊断用：raw - hpbar_bars = 被"没有 UI 黑框"挡掉的数量）
+        self._diag_monster_hpbar_raw: int = 0
+        self._diag_hpbar_coarse: int = 0
         self._last_gray: np.ndarray | None = None
+        # 角色定位：半分辨率灰度上一帧 + 平滑后的估计（None=还没攒够两帧）
+        self._char_gray: np.ndarray | None = None
+        self._char_ema: tuple[float, float] | None = None
         # 光柱时域跟踪: [(cx, cy, 剩余寿命, 连续可见帧数)]
         self._beam_track: list[tuple[int, int, int, int]] = []
         # 怪物时域确认: [(x, y, w, h, 命中次数)] —— 静态 HUD 图标/漂浮文字永不累加
@@ -142,13 +193,26 @@ class Detector:
 
     def _collect_templates(self, templates_dir: Path | None,
                            pattern: str, legacy: str = "") -> list[Path]:
-        """按通配收集模板；pattern 无命中时回退 legacy 通配（兼容老命名）。"""
+        """按通配收集模板：`pattern` 与 `legacy` **合并**（不是回退）。
+
+        为什么必须合并：早先的写法是"新命名没命中才回退老命名"。结果只要有人
+        按新规范加了一张 `gate_neg_xxx.png`，同目录里所有 `neg_*.png` 就被静默
+        丢弃——老的暗黑4 角色面板、火炬星图反例全部失效，门禁看起来"还有反例"，
+        实际只剩新加的那一张。真实事故：给新录屏加了 7 张反例后，原有两条反例
+        消失，`test_nether_map_has_no_beam_and_no_command` 当场变红。
+        """
         base = templates_dir or (ROOT_TEMPLATES if ROOT_TEMPLATES.exists() else None)
         if not base:
             return []
-        found = sorted(Path(p) for p in _glob.glob(str(Path(base) / pattern)))
-        if not found and legacy:
-            found = sorted(Path(p) for p in _glob.glob(str(Path(base) / legacy)))
+        found: list[Path] = []
+        seen: set[str] = set()
+        for pat in (pattern, legacy):
+            if not pat:
+                continue
+            for p in sorted(_glob.glob(str(Path(base) / pat))):
+                if p not in seen:
+                    seen.add(p)
+                    found.append(Path(p))
         return found
     def _load_template(self, templates_dir: Path | None) -> None:
         name = self.cfg.aframe.template
@@ -257,8 +321,17 @@ class Detector:
         # 先抹掉 HUD 排除区：移动端技能轮盘/背包键就压在右侧战斗区里，不抹掉会被
         # 当成怪物点掉（真实录像验证发现的误报源）；再交给时域确认滤静态图标。
         work_ground = self._apply_hud_exclusions(work, w0, h0, scale)
+        # 角色位置要先算：怪物检测要排除"角色自己"和"角色头顶的铭牌血条"。
+        # 角色位置：屏幕中心 + 帧差修正。
+        # 写死中心会让所有走位点都落在"中心 ±220"的四个固定点上 —— 回放里
+        # 232 条命令有 154 条就是这四个点，机械得像脚本。镜头跟随角色，
+        # 角色相对屏幕几乎不动、背景在动，所以"中心区帧差最小的一块"≈角色。
+        gray = cv2.cvtColor(work_ground, cv2.COLOR_BGR2GRAY)
+        char_wx, char_wy = self._locate_character(gray, ww, wh)
         monsters = self._detect_monsters(work_ground, ww, wh, scale,
-                                         avoid=[*ground_labels, *item_list])
+                                         avoid=[*ground_labels, *item_list],
+                                         char=(char_wx, char_wy),
+                                         orig=frame_bgr, plain=work)
 
         # 3c) 加载/黑屏过场判定（暗像素占比，于排除前的原始画面）
         gray_raw = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
@@ -269,13 +342,14 @@ class Detector:
         # 复用上面为怪物检测算好的副本，避免同一帧再复制一次
         work = work_ground
 
-        # 角色中心：屏幕中心（缩放后坐标系）
-        char_x, char_y = ww // 2, wh // 2
-
         hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+        # gray 已在怪物检测前算好（同一张 work_ground），不重复转换
+        # 统一用**原始帧坐标**对外（SceneState.character / 光柱 distance / 走位点）：
+        # 检测在缩放后的 work 坐标里做，但对外一旦混用两套基准，scale≠1 时
+        # 走位点会整体偏到画面左上方（真实 2560 宽录像里偏了 2 倍）。
+        char_x, char_y = int(char_wx / scale), int(char_wy / scale)
 
         # 5) 帧差（防撞墙）：变化像素占比（0-100），在 1/4 分辨率上计算（提速）
-        gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
         gray_q = cv2.resize(gray, (max(1, gray.shape[1] // 4), max(1, gray.shape[0] // 4)),
                             interpolation=cv2.INTER_AREA)
         frame_delta = 0.0
@@ -285,14 +359,16 @@ class Detector:
         self._last_gray = gray_q
 
         # 6) A框检测（先于光柱，用于过滤 A框边缘误报）
-        aframe = self._detect_aframe(work, hsv, scale)
+        aframe = (self._detect_aframe(work, hsv, scale)
+                  if getattr(self.cfg.aframe, "enabled", True) else None)
 
         # 7) 『再次挑战』按钮检测（ROI 内模板/启发式）
         rechallenge = self._detect_rechallenge(work, scale) if self.cfg.rechallenge.enabled \
             else None
 
         # 8) 光柱检测（白芯校验 + HUD 排除 + 时域确认）
-        pillars = self._detect_pillars(hsv, work, ww, wh, char_x, char_y, scale)
+        pillars = (self._detect_pillars(hsv, work, ww, wh, char_x, char_y, scale)
+                   if getattr(self.cfg, "pillar_enabled", True) else [])
         if aframe is not None:
             # A框边缘产生的竖向细条不是光柱：丢弃与 A框重叠的候选
             ax0, ax1 = aframe.x - aframe.w // 2 - 2, aframe.x + aframe.w // 2 + 2
@@ -325,6 +401,9 @@ class Detector:
             "scale": round(float(scale), 3),
             "detect_w": int(w0),
             "detect_h": int(h0),
+            "char": [int(char_x), int(char_y)],
+            "hpbar_bars": int(self._diag_monster_hpbar),
+            "hpbar_bars_raw": int(self._diag_monster_hpbar_raw),
         }
         return SceneState(
             ts_ms=ts_ms,
@@ -438,7 +517,7 @@ class Detector:
             return True
         # 1) 反例优先：整屏 UI（关卡选择/背包/结算）靠"有没有 HUD"判不出来，
         #    靠"这块 UI 长得像不像我标过的某张菜单"才判得出来。
-        neg = self._check_negative_ui(work, w0)
+        neg = self._check_negative_ui(work, w0, scale)
         if neg is not None:
             self._diag_gate_reason = f"negative:{neg}"
             return False
@@ -519,8 +598,17 @@ class Detector:
             log.info("反例模板已加载 %d 张: %s", len(self._neg_templates),
                      ", ".join(f"{n}(base {b})" for n, _, b in self._neg_templates))
 
-    def _check_negative_ui(self, work: np.ndarray, w0: int) -> str | None:
-        """整屏反例匹配：任一命中即返回模板名（命中=这是菜单/面板，不是战斗）。"""
+    def _check_negative_ui(self, work: np.ndarray, w0: int,
+                           scale: float = 1.0) -> str | None:
+        """整屏反例匹配：任一命中即返回模板名（命中=这是菜单/面板，不是战斗）。
+
+        `scale` 是 work 相对原始帧的缩放（`max_detect_width / w0`）。反例模板和
+        正向模板一样，必须按"模板基准宽 → 当前匹配图宽"的比例缩放，而当前匹配图
+        是 `work` 再降半分辨率。**这里漏乘 scale 会静默失效**：源帧宽等于
+        `max_detect_width` 时 scale=1，一切正常；一旦源帧更大（2560 宽录屏 →
+        work 1280），模板就会被放大 2 倍，整屏反例永远匹配不上——门禁看起来
+        "没有反例"，实际是反例根本没在对的尺度上比对。
+        """
         if not self._neg_templates:
             return None
         g = self.cfg.scene_gate
@@ -528,16 +616,30 @@ class Detector:
         if min(full.shape[:2]) < 12:
             return None
         gray = cv2.cvtColor(full, cv2.COLOR_BGR2GRAY)
+        coarse_gray = cv2.cvtColor(
+            cv2.resize(full, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA),
+            cv2.COLOR_BGR2GRAY)
         best, best_name = -1.0, ""
         for name, tpl, base_w in self._neg_templates:
-            norm = (w0 / float(base_w)) * 0.5
+            norm = (w0 / float(base_w)) * scale * 0.5
             th, tw = tpl.shape[:2]
             tw_s, th_s = max(2, int(round(tw * norm))), max(2, int(round(th * norm)))
             if th_s >= gray.shape[0] or tw_s >= gray.shape[1]:
                 continue
             t = cv2.resize(tpl, (tw_s, th_s), interpolation=cv2.INTER_AREA)
-            res = cv2.matchTemplate(gray, cv2.cvtColor(t, cv2.COLOR_BGR2GRAY),
-                                    cv2.TM_CCOEFF_NORMED)
+            t_gray = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY)
+            # 粗筛：模板与整屏同比再降一半（面积 1/4 → 匹配成本约 1/16）。
+            # 只有粗筛分数接近阈值时才做精细匹配——大部分战斗帧在第一轮就被淘汰。
+            # 粗筛分数低于"阈值 - 余量"而精细分数反超的情形几乎不存在：同一块
+            # 纹理降采样后 NCC 只会更平滑，不会凭空长出结构。
+            cw, ch = max(2, tw_s // 2), max(2, th_s // 2)
+            if ch < coarse_gray.shape[0] and cw < coarse_gray.shape[1]:
+                t_c = cv2.resize(t_gray, (cw, ch), interpolation=cv2.INTER_AREA)
+                v_c = float(cv2.minMaxLoc(
+                    cv2.matchTemplate(coarse_gray, t_c, cv2.TM_CCOEFF_NORMED))[1])
+                if v_c < g.negative_threshold - self.NEG_COARSE_MARGIN:
+                    continue
+            res = cv2.matchTemplate(gray, t_gray, cv2.TM_CCOEFF_NORMED)
             v = float(cv2.minMaxLoc(res)[1])
             if v > best:
                 best, best_name = v, name
@@ -764,50 +866,353 @@ class Detector:
         out.sort(key=lambda e: (e.y, e.x))
         return out[: gl.max_labels]
 
+    # ---------------- 角色定位 ----------------
+
+    def _locate_character(self, gray: np.ndarray, ww: int, wh: int) -> tuple[int, int]:
+        """角色在画面上的位置（**work 坐标**）：屏幕中心 + 帧差修正。
+
+        ARPG 的镜头跟随角色：角色相对屏幕几乎不动，背景在整片平移。于是
+        "中心搜索区里帧差最小的一块"就是角色所在。写死 `ww//2` 的后果是
+        所有走位点都落在"中心 ± 固定距离"的四个点上（真实回放里 232 条
+        命令有 154 条就是这四个坐标，机械得像脚本）。
+
+        三道保险，防止估计被拽走：
+          1. 只在中心区搜索（横向 22%~78%，纵向 28%~80%）；
+          2. 偏移限幅（`character_track_max_off`，默认 ±12% 帧宽/帧高）；
+          3. 指数平滑 + "最静块和中心块差别不大就用中心"（站立不动时
+             整屏帧差都接近 0，此时任何块都"最静"，不能信）。
+
+        坐标约定：内部一律在**半分辨率**坐标系里算（g 是 gray 的一半），
+        出口统一乘 2 回到 work 坐标。之前限幅用了 `ww`（全分辨率）却拿
+        半分辨率的 `tx` 去比，结果每一帧都被钳到 ±12% 的边界上。
+        """
+        cx0, cy0 = ww // 2, wh // 2
+        if not self.cfg.character_track:
+            self._char_gray = None
+            return cx0, cy0
+
+        # 半分辨率就够定位（1/4 会让角色与背景混在一起），且比全分辨率便宜 4 倍
+        g = cv2.resize(gray, (max(1, ww // 2), max(1, wh // 2)),
+                       interpolation=cv2.INTER_AREA)
+        prev, self._char_gray = self._char_gray, g
+        if prev is None or prev.shape != g.shape:
+            return cx0, cy0
+
+        hw, hh = g.shape[1], g.shape[0]        # 半分辨率尺寸
+        hcx, hcy = hw // 2, hh // 2
+        diff = cv2.absdiff(g, prev)
+        x0, x1 = int(hw * 0.22), int(hw * 0.78)
+        y0, y1 = int(hh * 0.28), int(hh * 0.80)
+        sub = diff[y0:y1, x0:x1]
+        if sub.shape[0] < 16 or sub.shape[1] < 16:
+            return cx0, cy0
+
+        # 4×6 网格找"最静"的格子
+        rows, cols = 4, 6
+        cell_h, cell_w = sub.shape[0] // rows, sub.shape[1] // cols
+        if cell_h < 4 or cell_w < 4:
+            return cx0, cy0
+        means = np.empty((rows, cols), dtype=np.float32)
+        for r in range(rows):
+            for c in range(cols):
+                blk = sub[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w]
+                means[r, c] = float(blk.mean())
+        r, c = np.unravel_index(int(means.argmin()), means.shape)
+
+        # 中心块（与屏幕中心同格）作参照：最静块没比它安静多少 → 画面整体静止，用中心
+        cr = min(rows - 1, max(0, int((hcy - y0) / cell_h)))
+        cc = min(cols - 1, max(0, int((hcx - x0) / cell_w)))
+        if means[cr, cc] - means[r, c] < 2.0:
+            tx, ty = float(hcx), float(hcy)
+        else:
+            tx = x0 + (c + 0.5) * cell_w
+            ty = y0 + (r + 0.5) * cell_h
+
+        # 限幅：估计值不许跑离中心太远（施法特效/静止地形会把最静块拽偏）
+        # 注意这里是**半分辨率**坐标，限幅基准必须也用 hw/hh（用 ww 会把
+        # 每个估计值都钳到边界上 —— 上一版就是这么错的）
+        max_dx = hw * float(self.cfg.character_track_max_off)
+        max_dy = hh * float(self.cfg.character_track_max_off)
+        tx = min(hcx + max_dx, max(hcx - max_dx, tx))
+        ty = min(hcy + max_dy, max(hcy - max_dy, ty))
+
+        if self._char_ema is None:
+            self._char_ema = (tx, ty)
+        else:
+            a = 0.35   # 平滑：单帧误判不该让角色瞬移
+            ex, ey = self._char_ema
+            self._char_ema = (ex + (tx - ex) * a, ey + (ty - ey) * a)
+        ex, ey = self._char_ema
+        # 半分辨率 → work 坐标（调用方再按 scale 换回原始帧坐标）
+        return int(ex * 2), int(ey * 2)
+
     # ---------------- 怪物检测 ----------------
+
+    def _hpbar_boxes(self, hsv: np.ndarray,
+                     orig: np.ndarray | None = None,
+                     scale: float = 1.0) -> list[tuple[int, int, int, int]]:
+        """全图找"血条状横条"（work 坐标）：细长、高饱和、填充实、**有黑框**。
+
+        暗黑4 / 火炬之光的敌人头顶都有 3~8px 高的条，而红岩、冰面、
+        火焰特效、技能图标没有 —— 这是"这确实是怪物"最可靠的物理判据，
+        比"色块 + 2 像素就算动了"的时域判据强得多。
+
+        颜色只认**纯红**（H 0-10 / 170-179，S≥150，V≥130）：
+        真实录像实测，TLI 的敌人血条是纯红；而金色建筑装饰、暖色灯光是
+        橙黄（H 20-30），之前把橙黄一起收进来，整片宫殿的鎏金柱子都被
+        当成了"怪头顶的条"，41 个检出里近一半是建筑。
+
+        **黑框校验**（`orig` 不为空时）：血条是游戏画的 UI —— 外圈有 1~2px
+        纯黑描边、内部纯色填充。地形色带和技能特效是柔和渐变，外圈亮度
+        接近填充本身。真实录像（2560 宽）实测：真条 ring/fill ≈ 0.26，
+        地形色带 0.65~0.97 —— 这一道把"看起来像条的红斑"整类挡掉。
+        校验必须在**原始帧**上做：1280 的下采样会把 2px 黑边糊进红里。
+        """
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        # 血条是"游戏画上去的纯色条"：饱和度和亮度都很高。
+        # 地形上的"像条的东西"（管道亮边、罐子边缘）是暗红/棕，V 明显更低 ——
+        # V≥130 这一道把真实录像里 12/16 的地形误报挡掉大半。
+        for h0, s0, v0, h1, s1, v1 in self.HPBAR_HSV_RANGES:
+            mask |= cv2.inRange(hsv, np.array([h0, s0, v0], np.uint8),
+                                np.array([h1, s1, v1], np.uint8))
+        # 横向闭运算：血条的彩色段（剩余血量）和灰色空槽交替，彩色段本身会被
+        # 切成两三截；接回去才能量出"整条"的宽度（TLI 实测条宽 ≈ 2 倍怪身宽）。
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_RECT,
+                                                          self.HPBAR_MERGE_KERNEL))
+        # 9×1 开运算：只留横向连通的细条，点状高亮（火花/粒子）会被抹掉
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out: list[tuple[int, int, int, int]] = []
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            if not (2 <= h <= self.HPBAR_MAX_H):
+                continue
+            if not (self.HPBAR_MIN_W <= w <= self.HPBAR_MAX_W):
+                continue
+            if w / max(1, h) < self.HPBAR_MIN_ASPECT:
+                continue
+            if cv2.contourArea(c) / max(1, w * h) < self.HPBAR_MIN_FILL:
+                continue
+            out.append((x, y, w, h))
+        self._diag_hpbar_coarse = len(out)
+        if orig is not None:
+            out = [b for b in out if self._bar_has_dark_frame(orig, *b, scale)]
+        return out
+
+    def _bar_has_dark_frame(self, orig: np.ndarray, x: int, y: int,
+                            w: int, h: int, scale: float) -> bool:
+        """在**原始帧**上验"这条横条有没有 UI 黑框"（work 坐标传入）。
+
+        血条是游戏画的控件：外圈 1~2px 纯黑，内部纯色填充。地形上的红色
+        亮边、技能特效的红色条是柔和渐变，外圈亮度与填充几乎一样。
+        实测（2560 宽录像）真条上下边线/填充 ≈ 0.24，地形色带 0.75~0.98。
+
+        只量**上下两条边线**，不量左右：轮廓只覆盖红色填充，横向会漏掉
+        圆角和描边（实测左边缺 6px），左右两侧必然取到填充本身；而上下
+        方向没有这个问题，黑边完整落在条的外面。
+        """
+        if scale <= 0:
+            return True
+        H, W = orig.shape[:2]
+        X, Y = int(round(x / scale)), int(round(y / scale))
+        W2 = max(2, int(round(w / scale)))
+        H2 = max(1, int(round(h / scale)))
+        if X < 0 or Y < 0 or X + W2 > W or Y + H2 > H:
+            return True          # 出界（贴边）时无法判断，放行交给后续判据
+        pad = max(1, int(round(W / 1280.0)))     # 2560 宽 → 2px，1280 宽 → 1px
+        y0, y1 = max(0, Y - pad), min(H, Y + H2 + pad)
+        v = cv2.cvtColor(orig[y0:y1, X:X + W2], cv2.COLOR_BGR2HSV)[:, :, 2]
+        if v.size == 0:
+            return True
+        inner = v[Y - y0:Y - y0 + H2]
+        up = v[:Y - y0]
+        dn = v[Y - y0 + H2:]
+        fill = float(inner.mean())
+        if fill <= 0 or (up.size == 0 and dn.size == 0):
+            return True
+        edges = [float(b.mean()) for b in (up, dn) if b.size]
+        return (sum(edges) / len(edges)) / fill <= self.HPBAR_RING_MAX_RATIO
+
+    def _is_player_bar(self, bar: tuple[int, int, int, int],
+                       char: tuple[int, int], ww: int, wh: int) -> bool:
+        """这条横条是不是玩家自己的铭牌血条（贴在角色头顶）。
+
+        玩家永远在画面中心附近，铭牌条因此是**全画面最稳定的条**：位置不变、
+        填充比例不变。不排除它，角色周围的岩石会一块块被"验证"成怪物。
+        """
+        bx, by, bw, bh = bar
+        bcy = by + bh / 2.0
+        sx, up, down = self.PLAYER_BAR_BOX
+        if abs(bx + bw / 2.0 - char[0]) > sx * ww:
+            return False
+        return (char[1] - up * wh) <= bcy <= (char[1] + down * wh)
+
+    def _body_below_bar(self, bar: tuple[int, int, int, int],
+                        bodies: list[tuple[int, int, int, int, float]]
+                        ) -> tuple[int, int, int, int, float] | None:
+        """在血条**正下方**找怪的身体（work 坐标）。
+
+        血条总是画在头顶、水平居中于身体。所以纵向窗口是
+        `[条底 + 1, 条底 + 2.5×条宽]`，横向容差 `±0.6×条宽`。
+        多个候选时取"横向最对齐、纵向最近"的那个（打分量最小）。
+
+        光有"下方有个色块"远远不够：真实录像里最常见的误报就是**血条是
+        真的、下面的身体配到了地形块**（岩石/树/珊瑚的色块正好落在窗口里）。
+        所以再叠两条物理约束：
+
+          * 宽度同量级：`HPBAR_BODY_W_RATIO`（0.45~3.2 倍）。头顶血条是
+            按怪物宽度画的，绝不会只有身体宽度的 1/4；
+          * 水平居中：`|条中心 - 身体中心| <= 0.6×条宽`。血条居中于身体，
+            但身体轮廓只覆盖精灵的一部分（带翅膀/尾巴/武器的怪，包围盒中心
+            会偏），0.35 倍实测会差 0.25px 就拒掉真怪。
+
+        纵向**不能**要求"身体顶边严格在条下方"：TLI 的高个怪（冰晶簇）血条
+        是压在身体上部的，实测条底 y=82 而身体包围盒 y=68~137 —— 要求严格
+        下方会把这类怪全拒掉。改成：身体必须**伸到条下方**，且身体顶边不能
+        高于条底 `0.9×身体高`（否则就是条深陷在一个大块地形中部，不是头顶条）。
+        """
+        bx, by, bw, bh = bar
+        bcx = bx + bw / 2.0
+        bottom = by + bh
+        y_hi = bottom + max(10.0, bw * 2.5)
+        x_tol = max(10.0, bw * 0.6)
+        lo_r, hi_r = self.HPBAR_BODY_W_RATIO
+        best: tuple[float, tuple[int, int, int, int, float]] | None = None
+        for body in bodies:
+            cx, cy, w, h, _a = body
+            if not (lo_r <= bw / max(1.0, w) <= hi_r):
+                continue
+            top = cy - h / 2.0
+            body_bottom = cy + h / 2.0
+            if body_bottom < bottom:
+                continue                     # 身体整体在条上方，不是这条的怪
+            if top > y_hi:
+                continue                     # 身体顶边离条太远（掉到别的层）
+            if top < bottom - h * 0.9:
+                continue                     # 条深陷在大块地形中部，不是头顶条
+            dx = abs(cx - bcx)
+            if dx > x_tol:
+                continue
+            score = dx / x_tol + max(0.0, bottom - top) / max(1.0, h)
+            if best is None or score < best[0]:
+                best = (score, body)
+        return None if best is None else best[1]
 
     def _detect_monsters(self, work: np.ndarray,
                          ww: int, wh: int, scale: float,
-                         avoid: list | None = None) -> list[Monster]:
-        """战斗区域怪物：中型饱和色块 + **时域确认**（静态 HUD/文字一律不算怪物）。
+                         avoid: list | None = None,
+                         char: tuple[int, int] | None = None,
+                         orig: np.ndarray | None = None,
+                         plain: np.ndarray | None = None) -> list[Monster]:
+        """战斗区域怪物：**血条为锚**，在条正下方找身体，再做时域确认。
 
-        真实录像（1080p 暗黑4 / 火炬之光手游）上纯形状启发式的命中几乎全是误报：
-        命中的是技能图标、漂浮的物品名、爆炸特效。所以这里加三道过滤：
-          1. HUD 排除区在调用前已抹黑（技能轮盘/背包键/聊天框不再是候选）；
-          2. 与已检出的掉落标签/列表条目重叠的候选丢弃（文字不是怪）；
-          3. 时域确认：上一帧同位置也在，且**位移或尺寸有变化** —— 怪物会走、
-             会打、会受击缩放；静态图标和悬停不动的物品名不会累加命中。
+        为什么不是"先找色块再看头顶有没有条"：火炬之光的怪多是淡色冰霜怪，
+        饱和度低到根本进不了色块候选；反过来地形岩石、火焰、技能图标全是
+        高饱和色块。两个方向都反了 —— 所以顺序必须倒过来：
+
+          1. **血条**是游戏自己画的"这是个敌人"标记（`monster_hpbar`，默认开），
+             先把它找出来：细长、高饱和、条高 3~9px；
+          2. 条必须在战斗区里（顶部 HUD 带 / 底部技能栏的条不是怪），
+             且**不是玩家自己的铭牌**（玩家永远在中心，铭牌是最稳定的条，
+             真实录像里它把角色周围的岩石一块块"验证"成了怪物）；
+          3. 在条**正下方**一段窗口里找身体：横向对齐（±0.6 条宽）、
+             纵向不超过 2.5 条宽。淡色怪用第二档低饱和掩码兜住；
+          4. 候选**中心**落在掉落标签/列表条目里的丢弃（文字不是怪；用"中心"
+             而不是"任意重叠"，否则头顶带名字的怪会被整批误杀）；
+          5. 时域确认：过了血条的候选**"有条"本身就是强证据**，不再要求位移
+             （站着放技能/被冰冻的怪框根本不动，只认运动就全漏了）。
         """
         px0, px1 = int(ww * 0.24), int(ww * 0.92)
         py0, py1 = int(wh * 0.10), int(wh * 0.80)
         roi = cv2.cvtColor(work[py0:py1, px0:px1], cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(roi, np.array([0, 100, 80], np.uint8),
-                           np.array([179, 255, 255], np.uint8))
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        raw: list[tuple[int, int, int, int]] = []
-        for c in contours:
-            a = cv2.contourArea(c)
-            if not (400 <= a <= 12000):
-                continue
-            x, y, w, h = cv2.boundingRect(c)
-            if not (20 <= w <= 170 and 18 <= h <= 170):
-                continue
-            fill = a / (w * h) if w * h else 0
-            if fill < 0.25 or fill > 0.95:  # 怪物精灵：中密度不规则
-                continue
-            cx, cy = int((px0 + x + w / 2) / scale), int((py0 + y + h / 2) / scale)
-            bw, bh = int(w / scale), int(h / scale)
-            if avoid and any(_box_overlap(cx, cy, bw, bh,
-                                          int(o.x), int(o.y), int(o.w), int(o.h))
-                             for o in avoid):
-                continue  # 与掉落标签/列表条目重叠 → 是文字不是怪
-            raw.append((cx, cy, bw, bh))
+        # 两档身体掩码：饱和精灵（红/紫/橙）+ 淡色精灵（冰霜怪的青白）
+        masks = [cv2.inRange(roi, np.array([0, 100, 80], np.uint8),
+                             np.array([179, 255, 255], np.uint8))]
+        pale = cv2.inRange(roi, np.array([80, 45, 90], np.uint8),
+                           np.array([125, 255, 255], np.uint8))
+        masks.append(pale)
+        # 角色自身不是怪：玩家精灵同样高饱和、尺寸也落在怪物判据里
+        self_r = self.PLAYER_SELF_RADIUS * wh
+        # 身体候选（work 坐标）：(cx, cy, w, h, area)
+        bodies: list[tuple[int, int, int, int, float]] = []
+        seen_boxes: list[tuple[int, int, int, int]] = []
+        for mask in masks:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                a = cv2.contourArea(c)
+                if not (250 <= a <= 15000):
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                if not (16 <= w <= 190 and 14 <= h <= 190):
+                    continue
+                fill = a / (w * h) if w * h else 0
+                if fill < 0.18 or fill > 0.95:  # 精灵：中密度不规则
+                    continue
+                wcx, wcy = px0 + x + w // 2, py0 + y + h // 2
+                if any(abs(wcx - bx) < 6 and abs(wcy - by) < 6
+                       for (bx, by, _bw, _bh) in seen_boxes):
+                    continue  # 两档掩码重复命中同一块
+                seen_boxes.append((wcx, wcy, w, h))
+                if char is not None:
+                    if ((wcx - char[0]) ** 2 + (wcy - char[1]) ** 2) ** 0.5 <= self_r:
+                        continue  # 角色自己
+                bodies.append((wcx, wcy, w, h, a))
 
-        # 时域确认：与前一次检测的追踪表按中心距离配对
+        # 血条闸门
+        bar_gated = False
+        pairs: list[tuple[int, int, int, int, int, int]] = []
+        if getattr(self.cfg, "monster_hpbar", False):
+            # 血条扫描用**没被 HUD 排除抹黑**的图：HUD 排除是为地面掉落物画的，
+            # 它会把屏幕顶部一条（关卡名/进度）一起抹掉 —— 而怪的血条正好可能
+            # 落在那条带里（真实录像 tick559 的冰霜怪就是），用抹黑的图会漏怪。
+            src = plain if plain is not None else work
+            bars = self._hpbar_boxes(cv2.cvtColor(src, cv2.COLOR_BGR2HSV),
+                                     orig=orig, scale=scale)
+            self._diag_monster_hpbar_raw = int(self._diag_hpbar_coarse)
+            # 只认战斗区里的条：顶部 HUD 带（关卡名/进度）与底部技能栏的条不是怪
+            bars = [b for b in bars
+                    if py0 <= b[1] + b[3] / 2.0 <= py1 and px0 <= b[0] + b[2] / 2.0 <= px1]
+            if char is not None:
+                bars = [b for b in bars if not self._is_player_bar(b, char, ww, wh)]
+            self._diag_monster_hpbar = len(bars)
+            bar_gated = True
+            used: list[tuple[int, int]] = []
+            for bar in bars:
+                body = self._body_below_bar(bar, bodies)
+                if body is None:
+                    continue
+                wcx, wcy, w, h, _a = body
+                # 一只怪有两条（HP + MP）时会被匹配两次 → 按身体位置去重
+                if any(abs(wcx - ux) < max(10, w * 0.5) and abs(wcy - uy) < max(10, h * 0.5)
+                       for (ux, uy) in used):
+                    continue
+                used.append((wcx, wcy))
+                cx, cy = int(wcx / scale), int(wcy / scale)
+                bw, bh = int(w / scale), int(h / scale)
+                if avoid and any(_center_in_box(cx, cy,
+                                                int(o.x), int(o.y), int(o.w), int(o.h))
+                                 for o in avoid):
+                    continue  # 候选中心落在文字标签里 → 是文字不是怪
+                pairs.append((cx, cy, bw, bh, wcx, wcy))
+
+        # 闸门关掉时退回旧行为（色块 + 时域确认），供没有血条的游戏使用
+        raw = pairs if bar_gated else [
+            (int(wcx / scale), int(wcy / scale), int(w / scale), int(h / scale), wcx, wcy)
+            for (wcx, wcy, w, h, _a) in bodies
+        ]
+
+        # 时域确认：与前一次检测的追踪表按中心距离配对。
+        # 但**血条锚定的候选不等第二帧**：条是游戏自己画的"这是敌人"标记，
+        # 证据在条上，不在"动没动"上。实测 2Hz 采样下镜头跟着玩家滚动，
+        # 同一个怪两帧之间能位移 100+px（超过 MONSTER_NEAR_PX），等确认就全漏了。
+        # 闸门关掉（没有血条的游戏）时仍走原来的"位移/尺寸变化"判据。
         track: list[tuple[int, int, int, int, int]] = []
         out: list[Monster] = []
-        for (cx, cy, w, h) in raw:
-            hits = 0
+        for (cx, cy, w, h, _wcx, _wcy) in raw:
+            hits = self.MONSTER_CONFIRM_HITS if bar_gated else 0
             best: tuple[float, int, int, int] | None = None
             for (tx, ty, tw, th, thits) in self._monster_track:
                 d = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
@@ -816,8 +1221,10 @@ class Detector:
             if best is not None:
                 d, tw, th, thits = best
                 size_change = abs(w * h - tw * th) / max(1, tw * th)
-                alive = d >= self.MONSTER_MOVE_PX or size_change >= self.MONSTER_SIZE_TOL
-                hits = thits + 1 if alive else thits
+                alive = (d >= self.MONSTER_MOVE_PX
+                         or size_change >= self.MONSTER_SIZE_TOL
+                         or bar_gated)
+                hits = max(hits, thits + 1 if alive else thits)
             track.append((cx, cy, w, h, hits))
             if hits >= self.MONSTER_CONFIRM_HITS and len(out) < 10:
                 out.append(Monster(x=cx, y=cy, w=w, h=h))

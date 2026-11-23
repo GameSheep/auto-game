@@ -6,6 +6,7 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.pytest_tmp/
 
 # 敏感信息
 .token
@@ -42,6 +43,10 @@ assets/batch_list.*
 assets/replay_*.json
 assets/replay_*.csv
 assets/hit_check*.png
+# 逐帧排查用的可视化（frame_check / monster_sheet / review_offline 生成，可随时重跑）
+assets/ms_*.png
+assets/monster_sheet*.png
+assets/replay_*.png
 assets/aframe_candidates.png
 assets/aframe_tli_grid.png
 assets/a_prompt_grid.png

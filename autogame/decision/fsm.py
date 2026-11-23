@@ -169,12 +169,22 @@ class DecisionEngine:
         self._rechallenge_first_seen: float | None = None
         self._list_first_seen_ms: int | None = None
         self._label_first_seen_ms: int | None = None
+        # 地面标签近距拾取（TLI 类：标签本身=拾取提示，没有独立 A框）
+        self._label_pick_seen: int = 0
+        self._label_pick_pos: tuple[int, int] | None = None
+        self._label_pick_taps: int = 0
+        self._label_pick_cooldown_ms: int = 0
         self._last_nav_ms: int = 0
         self._gate_hold_emitted: bool = False
         self._gate_uncalibrated_emitted: bool = False
         self.last_intent: str = ""
         self._explore_i: int = 0
         self._last_explore_ms: int = 0
+        # 探索扇区计数（8 × 45°）：优先去"去得最少"的扇区，落点带角度/距离抖动。
+        # 之前是 4 个方向 × 固定 220px —— 真实回放 232 条命令里 154 条就是
+        # 那 4 个固定坐标，一眼能看出是脚本。
+        self._sector_hits: list[int] = [0] * 8
+        self._last_explore_xy: tuple[int, int] | None = None
         self._loading_hold_emitted: bool = False
         self._target: Pillar | None = None
         self._target_started: float = 0.0
@@ -670,6 +680,22 @@ class DecisionEngine:
         self._intent("自主恢复成功，回到扫描")
         self.recovery.reset()
 
+    def _recovery_cmd_allowed(self, cmd: Command) -> bool:
+        """非战斗界面（门禁关闭）时，恢复阶梯只许发"脱困键"。
+
+        允许：ESC（关弹窗/退菜单）、闪避键（脱困）、stop_all（松手）。
+        禁止：任何鼠标点击/移动 —— 在星图或背包里点一下就是选关/换装。
+        """
+        if cmd.op == "stop_all":
+            return True
+        if cmd.op in ("key_tap", "key_down"):
+            dodge = (self.cfg.autonomy.dodge_key or "").lower()
+            allowed = {"esc", "escape", "space"}
+            if dodge:
+                allowed.add(dodge)
+            return (cmd.key or "").lower() in allowed
+        return False
+
     def _tick_recovery(self, scene: SceneState, now: float, signals: StallSignals) -> None:
         if now < self._recovery_pause_until:
             return  # 循环间的降速等待（避免"卡住→疯狂乱按"）
@@ -690,7 +716,16 @@ class DecisionEngine:
             self._explore_i = 0
             self._last_explore_ms = 0
 
+        # 门禁闸门：非战斗界面（星图/背包/过场）只允许"脱困键"，不许点击走位。
+        # 真实事故：星图界面上恢复阶梯的探路点击 (1494,580)/(1516,594) 直接点在
+        # 了关卡节点上 —— 门禁判"这不是战斗"，恢复阶梯却照样点，等于绕过门禁。
+        gate_ok = bool(getattr(scene, "in_game", True))
         for cmd in res.commands:
+            if not gate_ok and not self._recovery_cmd_allowed(cmd):
+                self.stats["gate_blocked_recovery"] = \
+                    self.stats.get("gate_blocked_recovery", 0) + 1
+                self._emit_event("recovery_cmd_gated", op=cmd.op)
+                continue
             if self._act(cmd):
                 self.stats["recovery_actions"] += 1
         if res.commands:
@@ -730,6 +765,11 @@ class DecisionEngine:
         if target is None:
             if not self._maybe_rechallenge(scene, now):
                 # 上一次点地面还在走 → 别重发同一指令（点一下 ≠ 走到位）
+                # 走到标签跟前 → 按拾取键（TLI 的拾取提示就是地面标签本身，
+                # 没有暗黑4 那种独立方框；这条路径必须排在"点标签走位"之前，
+                # 否则人会一直点标签、永远不按拾取键）
+                if self._maybe_pickup_ground_label(scene, now):
+                    return
                 if self._walk_wait_active(scene, now):
                     return
                 if not self._maybe_click_list_entry(scene, now):
@@ -973,6 +1013,49 @@ class DecisionEngine:
         self.state = State.COOLDOWN
         return True
 
+    def _pick_explore_point(self, scene: SceneState) -> tuple[int, int]:
+        """选一个"看起来像人选的"探索落点：优先没走过的方位 + 角度/距离抖动。
+
+        旧实现是 `角色中心 + 方向键向量 × 220`，方向只有 4 个、距离恒定，
+        于是落点永远是那 4 个坐标。真人走路不会这样：他往没去过的地方走，
+        每次走多远也不一样。
+
+        做法：8 个扇区各记一个"去过次数"，从最少的扇区里随机挑，角度 ±16°、
+        距离 14%~26% 画面短边抖动；钳进安全区（不点底部 HUD、不点屏幕边缘），
+        钳完方向偏太多说明这个扇区走不出去，换一个。
+        """
+        w, h = int(scene.w), int(scene.h)
+        cx, cy = int(scene.character[0]), int(scene.character[1])
+        lo_x, hi_x = int(w * 0.06), int(w * 0.94)
+        lo_y, hi_y = int(h * 0.08), int(h * 0.86)
+        base = min(w, h)
+
+        for _ in range(5):
+            fewest = min(self._sector_hits)
+            pool = [i for i, n in enumerate(self._sector_hits) if n == fewest]
+            sec = random.choice(pool)
+            ang = math.radians(sec * 45 + random.uniform(-16, 16))
+            dist = base * random.uniform(0.14, 0.26)
+            px = max(lo_x, min(hi_x, int(cx + math.cos(ang) * dist)))
+            py = max(lo_y, min(hi_y, int(cy + math.sin(ang) * dist)))
+            # 钳完几乎没走出去（角色贴边）→ 该扇区不可行，记一次并换一个
+            if math.hypot(px - cx, py - cy) < dist * 0.5:
+                self._sector_hits[sec] += 1
+                continue
+            if self._last_explore_xy and math.hypot(
+                    px - self._last_explore_xy[0], py - self._last_explore_xy[1]) < base * 0.06:
+                self._sector_hits[sec] += 1
+                continue   # 和上一次几乎同一点，别原地踏步
+            self._sector_hits[sec] += 1
+            self._last_explore_xy = (px, py)
+            return px, py
+
+        # 兜底：真的四面都走不出去（被围住）→ 往上走一步，交给恢复阶梯处理
+        px = max(lo_x, min(hi_x, cx))
+        py = max(lo_y, min(hi_y, cy - int(base * 0.18)))
+        self._last_explore_xy = (px, py)
+        return px, py
+
     def _maybe_explore(self, scene: SceneState, now: float) -> bool:
         """探索：无目标时按方向序列移动（通关=走完整个关卡）。
 
@@ -994,10 +1077,12 @@ class DecisionEngine:
         step_ms = self.cfg.explore_step_ms if self.cfg.explore_enabled else auto.explore_step_ms
         hold = _jitter_ms(step_ms, self.cfg.jitter_ratio)
         if self.cfg.approach_mode == "mouse_click" or key.lower() == self.cfg.pickup_key.lower():
-            # 点地面探索：既能走，又不会把拾取键当移动键（铁律）
-            self._click_direction(scene, key, 220)
-            self._intent(f"向{_DIR_CN.get(key, key)}方向点地面探索（寻找怪物/掉落）")
-            self._emit_event("explore_move", key=key, mode="click")
+            # 点地面探索：既能走，又不会把拾取键当移动键（铁律）。
+            # 落点由 _pick_explore_point 选（扇区轮转 + 抖动），不是固定四点。
+            px, py = self._pick_explore_point(scene)
+            self._act(Command(op="mouse_click", button="left", x=px, y=py))
+            self._intent(f"点地面探索（{px},{py}，寻找怪物/掉落）")
+            self._emit_event("explore_move", x=px, y=py, mode="click")
             self._begin_walk(now, None)   # 点完等人物走过去，别每秒重发
         else:
             self._emit_move_keys([key], hold)
@@ -1006,6 +1091,69 @@ class DecisionEngine:
         return True
 
     # ------------- 地面掉落标签走位（TLI 类） -------------
+
+    def _maybe_pickup_ground_label(self, scene: SceneState, now: float) -> bool:
+        """走到地面标签跟前 → 按一次拾取键（TLI 类游戏的拾取提示就是标签本身）。
+
+        为什么需要这条路：火炬之光 PC 端没有暗黑4 那种"A 方框"，`templates/aframe.png`
+        在这款游戏上是空的（真实录像 334 秒里 A框检出 14 次全是散点误报，按 A 0 次）。
+        掉落提示是"字母 + 物品名"的地面文字标签，也就是 `ground_labels`。
+
+        "绝不盲按"仍然成立，四个前提全满足才按：
+          ① 配置显式开启 `label_pickup_when_near`（没有拾取键的游戏不会误开）；
+          ② 最近标签与角色的中心距 ≤ `label_pickup_near_ratio × 画面短边`（真的走到了）；
+          ③ **连续 ≥ `label_pickup_min_frames` 帧都有标签落在跟前**（不是闪烁/旧帧）；
+          ④ 同一个目标最多按 2 次，按不动就冷却 3 秒再来（别无限空按）。
+
+        ③ 不要求"标签像素位置不变"：真实录像里 0.5 秒内镜头会带着标签移动 100+px，
+        要求位置不变等于永远攒不够帧（实测 19 帧近距、按 A 0 次）。防抖靠"连续
+        在跟前"就够了 —— 拾取键本来就是捡最近的那件。
+        """
+        if not self.cfg.label_pickup_when_near or not scene.ground_labels:
+            self._label_pick_seen = 0
+            self._label_pick_pos = None
+            return False
+        if scene.ts_ms < self._tap_block_until_ms:
+            return False   # 刚按过，等游戏处理拾取动画
+
+        near_px = float(self.cfg.label_pickup_near_ratio) * min(int(scene.w), int(scene.h))
+        ch = scene.character
+        e = min(scene.ground_labels,
+                key=lambda g: (g.x - ch[0]) ** 2 + (g.y - ch[1]) ** 2)
+        d = math.hypot(e.x - ch[0], e.y - ch[1])
+        if d > near_px:
+            self._label_pick_seen = 0
+            self._label_pick_pos = (e.x, e.y)
+            self._label_pick_taps = 0     # 离开跟前 → 计数清零（下一件重新算）
+            return False
+
+        self._label_pick_seen += 1
+        self._label_pick_pos = (e.x, e.y)
+
+        if self._label_pick_seen < self.cfg.label_pickup_min_frames:
+            self._intent(f"掉落标签已在近处（{d:.0f}px），等连续确认再按拾取键")
+            return False
+        if self._label_pick_taps >= 2:
+            if scene.ts_ms < self._label_pick_cooldown_ms:
+                return False
+            self._label_pick_taps = 0     # 冷却结束，重新开始计数（别永久拉黑这一片）
+            self._label_pick_seen = 0
+            return False
+
+        self._label_pick_taps += 1
+        self._label_pick_seen = 0
+        if self._label_pick_taps >= 2:
+            # 按满两次还捡不到 → 冷却 3 秒（可能够不着/是别人的掉落/标签是误检）
+            self._label_pick_cooldown_ms = scene.ts_ms + 3000
+        self.stats["a_taps"] = self.stats.get("a_taps", 0) + 1
+        hold = _jitter_ms(70, self.human.jitter_ratio(now, self.cfg.jitter_ratio))
+        self._intent(f"按拾取键 [{self.cfg.pickup_key.upper()}] 拾取地面标签物品"
+                     f"（近距 {d:.0f}px + 连续确认）")
+        self._act(Command(op="key_tap", key=self.cfg.pickup_key, hold_ms=hold))
+        self._last_tap_ts = now
+        self._tap_block_until_ms = now * 1000.0 + self.cfg.tap_recheck_ms
+        self._emit_event("pickup_tap", tap=self._label_pick_taps, source="ground_label")
+        return True
 
     def _maybe_approach_ground_label(self, scene: SceneState, now: float) -> bool:
         """无光柱/列表时：地面掉落标签（黄条）→ 点击标签下方地面走过去。

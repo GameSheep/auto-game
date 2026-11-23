@@ -71,3 +71,35 @@ def test_report_empty_root_is_loud(tmp_path):
         assert "manifest.json" in str(e)
     else:  # pragma: no cover
         raise AssertionError("没有 manifest 时必须直接报错，而不是生成一个空页面")
+
+
+def test_legacy_manifest_still_renders(tmp_path):
+    """旧产物（2026-11 之前）没有 summary，items 形状也不同。
+
+    真实事故：`assets/frames_replay/user_farm` 是上一版工具落的帧，
+    重新生成审查页时 `KeyError: 'summary'` 直接崩——而这一批帧恰好是
+    "半年后回头看当时判得对不对"的唯一证据。产物格式升级不该让旧证据作废。
+    """
+    d = tmp_path / "old_run"
+    d.mkdir()
+    # 旧产物把帧图直接放目录下，没有 frames/ 子目录
+    cv2.imwrite(str(d / "tick_000000000.png"), np.zeros((54, 96, 3), dtype=np.uint8))
+    legacy = {
+        "video": "assets/videos/old.mp4",
+        "items": [
+            {"image": "tick_000000000.png", "t": "00:00.00", "gate": "战斗",
+             "pillars": [[700, 330, "gold"]], "aframe": [640, 68],
+             "commands": ["MOUSE_CLICK left (640,68)"]},
+            {"image": "tick_000000500.png", "t": "00:00.50", "gate": "拦截",
+             "pillars": [], "aframe": None, "commands": []},
+        ],
+    }
+    (d / "manifest.json").write_text(json.dumps(legacy, ensure_ascii=False),
+                                     encoding="utf-8")
+
+    html = review_offline.build(tmp_path).read_text(encoding="utf-8")
+    assert "MOUSE_CLICK left (640,68)" in html, "旧产物里的指令串也得照样显示"
+    assert "旧产物（未记抽帧频率）" in html, "缺的信息要写明白，不能假装知道"
+    assert html.count('class="card"') == 2
+    # 旧格式光柱只有中心点 → 按 10px 标记画，而不是猜一个尺寸
+    assert "old_run/tick_000000000.png" in html, "没有 frames/ 子目录时要用目录下的图"

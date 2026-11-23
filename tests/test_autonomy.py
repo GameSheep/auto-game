@@ -323,3 +323,31 @@ def test_escape_step_works_when_gate_says_not_in_game():
     res = lad.step(100.0, scene, {"in_game": False})
     assert any(c.op == "key_tap" and c.key == a.escape_key for c in res.commands), \
         "非战斗界面下 ESC 必须能发出来"
+
+
+def test_recovery_never_clicks_when_gate_closed():
+    """门禁关闭（星图/背包/过场）时，恢复阶梯只许按脱困键，不许点击。
+
+    真实事故：火炬之光星图界面卡住，恢复阶梯的探路点击落在
+    (1494,580)/(1516,594) —— 正好是关卡节点。回放里记成 2 条 R3 违规
+    （"门禁关闭却有命令"）。门禁说"这不是战斗"，恢复阶梯却照样点，
+    等于把门禁绕过去了；在星图上点一下就是选关，在背包里点一下就是换装。
+    """
+    eng, ex = _engine()
+    # 先在战斗界面里冻住 → 进 RECOVERING
+    for i in range(12):
+        eng.on_scene(_scene(1000 + i * 1000, delta=0.0))
+    assert eng.state == State.RECOVERING, "测试前提：必须先进入恢复状态"
+
+    # 再切到"非战斗界面"（星图/背包）—— 此时恢复阶梯还在跑
+    mark = len(ex.journal)
+    for i in range(12, 30):
+        eng.on_scene(_scene(1000 + i * 1000, delta=0.0, in_game=False))
+
+    clicks = [j for j in ex.journal[mark:] if j["op"] in ("mouse_click", "mouse_move")]
+    assert clicks == [], f"门禁关闭时恢复阶梯发了鼠标命令: {clicks[:3]}"
+    assert eng.stats.get("gate_blocked_recovery", 0) > 0, \
+        "被门禁拦下的恢复命令要计数（监控可见），否则等于静默吞掉"
+    # ESC / 脱困键仍要能发 —— 否则界面卡住就永远出不来
+    keys = [j["key"] for j in ex.journal[mark:] if j["op"] == "key_tap"]
+    assert "esc" in keys or "space" in keys, f"非战斗界面下仍应能用 ESC 自救，实际 {keys}"

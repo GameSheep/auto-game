@@ -66,6 +66,19 @@ class VisionConfig(BaseModel):
 
     # 角色固定在屏幕中心（ARPG 通用设定，来自对话）
     character_at_center: bool = True
+    # 角色位置帧差修正：镜头跟随角色，角色在画面上几乎不动、背景在动，
+    # 于是"中心区域里帧差最小的一块"就是角色。写死中心会让所有走位点
+    # 都落在中心 ±220 的四个固定位置上（回放里一眼看出是脚本）。
+    character_track: bool = Field(
+        True, description="用帧差在中心区找'最静的一块'修正角色位置（限幅在中心附近）")
+    character_track_max_off: float = Field(
+        0.12, ge=0.0, le=0.4, description="角色估计相对屏幕中心的最大偏移（×帧宽/帧高）")
+
+    # 怪物必须有血条：候选框正上方找不到细长横条（红/绿/橙）就不算怪物。
+    # 真实录像（火炬之光 PC 2560×1380）上纯色块+时域确认的误报率接近 100%：
+    # 红岩、冰面、火焰特效、技能图标全被当成怪，2 像素位移就判"动了"。
+    monster_hpbar: bool = Field(
+        True, description="怪物必须头顶有血条（细长横条）才算，否则一律丢弃")
 
     # 模板目录（门禁锚点/反例/A框）。None = 仓库根 templates/。
     # 由 profile 自动注入到该游戏的 templates/ —— 换游戏就不该共用一套 HUD 模板。
@@ -83,6 +96,9 @@ class VisionConfig(BaseModel):
         }
     )
     pillar_min_area: int = Field(40, ge=5, description="光柱最小轮廓面积(px)")
+    pillar_enabled: bool = Field(
+        True, description="是否检测光柱。火炬之光 PC 端的掉落不走光柱（走地面文字标签），"
+                          "开着只会产出散点误报并白烧 CPU —— 这类游戏在 profile 里关掉")
     pillar_min_width: int = Field(2, ge=1, description="光柱最小宽度px（真实 TLI 光柱 2-6px 细条）")
     pillar_max_width: int = Field(70, ge=10, description="光柱最大宽度px")
     pillar_min_aspect: float = Field(
@@ -347,6 +363,9 @@ class AFrameConfig(BaseModel):
     """
 
     template: Optional[str] = Field(None, description="模板图路径；None=禁用模板匹配")
+    enabled: bool = Field(
+        True, description="是否检测 A框（近距拾取提示）。没有 A框的游戏（如火炬之光 "
+                          "PC 端）开着只会命中伤害数字/技能图标 —— 在 profile 里关掉")
     template_threshold: float = Field(0.78, ge=0.5, le=0.99)
     template_scales: list[float] = Field(
         [0.9, 1.1],
@@ -816,6 +835,15 @@ class DecisionConfig(BaseModel):
     # 小地图导航（空闲时朝小地图目标点走）
     nav_enabled: bool = Field(False, description="空闲(SCANNING无目标)时按小地图标记走位")
     nav_step_ms: int = Field(400, ge=100, le=1500, description="导航单次方向键按压时长")
+
+    # 地面标签近距拾取（TLI 类：拾取提示就是地面标签本身，没有暗黑4 那种独立 A框）
+    # 默认关 —— 它会在"标签跟前"按拾取键，对没有拾取键的游戏等于空按。
+    label_pickup_when_near: bool = Field(
+        False, description="走到地面标签跟前且连续可见时按一次拾取键（TLI 类）")
+    label_pickup_near_ratio: float = Field(
+        0.14, ge=0.02, le=0.30, description="判定'走到跟前'的距离（×画面短边）")
+    label_pickup_min_frames: int = Field(
+        2, ge=2, le=10, description="按拾取键前标签需连续可见的帧数（防旧帧/闪烁盲按）")
 
     # Ollama 决策顾问（可选）：连续放弃 N 次等异常局面时咨询局域网 LLM
     llm: "LLMConfig" = Field(default_factory=lambda: LLMConfig())
