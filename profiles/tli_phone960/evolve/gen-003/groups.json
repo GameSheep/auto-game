@@ -1,0 +1,47 @@
+{
+  "synced": {
+    "world": {
+      "scenes": 5,
+      "objects": 1,
+      "keys": 5,
+      "terms": 5
+    },
+    "groups": [
+      "刷k7",
+      "刷一局"
+    ],
+    "orphans": [],
+    "conflicts": []
+  },
+  "groups": [
+    {
+      "id": "刷k7",
+      "name": "刷k7",
+      "say": [
+        "打k7",
+        "k7",
+        "第七张",
+        "搬砖",
+        "刷图"
+      ],
+      "start": "异界星图",
+      "steps": 3,
+      "ready": false,
+      "gaps": [
+        "第 1 步要点的「K7」没有对应模板"
+      ]
+    },
+    {
+      "id": "刷一局",
+      "name": "刷一局",
+      "say": [
+        "再来一局",
+        "继续刷"
+      ],
+      "start": "战斗",
+      "steps": 2,
+      "ready": true,
+      "gaps": []
+    }
+  ]
+}

@@ -27,16 +27,23 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from ..atomic import atomic_write_text
-from ..config import AppConfig, runtime_overlay_path
+from ..config import AppConfig, apply_input_scheme, runtime_overlay_path
+from ..input import InputSchemeError
 
 log = logging.getLogger(__name__)
 
 #: 改了立刻生效的字段前缀（其余字段页面会提示"需重启"）。
 LIVE_FIELDS: tuple[str, ...] = (
     "decision.",
+    # 操作方案：改键位本身不生效，但 apply_patch 会就地重新派生到 decision.* /
+    # executor.mash.keys，而 FSM 读的正是那些字段 → 实际是即时生效的。
+    # 不列在这里的话，页面会提示"需重启"，而它其实已经生效了（比不生效更误导）。
+    "input.",
     "executor.mouse_path.",
     "executor.min_action_interval_ms",
     "executor.max_actions_per_sec",
+    "executor.rate_floor_jitter",
+    "executor.mash.",
     "vision.whitelist",
     "vision.whitelist_colors",
     "vision.hsv",
@@ -83,6 +90,27 @@ def _copy_into(dst: BaseModel, src: BaseModel, prefix: str = "") -> list[str]:
     return changed
 
 
+#: 有操作方案时，这些字段是**派生值**：改它们会被下次加载覆盖回方案里的值。
+#: 典型症状是"页面上改了拾取键，跑起来了，重启后又变回去"——比报错难查得多，
+#: 所以这里直接拒，并告诉人该改哪儿。
+_DERIVED_BY_SCHEME: frozenset[str] = frozenset({
+    "decision.pickup_key",
+    "decision.interact_key",
+    "decision.approach_mode",
+    "decision.move_button",
+    "executor.mash.keys",
+})
+
+
+def _flat_paths(d: dict, prefix: str = ""):
+    for k, v in (d or {}).items():
+        p = f"{prefix}{k}"
+        if isinstance(v, dict) and v:
+            yield from _flat_paths(v, f"{p}.")
+        else:
+            yield p
+
+
 def apply_patch(cfg: AppConfig, patch: dict) -> dict:
     """校验并原地应用 patch。返回 {"changed": [...], "restart_required": [...]}。
 
@@ -90,6 +118,13 @@ def apply_patch(cfg: AppConfig, patch: dict) -> dict:
     """
     if not isinstance(patch, dict) or not patch:
         raise ConfigError("patch 必须是非空对象")
+    if cfg.input is not None:
+        locked = sorted(p for p in _flat_paths(patch) if p in _DERIVED_BY_SCHEME)
+        if locked:
+            raise ConfigError(
+                "这些字段由操作方案决定，直接改会在下次加载时被覆盖回去："
+                f"{', '.join(locked)}。请改 input.bindings / input.move / input.primary "
+                "（对应页面「操作方案」，或 profiles/<id>/scheme.yaml）")
     merged = _deep_merge(cfg.model_dump(), patch)
     try:
         new_cfg = AppConfig.model_validate(merged)
@@ -99,6 +134,15 @@ def apply_patch(cfg: AppConfig, patch: dict) -> dict:
             for err in e.errors()
         ]
         raise ConfigError(f"配置校验失败: {errs}") from e
+
+    # 改了键位就必须**立刻重新派生**到 decision.* / mash.keys，否则是假生效：
+    # 页面显示"拾取键已改成 F"，FSM 还在按旧的 a —— 日志里一切正常，
+    # 游戏里一直捡空。派生在临时对象上做，冲突就整笔拒绝，不做半套。
+    if "input" in (patch or {}):
+        try:
+            apply_input_scheme(new_cfg)
+        except InputSchemeError as e:
+            raise ConfigError(str(e)) from e
 
     changed = _copy_into(cfg, new_cfg)
     restart = [p for p in changed
@@ -117,6 +161,49 @@ def public_config(cfg: AppConfig) -> dict:
         if parts[-1] in cur:
             cur[parts[-1]] = "***" if cur[parts[-1]] else ""
     return d
+
+
+def agent_report(cfg: AppConfig, profile_root: Any = None) -> dict | None:
+    """游戏者知识的状态（页面"这游戏现在能玩到什么程度"）。
+
+    返回 `None` = 这个游戏还没教（没有 goals/skills）—— 页面据此隐藏卡片，
+    而不是显示一张空表让人以为"能玩但没内容"。
+    """
+    try:
+        from ..agent import AgentKnowledge, resolve_knowledge_dir
+
+        kn = AgentKnowledge.load(resolve_knowledge_dir(cfg.agent, profile_root))
+    except Exception as e:  # noqa: BLE001
+        return {"source": "", "error": f"{type(e).__name__}: {e}"}
+    if not kn:
+        return None
+    scheme = cfg.input
+    if scheme is None:
+        return {"source": kn.source_dir, "error": "没有操作方案（scheme.yaml），"
+                                                "动作不知道按哪个键"}
+    rep = kn.report(scheme)
+    rep["enabled"] = bool(getattr(cfg.agent, "enabled", False))
+    return rep
+
+
+def input_report(cfg: AppConfig) -> dict | None:
+    """操作方案的可视化数据（页面"这个游戏能跑到什么程度"就靠它）。
+
+    为什么不把 `input` 原样丢给页面：原始结构是"键盘怎么配的"，页面要回答的是
+    "哪些做得了、哪些做不了、做不了会怎样"。后者的答案在 `capability_table()` 里
+    （它包含引擎的支持度判断），不能靠前端拼。
+    """
+    scheme = getattr(cfg, "input", None)
+    if scheme is None:
+        return None
+    return {
+        "describe": scheme.describe(),
+        "source": scheme.source,
+        "move_kind": scheme.move.kind,
+        "capabilities": scheme.capability_table(),
+        "conflicts": [{"severity": c.severity, "message": c.message, "fix": c.fix}
+                      for c in scheme.conflicts()],
+    }
 
 
 def save_overlay(config_path: str, patch: dict) -> str:

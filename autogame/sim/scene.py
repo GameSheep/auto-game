@@ -27,6 +27,13 @@ _GRID = (46, 40, 38)
 _GOLD_BGR = (36, 190, 255)      # HSV hue≈26 高饱和高亮
 _PINK_BGR = (147, 86, 255)      # HSV hue≈160
 _CHAR_BGR = (235, 235, 235)
+_HP_BGR = (48, 48, 208)         # 红（BGR）
+_MP_BGR = (212, 107, 42)        # #2a6bd4 蓝，`cues.yaml` 里按这个颜色判"蓝够不够"
+_VITAL_SLOT = (26, 24, 22)      # 空槽（深灰，低饱和，不会被颜色判据认成有蓝）
+
+#: 模拟器认为的"技能键"：q/e/r（不含 wasd 与拾取键 a）。
+#: 不写 qwer 全套是因为 w 在 wasd 方案里是前进 —— 模拟器不能同时把 w 当两种东西。
+_SIM_SKILL_KEYS = {"q", "e", "r"}
 
 
 class SimPillar:
@@ -82,6 +89,13 @@ class SimWorld:
         # 按键状态（键盘走位模式）
         self._keys_down: set[str] = set()
         self._last_update = time.monotonic()
+        # 资源条（左下 HUD）。没有它，"蓝够不够"这条判据在陪练里永远不成立，
+        # 只能上真机才知道写没写对 —— 模拟器得先长得像真机，才配叫陪练。
+        self.hp = 1.0
+        self.mana = 1.0
+        self.mana_spend = 0.3          # 放一次技能扣多少
+        self.mana_regen_per_s = 0.12   # 每秒回多少
+        self.skill_presses = 0
 
     # ------------- 输入事件（执行器干跑日志驱动） -------------
 
@@ -104,6 +118,11 @@ class SimWorld:
         elif op == "key_tap":
             if key == "a":
                 self._try_pickup()
+            elif (key or "").lower() in _SIM_SKILL_KEYS:
+                # 技能键：扣蓝（模拟器的技能栏就那几格）。走位键 w/a/s/d 不算 ——
+                # a 是拾取、w 在 wasd 方案里是前进，扣蓝会把"走位"和"放技能"混一起。
+                self.skill_presses += 1
+                self.mana = max(0.0, self.mana - self.mana_spend)
             else:
                 # 方向键 tap：按 hold 时长移动
                 dist = self.walk_speed * max(0.05, hold_ms / 1000.0)
@@ -165,7 +184,17 @@ class SimWorld:
         if not near:
             # 游戏会捡范围内"最好的垃圾" —— 模拟器记录违规盲按
             self.blind_a_press += 1
-            log.warning("模拟器: 盲按 A（无近距目标）—— FSM 违规!")
+            # 打上"当时最近的目标有多远、这一拍世界推进了多久"：盲按要么是
+            # 旧帧（证据早过期），要么是世界在两拍之间跳了一大步（步长被放大）。
+            # 没有这两项就只能看到"盲按了"，查不出是哪一种。
+            nearest = min((math.hypot(p.wx - self.char_wx, p.wy - self.char_wy)
+                           for p in self.pillars), default=float("inf"))
+            since = time.monotonic() - getattr(self, "_last_abox_at", 0.0)
+            log.warning("模拟器: 盲按 A（无近距目标）—— FSM 违规! 最近目标 %.0fpx"
+                        "（半径 %.0f）本拍推进 %.2fs，上次画出 A 框在 %.2fs 前"
+                        "（距离 %.0fpx）", nearest, self.pickup_radius,
+                        getattr(self, "_last_dt", 0.0), since,
+                        getattr(self, "_last_abox_d", -1))
             return
         target = near[0]
         self.pillars.remove(target)
@@ -200,7 +229,11 @@ class SimWorld:
         # **不能直接 return** —— 刷怪/结算都是"时间戳判据"，被吞掉就会表现为
         # "点了再次挑战却没刷出东西"（e2e 刷图循环曾因此失败）。
         dt = max(0.0, min(0.5, now - self._last_update))
+        self._last_dt = dt
         self._last_update = max(now, self._last_update)
+        # 蓝量自然回复（夹在 [0,1]：不回复会让"放完一轮就再也放不出"永远成立，
+        # 那样陪练里看到的是"技能被 CD 锁死"，而不是真实的"蓝不够，等了两秒"）
+        self.mana = min(1.0, self.mana + dt * self.mana_regen_per_s)
         # 键盘持续按住移动
         dx = dy = 0
         if "w" in self._keys_down:
@@ -289,6 +322,10 @@ class SimWorld:
             # A框：距离足够近时出现（对话定稿的核心锚点）
             d = math.hypot(p.wx - self.char_wx, p.wy - self.char_wy)
             if d <= self.pickup_radius:
+                # 诊断：记下最后一次"真的画了 A 框"的时刻与距离。盲按时用它算
+                # "按键落下的那一刻，A 框证据已经过期多久"。
+                self._last_abox_at = time.monotonic()
+                self._last_abox_d = d
                 ax, ay = sx, sy - 150
                 cv2.rectangle(frame, (ax - 16, ay - 16), (ax + 16, ay + 16), color_bgr, 2)
                 cv2.rectangle(frame, (ax - 14, ay - 14), (ax + 14, ay + 14), (0, 0, 0), -1)
@@ -311,6 +348,8 @@ class SimWorld:
         self._draw_minimap(frame)
         # 技能栏（底部中央）：战斗 HUD 锚点（场景门依赖）
         self._draw_skillbar(frame)
+        # 血/蓝条（左下）：判据的落点（"蓝够不够"要能被读出来）
+        self._draw_vitals(frame)
 
         # 角色（屏幕中心白十字）
         cx, cy = self.w // 2, self.h // 2
@@ -337,9 +376,44 @@ class SimWorld:
             sy = by + 10
             cv2.circle(frame, (sx + slot // 2, sy + slot // 2), slot // 2,
                        colors[i], 2)
-            key = ["Q", "W", "E", "R", "A", "S"][i]
-            cv2.putText(frame, key, (sx + slot // 2 - 5, by + bh - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (230, 230, 230), 1)
+            # 第 5 格标 `RMB` 而不是 `A`：真实游戏这一格是**鼠标右键**，
+            # 键盘 A 只用于拾取。以前这里画成 A，看模拟器截图会以为"按 a 放技能"，
+            # 进而怀疑 pickup_key=a 定错了（实际没错）——模拟器不该教错这件事。
+            key = ["Q", "W", "E", "R", "RMB", "S"][i]
+            # 按实测文本宽度居中：以前写死 -5px 是按单字符算的，`RMB` 会偏出格子
+            scale = 0.4
+            (tw, _th), _base = cv2.getTextSize(key, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+            cv2.putText(frame, key, (sx + slot // 2 - tw // 2, by + bh - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, (230, 230, 230), 1)
+
+    #: 资源条布局（归一化 [x1,y1,x2,y2]）。绘制和判据标定共用同一组数：
+    #: 两处各写一份的话，改一处就"画在那儿、按这儿判"，永远调不准。
+    VITAL_HP = (0.03, 0.848, 0.19, 0.874)
+    VITAL_MP = (0.03, 0.880, 0.19, 0.906)
+
+    def _draw_vitals(self, frame: np.ndarray) -> None:
+        """左下角的血/蓝条（红 HP + 蓝 MP）。"""
+        x1, y1, x2, y2 = self.VITAL_HP
+        bw = int(self.w * (x2 - x1))
+        bh = max(6, int(self.h * (y2 - y1)))
+        px1 = int(self.w * x1)
+        for i, (val, bgr, tag) in enumerate(((self.hp, _HP_BGR, "HP"),
+                                             (self.mana, _MP_BGR, "MP"))):
+            py1 = int(self.h * (y1 + i * 0.032))
+            cv2.rectangle(frame, (px1, py1), (px1 + bw, py1 + bh), _VITAL_SLOT, -1)
+            fill = int(bw * max(0.0, min(1.0, float(val))))
+            if fill > 0:
+                cv2.rectangle(frame, (px1, py1), (px1 + fill, py1 + bh), bgr, -1)
+            cv2.rectangle(frame, (px1, py1), (px1 + bw, py1 + bh), (72, 68, 62), 1)
+            # 标签写在条右侧，不压在条上：压在条上会占掉一块纯色，
+            # "蓝量占比"的读数就永远到不了 0（空蓝时也剩几个像素）。
+            cv2.putText(frame, tag, (px1 + bw + 5, py1 + bh - 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (205, 205, 205), 1)
+
+    def vitals_region(self, which: str = "mp") -> list[float]:
+        """资源条的归一化矩形 —— 直接抄进 `cues.yaml` 的 `region`。"""
+        box = self.VITAL_HP if which == "hp" else self.VITAL_MP
+        return [round(v, 4) for v in box]
 
     def _draw_minimap(self, frame: np.ndarray) -> None:
         size = int(min(self.w, self.h) * 0.25)

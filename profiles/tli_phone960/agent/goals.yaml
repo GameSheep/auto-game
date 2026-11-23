@@ -1,0 +1,21 @@
+# 火炬之光：无限（PC）—— 目标（为什么干）
+#
+# priority 大的先考虑；同一目标里 skills 按顺序试，前一条失败/做不到就换下一条。
+# 程序只会挑"现在适用（when）**而且**真做得到（能力都教过）"的目标 ——
+# 做不到的目标会在 preflight / 设置页上写明缺什么，而不是硬跑然后空转。
+
+goals:
+  - id: recover_screen
+    name: 回到战斗界面
+    when: out_of_game
+    priority: 100
+    skills: [back_out]
+    max_seconds: 30
+    note: 开面板/结算/掉线时优先退出来，别在异常界面里瞎按
+
+  - id: farm
+    name: 刷图
+    when: in_game
+    priority: 10
+    skills: [fight_group, pick_nearest, roam_and_look]
+    note: 有怪先打（打完能捡更多），没怪就捡，什么都没有就找路

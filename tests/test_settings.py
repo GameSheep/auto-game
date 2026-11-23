@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from autogame.config import AppConfig, load_config, runtime_overlay_path
+from autogame.config import AppConfig, apply_input_scheme, load_config, runtime_overlay_path
 from autogame.executor import DryRunExecutor
 from autogame.executor import ExecutorConfig
 from autogame.presets import PRESETS, apply_preset, preset_patch
@@ -177,7 +177,14 @@ def test_human_preset_makes_it_slower_and_more_random():
     assert h.reaction_ms[1] >= 600, "反应时间上限要明显拉长"
     assert h.drift.hesitate_prob > 0.3
     assert h.mood.skip_prob >= 0.03
-    assert cfg.executor.mouse_path.wind >= 4.0
+    # 轨迹：换成运动学模型，弯曲/抖动都要往上推（wind 只对旧模型有效）
+    assert cfg.executor.mouse_path.model == "kinematic"
+    assert cfg.executor.mouse_path.bow >= 0.08
+    assert cfg.executor.mouse_path.wobble_px >= 2.0
+    # 节奏：打散 + 长尾都要开（否则间隔仍会被帧边界量化）
+    assert cfg.decision.action_desync_ms >= 400
+    assert cfg.decision.humanize.rhythm.enabled is True
+    assert cfg.executor.rate_floor_jitter > 0
     assert cfg.decision.walk.budget_s >= 3.5
 
 
@@ -522,3 +529,44 @@ def test_notify_config_accepts_bark_through_api():
     assert r.status_code == 200, r.text
     assert cfg.notify.webhook_format == "bark"
     assert cfg.notify.bark_key == "mykey"
+
+
+# ═══════════════════════ 操作方案（页面展示 + 热更新） ═══════════════════════
+
+
+def test_config_api_exposes_input_report():
+    """页面要能直接渲染"这款游戏能跑到什么程度"，支持度判断在服务端做。"""
+    from autogame.input import preset
+
+    cfg = _cfg()
+    cfg.input = preset("tli_pc")
+    apply_input_scheme(cfg)          # 和 load_config 一样：方案 → decision.*
+    hub = _hub(cfg)
+    d = _client(cfg, hub).get("/api/config", headers=_h()).json()
+    rep = d["input_report"]
+    assert rep is not None
+    rows = {r["capability"]: r for r in rep["capabilities"]}
+    assert rows["pickup"]["key"] == "a"
+    assert rows["move"]["state"] == "ready"
+    assert "点地面" in rep["describe"]
+
+
+def test_config_api_without_scheme_has_null_report():
+    """没配方案的机器：报告为 null，页面自动隐藏这张卡（不显示一张空表）。"""
+    cfg = _cfg()
+    hub = _hub(cfg)
+    d = _client(cfg, hub).get("/api/config", headers=_h()).json()
+    assert d["input_report"] is None
+
+
+def test_patch_input_updates_decision_in_place():
+    """页面改键位 → decision.pickup_key 立刻变（FSM 读的就是它）。"""
+    from autogame.input import preset
+
+    cfg = _cfg()
+    cfg.input = preset("tli_pc")
+    res = apply_patch(cfg, {"input": {"bindings": {"pickup": {"key": "f"}}}})
+    assert cfg.decision.pickup_key == "f"
+    assert "decision.pickup_key" in res["changed"]
+    assert res["restart_required"] == []      # 已派生 → 不是"需重启"
+

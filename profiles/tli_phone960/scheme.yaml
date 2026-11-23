@@ -1,0 +1,43 @@
+# 火炬之光：无限 —— 操作方案（PC 键位）
+#
+# 素材是手机端录屏（960x432），但操作按 PC 端键盘鼠标算：用户的实际玩法是
+# 左键点地面走、右键主攻、QWER 辅助、A 捡、D 交互。
+#
+# 改键位只改这份文件。视觉标定（光柱颜色、HUD 排除区）在 profile.yaml，两件事分开。
+# 改完不用重启服务，但**需要重新加载配置**（页面「配置」→ 应用）才会推给决策层。
+
+name: 火炬之光：无限（PC 键位）
+game: 火炬之光：无限
+source: preset
+
+# 点地面走位：左键点哪，角色走到哪。WASD 不用于走位。
+# 这条决定了 A/D 为什么可以安全地当拾取/交互键 —— 它们从来不会被当移动键按下去。
+move:
+  kind: click
+  button: mouse_left
+
+# 主攻 = 鼠标右键，**按住**连发。用 tap 会表现成"一下一下点"，不是不能打，是打得很慢。
+primary:
+  key: mouse_right
+  action: hold
+  hold_ms: 220
+
+# 技能栏 Q W E R（第 5 格标的 A 是鼠标右键，不是键盘 A —— 见 lessons/tli.md 的禁忌）
+skills:
+  - {id: 技能1, key: q, action: tap, role: aoe}
+  - {id: 技能2, key: w, action: tap, role: aoe}
+  - {id: 技能3, key: e, action: tap, role: defense}
+  - {id: 技能4, key: r, action: hold, role: buff}
+
+bindings:
+  pickup:
+    key: a
+    action: tap
+  # D 是交互/选择：进 Boss 房、开宝箱、开任务点、开关卡面板、选传送门。
+  # 在点地面走位下它不会和"右移"撞车；换成 wasd 走位就会变成致死冲突。
+  interact:
+    key: d
+    action: tap
+  cancel:
+    key: escape
+    action: tap

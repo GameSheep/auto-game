@@ -331,12 +331,16 @@ def create_app(cfg: AppConfig, hub: Hub, dashboard_html: str,
 
     @app.get("/api/config")
     async def get_config(request: Request) -> JSONResponse:
-        from .settings import LIVE_FIELDS, public_config
+        from .settings import LIVE_FIELDS, agent_report, input_report, public_config
         from ..presets import DESCRIPTIONS
 
         _require_token_header(request)
         return JSONResponse({
             "config": public_config(cfg),
+            "input_report": input_report(cfg),
+            # 游戏者：目标/技能这类"知识"的状态。改知识文件需要重启（不像键位能就地派生），
+            # 所以这里只报状态，不进 LIVE_FIELDS。
+            "agent_report": agent_report(cfg, getattr(profile, "root", None)),
             "presets": DESCRIPTIONS,
             "live_fields": list(LIVE_FIELDS),
             "config_path": config_path,

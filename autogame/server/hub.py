@@ -19,7 +19,7 @@ from ..config import AppConfig
 from ..decision.fsm import DecisionEngine, State
 from ..executor import BaseExecutor
 from ..monitor import HealthMonitor, append_incident, incident_path
-from ..protocol import SceneState
+from ..protocol import SceneState, frame_age_ms
 from ..vision.pipeline import VisionPipeline
 from .notify import Notifier
 
@@ -34,12 +34,26 @@ class Hub:
         self.executor = executor
         self.pipeline = pipeline
         self.fsm = DecisionEngine(cfg.decision, executor)
+        # 游戏者（agent）：开启后由它接管"这一帧做什么"，FSM 退成低层技能。
+        # 懒加载 + 只试一次：知识文件解析失败不该每帧重试一次、也不该悄悄退回 FSM
+        # 而不说 —— "显示在跑、其实跑的是旧逻辑" 是这类系统最贵的故障。
+        self._player = None
+        self._player_tried = False
+        self._agent_error = ""
 
         self._latest_jpeg: bytes | None = None
+        # 待处理帧（jpeg, ts_ms）。入口只写这里，检测在决策循环里做 —— 只有一格，
+        # 新帧到了直接覆盖旧帧，天然实现"只处理最新"。
+        self._pending: tuple[bytes, int] | None = None
         self._latest_scene: SceneState | None = None
+        #: 最近一帧的 BGR 原图（只被决策线程读写）。游戏者的判据要看画面，
+        #: 而 SceneState 里没有"蓝条多少"这类字段 —— 那是每款游戏都不一样的知识。
+        #: 存引用不存拷贝：帧本身已经存在，复制一次就是每帧 3~6MB 的垃圾。
+        self._last_bgr: Any = None
         self._latest_ts: float = 0.0
         self._frame_seq: int = 0
         self._processed_seq: int = 0
+        self._dropped_stale: int = 0   # 入口丢弃的过期帧（积压保护，见 on_frame）
         self._history: deque[dict] = deque(maxlen=cfg.server.history_size)
         self._lock = threading.Lock()
         self._decide_event = asyncio.Event()
@@ -264,32 +278,57 @@ class Hub:
     # ------------- 代理帧入口（WS handler 线程调用） -------------
 
     def on_frame(self, jpeg: bytes, ts_ms: int) -> dict:
-        """收到代理帧：解码 → 视觉 → 缓存 → 唤醒决策循环。返回摘要。"""
+        """收到代理帧：**只入栈，不做重活**。
+
+        解码 + 检测是 100ms 级的活。放在这里会卡住 WS 读线程：读得慢，传输层
+        就积压，读到的每一帧都更旧 —— 实测积压到 3 秒时，决策拿的是 5 秒前的
+        A 框，按下去当然按空（模拟器里就是 blind_a_press）。
+
+        现在入口只做三件便宜事：丢掉过期帧、记下最新帧、唤醒决策。检测在
+        决策循环里做，而且永远只处理"最新那一格"—— 中间没来得及处理的直接
+        被覆盖，不排队、不积压、不占内存。
+        """
+        with self._lock:
+            self._latest_jpeg = jpeg
+            self._latest_ts = time.time()
+
+        if self._loop is None:
+            # 没有决策循环（标定接口 / 离线工具 / 单测直接喂一帧）：就地处理。
+            # 挂到 _pending 上没人取，调用方会以为"这一帧没进来"。
+            scene = self.process_pending(jpeg, int(ts_ms))
+            return {"seq": self._processed_seq, "inline": True,
+                    "pillars": len(scene.pillars) if scene else 0}
+
+        age = frame_age_ms(ts_ms)
+        if age > self.cfg.capture.max_frame_age_ms:
+            self._dropped_stale += 1
+            return {"seq": self._frame_seq, "dropped": "stale", "age_ms": round(age)}
+
+        with self._lock:
+            self._pending = (jpeg, int(ts_ms))
+            self._frame_seq += 1
+            seq = self._frame_seq
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._decide_event.set)
+        return {"seq": seq}
+
+    def process_pending(self, jpeg: bytes, ts_ms: int) -> SceneState | None:
+        """解码 + 检测一帧（决策循环里调用，不阻塞 WS 读线程）。"""
         buf = np.frombuffer(jpeg, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
-            raise ValueError("jpeg 解码失败")
-
+            return None
         scene = self.pipeline.process(frame, ts_ms)
+        scene.age_ms = round(frame_age_ms(ts_ms), 1)
+        self._last_bgr = frame
         with self._lock:
-            self._latest_jpeg = jpeg
             self._latest_scene = scene
-            self._latest_ts = time.time()
-            self._frame_seq += 1
-            seq = self._frame_seq
+            self._processed_seq += 1
         self._history.append(
-            {"seq": seq, "ts": scene.ts_ms, "pillars": len(scene.pillars),
+            {"seq": self._processed_seq, "ts": scene.ts_ms, "pillars": len(scene.pillars),
              "aframe": scene.aframe is not None, "state": self.fsm.state.value}
         )
-        # 唤醒决策
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._decide_event.set)
-        return {
-            "seq": seq,
-            "pillars": len(scene.pillars),
-            "aframe": scene.aframe is not None,
-            "state": self.fsm.state.value,
-        }
+        return scene
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -328,6 +367,8 @@ class Hub:
             ev = {"ts": time.time(), "state": self.fsm.state.value,
                   "event": "frame_resumed", "gap_s": round(self._stall_gap, 1)}
             self.fsm.events.append(ev)
+            if len(self.fsm.events) > 400:      # 与 FSM 内部同口径：事件日志必须有上限
+                del self.fsm.events[:-200]
             self._emit_event_log(ev)
             log.info("帧流恢复（中断 %.1fs）", self._stall_gap)
 
@@ -479,16 +520,22 @@ class Hub:
             await self._decide_event.wait()
             self._decide_event.clear()
             with self._lock:
-                scene = self._latest_scene
-            if scene is None:
+                pending = self._pending
+                self._pending = None      # 取走最新那格；后面到的新帧会覆盖它
+            if pending is None:
                 continue
             if not self._may_decide():
-                # 暂停模式：连决策都不做。动作闸门管的是"发不发得出去"，
+                # 暂停模式：连决策都不做。动作闸门管的是"发不发的出去"，
                 # 这里管的是"要不要想" —— 想出来的东西没人看，只是白烧 CPU。
                 continue
-            self._note_scene(scene)
             loop = asyncio.get_running_loop()
             t0 = time.perf_counter()
+            # 解码 + 检测在这里做（线程池）：WS 读线程只管收，不会因为检测慢而积压。
+            jpeg, ts = pending
+            scene = await loop.run_in_executor(None, self.process_pending, jpeg, ts)
+            if scene is None:
+                continue
+            self._note_scene(scene)
             try:
                 if self.ui_task is not None:
                     # UI 任务激活：配方引擎接管（FSM 暂停），解码最新帧推进
@@ -513,13 +560,69 @@ class Hub:
                         self._emit_event_log(end)
                         self.ui_task = None
                 else:
-                    await loop.run_in_executor(None, self.fsm.on_scene, scene)
+                    # 检测完到这里又过了一会儿，按"现在"再算一次年龄：
+                    # 按键闸门要的是"证据到现在多久"，不是"检测开始时多久"。
+                    scene.age_ms = round(frame_age_ms(scene.ts_ms), 1)
+                    player = self.agent_player()
+                    if player is not None:
+                        evs = await loop.run_in_executor(
+                            None, player.on_scene, scene, None, self._last_bgr)
+                        for e in evs or ():
+                            # 只把"决策级"的事件写进历史/审计：目标是新加的、
+                            # 技能结束要能复盘、被挡下要能看见原因。
+                            if e.get("kind") in ("goal", "goal_giveup", "skill_end",
+                                                 "idle", "blocked"):
+                                self._emit_event_log({"event": "agent", **e})
+                    else:
+                        await loop.run_in_executor(None, self.fsm.on_scene, scene)
             except Exception:  # noqa: BLE001
                 log.exception("决策 tick 异常")
             finally:
                 self._drain_event_log()
                 # 体检放在 finally 里：tick 抛异常的那几帧恰恰最该被算进"变慢"
                 self.health_tick(time.perf_counter() - t0)
+
+    # ------------- 游戏者 -------------
+
+    def agent_player(self):
+        """拿到游戏者实例；没开/没知识/构建失败都返回 None（退回 FSM）。
+
+        必须在**第一次真的要用**的时候才构建：知识要按 profile 解析，而 profile
+        是在 `create_app` 里挂上来的，Hub 构造时还拿不到。
+        """
+        if not getattr(getattr(self.cfg, "agent", None), "enabled", False):
+            return None
+        if self._player is not None or self._player_tried:
+            return self._player
+        self._player_tried = True
+        try:
+            from ..agent import AgentKnowledge, GamePlayer, resolve_knowledge_dir
+            from ..input import from_legacy
+
+            scheme = self.cfg.input or from_legacy(self.cfg.decision)
+            root = getattr(getattr(self, "profile", None), "root", None)
+            kn = AgentKnowledge.load(resolve_knowledge_dir(self.cfg.agent, root))
+            if not kn:
+                self._agent_error = f"知识目录为空：{kn.source_dir}"
+                log.warning("agent.enabled=true 但没知识（%s）—— 继续用 FSM", kn.source_dir)
+                self._emit_event_log({"event": "agent_off", "reason": self._agent_error})
+                return None
+            self._player = GamePlayer(
+                knowledge=kn, scheme=scheme,
+                reach_px=self.cfg.agent.reach_px,
+                dead_after=self.cfg.agent.dead_after,
+                max_frame_age_ms=self.cfg.agent.max_frame_age_ms,
+                sink=self.executor.execute,
+                cues=kn.cues or None,
+            )
+            log.info("游戏者已接管：%s（%s）", kn.source_dir, kn.summary(scheme))
+            self._emit_event_log({"event": "agent_on", "source": kn.source_dir,
+                                  "summary": kn.summary(scheme)})
+        except Exception as e:  # noqa: BLE001
+            self._agent_error = f"{type(e).__name__}: {e}"
+            log.exception("游戏者构建失败，继续用 FSM")
+            self._emit_event_log({"event": "agent_off", "reason": self._agent_error})
+        return self._player
 
     # ------------- 上线后体检（性能监控 → 退化回滚） -------------
 
@@ -636,6 +739,10 @@ class Hub:
         d = {
             "state": self.fsm.state.value,
             "frame_seq": seq,
+            "processed_seq": self._processed_seq,
+            # 到货就过期被丢掉的帧：这个数一直涨 = 机器/链路跟不上采集，
+            # 不是"策略保守"。页面要能看到，否则只会觉得"它怎么不动"。
+            "dropped_stale": self._dropped_stale,
             "latest_ts": self._latest_ts,
             "frame_gap_s": (round(time.time() - self._latest_ts, 1)
                             if self._latest_ts else None),

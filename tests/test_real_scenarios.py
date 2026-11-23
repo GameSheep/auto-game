@@ -126,11 +126,13 @@ def test_equip_panel_blocked_and_silent():
 # ---------------- 误报抑制（战斗特效 ≠ 光柱） ----------------
 
 # 特效压力样本：Boss 触手/技能光束/满屏光效（不管门禁是否放行，都不许被当成光柱）
+# 注意：`real_darkmap_farm.png` **不在这里**。它一度被当成"特效误报"样本列进来，
+# 因为按模拟器调的阈值在它上面检出 0 —— 于是就得出"这游戏没有光柱"、把功能关了。
+# 肉眼复核：那两根竖直金柱是真的掉落光柱。它现在有正向用例（见下面 loot pillar 那条）。
 FX_SAMPLES = [
     "real_beamlike_tentacles.png",
     "real_skillfx_storm.png",
     "real_hud_boss.png",
-    "real_darkmap_farm.png",
 ]
 
 
@@ -236,3 +238,17 @@ def test_real_beamlike_tentacles_do_not_trigger_pickup():
     a_taps = [j for j in ex.journal if j["op"] == "key_tap" and j["key"] == "a"]
     assert len(a_taps) == 0, "Boss 触手特效绝不能触发拾取键"
     assert eng.stats["blind_tap_violations"] == 0
+
+
+def test_real_loot_pillars_are_detected_on_the_ground_truth_frame():
+    """真·掉落光柱必须检出 —— 这是全项目唯一一张"PC 端真游戏、真光柱"的基准。
+
+    它以前被列进 FX_SAMPLES（要求检出 0），等于把"我们的阈值不对"固化成了正确答案。
+    现在要求：至少 2 根、且都是金色。漏了这条，光柱就会再次悄悄失效。
+    """
+    det = _det()
+    states = _run_ticks(det, _load("real_darkmap_farm.png"), n=4)
+    got = max((len(st.pillars) for st in states), default=0)
+    assert got >= 2, f"真光柱漏检：只检出 {got} 根（应 >=2）"
+    colors = {p.color for st in states for p in st.pillars}
+    assert colors == {"gold"}, f"颜色不对: {colors}"

@@ -1,0 +1,60 @@
+# 操作方案样板 —— 复制 profile 时一起带走。
+#
+# 「这个游戏怎么被操作」只写在这里。视觉阈值在 profile.yaml，键位在这里，
+# 两件事分开：换游戏时你只需要重写这份，视觉那边照旧。
+#
+# 生成方式（推荐，别手抄）：
+#     py -3.12 tools/learn_input.py --profile <id> --preset tli_pc --ask
+# 校验（有冲突会 exit 1）：
+#     py -3.12 tools/learn_input.py --profile <id> --print
+#
+# 硬规矩：这份文件只决定「发哪个物理输入」，不决定「什么时候允许按」。
+# 拾取永远要过 场景门 + A框 + 目标存在 三道闸，改这里放宽不了任何一条。
+
+name: 火炬之光：无限（PC 键位示例）
+game: 火炬之光：无限
+source: manual
+
+# ---- 走路 ----
+# click = 点地面让角色自己走（火炬/暗黑/传奇类）。WASD 不参与走位，
+#         所以拾取键 A 与「左移 A」不冲突 —— 这是这套键位能安全跑的前提。
+# wasd  = 按方向键走（魔兽/FPS/3D MMO）。此时 A/D/A/W 会被真的按下去，
+#         任何功能键撞上移动键都是致死冲突（会一边走一边捡空气）。
+# stick = 手游虚拟摇杆。需要按住拖动，当前后端只会点按 → 会标成「不支持」。
+# none  = 还没学。程序不让角色移动，其余动作仍可用。
+move:
+  kind: click
+  button: mouse_left        # 有的 ARPG 左键是"选中"，走位要给 mouse_right
+
+# 走方向键的游戏才需要这段。四向都要写，别指望"以 W 为基准推"。
+# 视角由鼠标控制的游戏（魔兽）把 camera 设成 mouse_look —— 目前引擎还不会
+# 转视角，走位会被标成「部分」：能按出来，但方向不准。
+# move:
+#   kind: wasd
+#   camera: mouse_look
+#   keys: {forward: w, back: s, left: a, right: d}
+
+# ---- 主攻 ----
+# action: tap=按一下 / hold=按住（按住连发的游戏必须用 hold，
+#         用 tap 会表现成"打得很慢但没报错"）/ mash=连按（走拟人连打模型）
+primary:
+  key: mouse_right
+  action: hold
+  hold_ms: 220
+
+# ---- 辅助技能 ----
+# id 是给人看的名字：日志里只显示"按了 3"时，出问题无法对照录像。
+# role 只作标注，程序暂不据此判断时机。
+skills:
+  - {id: 技能1, key: q, action: tap, role: aoe}
+  - {id: 技能2, key: w, action: tap, role: aoe}
+  - {id: 技能3, key: e, action: tap, role: defense}
+  - {id: 技能4, key: r, action: hold, role: buff}
+
+# ---- 一次性动作 ----
+# 没学的不要瞎填：留空 = 程序不会去按（少做一件，好过按错一下）。
+bindings:
+  pickup:   {key: a, action: tap}        # 捡东西；没有这个键就整条删掉
+  interact: {key: d, action: tap}        # 开箱/进房/点传送门
+  cancel:   {key: escape, action: tap}   # 关面板
+  # map:    {key: m, action: tap}        # 打开地图/关卡面板

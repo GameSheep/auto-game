@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "updated": "2026-11-23",
+  "note": "用户的黑话/简称对照表。由 tools/teach.py 从 lessons/ 生成。",
+  "terms": {
+    "搬砖": {
+      "canonical": "反复刷同一张图产出装备和材料",
+      "note": "本项目的主要玩法",
+      "source": "tli.md"
+    },
+    "星图": {
+      "canonical": "异界地图的关卡选择界面",
+      "note": "左上角有「‹ 异界」，中间 7 个发光节点",
+      "source": "tli.md"
+    },
+    "一局": {
+      "canonical": "从进图到点「再次挑战」的完整循环",
+      "note": "",
+      "source": "tli.md"
+    },
+    "光柱": {
+      "canonical": "掉落物在地上形成的竖直光条",
+      "note": "不是星图上的圆形节点",
+      "source": "tli.md"
+    },
+    "A框": {
+      "canonical": "靠近可拾取物时出现的「A」提示框",
+      "note": "出现才说明脚下有东西",
+      "source": "tli.md"
+    }
+  }
+}

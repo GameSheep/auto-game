@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import logging
 import time
 from pathlib import Path
@@ -204,8 +206,13 @@ class RecipeRunner:
             self.log.append({"t": ts_ms, "event": "error", "reason": str(e)})
 
         if cmds and self.executor is not None:
-            for c in cmds:
-                self.executor.execute(Command(**c))
+            # 配方是精确的 UI 操作序列（点槽位/确认买入），多按两下就点错。
+            # 连按是给"打怪"用的，不是给"填表单"用的。
+            pause = getattr(self.executor, "burst_paused", None)
+            ctx = pause() if callable(pause) else contextlib.nullcontext()
+            with ctx:
+                for c in cmds:
+                    self.executor.execute(Command(**c))
 
         if advanced:
             self.step_i += 1

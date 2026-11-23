@@ -1,0 +1,33 @@
+# 火炬之光：无限（手机 960）—— 判据
+#
+# 现在是空的，而且**故意留空**。
+#
+# 判据和键位一样，是「这一款游戏的画面长什么样」，只能看着截图定。
+# 我没有任何一张这台手机上的实拍图，凭空写一组 region/color 的后果是：
+# 程序照跑、判据恒为 0、技能一次不放 —— 而那和「蓝真的一直不够」在日志里
+# 长得一模一样。宁可空着（知识检查里会写「判据 0 条」），也不填假数字。
+#
+# 要标的就是这四条（标完就能用在 skills.yaml 里）：
+#
+#   mana_ok      蓝条够不够放技能    ratio  蓝条填充段，看蓝色占比
+#   hp_low       血低了该吃药/后撤    ratio  血条填充段，看红色占比（用 below）
+#   chest_hint   脚下有可交互目标      template  "按 D 开箱/进门"提示的图标位
+#   level_panel  关卡结算/选关面板     template  面板标题或"再次挑战"按钮
+#
+# 标法（每个 30 秒，需要一张「成立」和一张「不成立」的截图）：
+#
+#   py tools/learn_cue.py --profile tli_phone960 --image shots/mana_full.png \
+#       --region 0.03,0.88,0.19,0.906
+#       ↑ 先看这块区域里主要是什么颜色
+#
+#   py tools/learn_cue.py --profile tli_phone960 --id mana_ok --name "蓝量够" \
+#       --region 0.03,0.88,0.19,0.906 --color "#2a6bd4" \
+#       --on-img shots/mana_full.png --off-img shots/mana_empty.png --write
+#       ↑ 两张图的读数取中间值，写进这个文件
+#
+#   （上面的 region 只是从模拟器抄来的示意位置，手机版的 HUD 在哪要按实拍图改）
+#
+# 标完跑一遍：py tools/agent_play.py --profile tli_phone960 --check
+#   → 「判据 N 条」，没有 [错误] 就说明写得对（读不出来的判据在预检里会拦）。
+
+cues: []

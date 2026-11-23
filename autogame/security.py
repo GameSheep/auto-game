@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hmac
+import random
 import time
 from collections import deque
 
@@ -26,17 +27,29 @@ class ActionRateLimiter:
     - min_action_interval_ms：两次动作之间的最小间隔（自适应等待而非丢弃，
       保证 mouse_click 等连续合法命令完整下发）
     - max_actions_per_sec：滑动窗口速率上限（超限丢弃，防指令风暴）
+    - floor_jitter：**最小间隔本身的抖动**。把 min_interval 当硬墙时，
+      动作间隔的直方图会出现一堵陡边（所有动作都贴着墙走），这是很容易
+      被抓的量化特征。每次放行后重新抽一个下界（三角分布，mode=名义值），
+      墙就变成坡。
+
+    ⚠️ floor_jitter 只会让动作**更快一点**，上限仍受 max_per_sec 约束；
+    它不改变任何安全语义（该丢的照丢）。
     """
 
-    def __init__(self, min_interval_ms: int = 25, max_per_sec: int = 20) -> None:
+    def __init__(self, min_interval_ms: int = 25, max_per_sec: int = 20,
+                 floor_jitter: float = 0.0) -> None:
         self.min_interval = min_interval_ms / 1000.0
         self.max_per_sec = max_per_sec
+        self.floor_jitter = max(0.0, min(0.5, float(floor_jitter)))
+        self._rng = random.Random()
+        self._floor = self.min_interval
         self._window: deque[float] = deque()
         self._last_ts: float = 0.0
         self.dropped = 0
         self.allowed = 0
 
-    def sync(self, min_interval_ms: int, max_per_sec: int) -> None:
+    def sync(self, min_interval_ms: int, max_per_sec: int,
+             floor_jitter: float | None = None) -> None:
         """跟随配置热更新。
 
         构造时就复制数值的话，配置页把「执行速度」拖到另一档后，
@@ -44,18 +57,31 @@ class ActionRateLimiter:
         """
         self.min_interval = min_interval_ms / 1000.0
         self.max_per_sec = max_per_sec
+        if floor_jitter is not None:
+            self.floor_jitter = max(0.0, min(0.5, float(floor_jitter)))
+        self._floor = self._draw_floor()
+
+    def _draw_floor(self) -> float:
+        """抽一个本次生效的下界（秒）。"""
+        if self.floor_jitter <= 0:
+            return self.min_interval
+        lo = self.min_interval * (1.0 - self.floor_jitter)
+        hi = self.min_interval * (1.0 + self.floor_jitter)
+        if hi <= 0:
+            return 0.0
+        return max(0.0, self._rng.triangular(lo, hi, self.min_interval))
 
     def delay_needed(self, now: float | None = None) -> float:
         """距下次可发送还需等待的秒数（0=立即可发）。"""
         now = time.monotonic() if now is None else now
         if self._last_ts <= 0:
             return 0.0
-        return max(0.0, self.min_interval - (now - self._last_ts))
+        return max(0.0, self._floor - (now - self._last_ts))
 
     def _try(self, now: float | None = None) -> bool:
         """尝试占用一个发送名额（不计数失败）。"""
         now = time.monotonic() if now is None else now
-        if self._last_ts > 0 and now - self._last_ts < self.min_interval:
+        if self._last_ts > 0 and now - self._last_ts < self._floor:
             return False
         # 清理滑动窗口
         horizon = now - 1.0
@@ -65,6 +91,7 @@ class ActionRateLimiter:
             return False
         self._last_ts = now
         self._window.append(now)
+        self._floor = self._draw_floor()
         self.allowed += 1
         return True
 
@@ -101,3 +128,4 @@ class ActionRateLimiter:
     def reset(self) -> None:
         self._window.clear()
         self._last_ts = 0.0
+        self._floor = self._draw_floor()

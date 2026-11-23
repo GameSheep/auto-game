@@ -16,6 +16,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from .atomic import atomic_write_text
+from .input import InputScheme, InputSchemeError
 
 
 def _project_root() -> Path:
@@ -51,6 +52,16 @@ class CaptureConfig(BaseModel):
     motion_trigger: bool = Field(False, description="启用画面异动检测（静止场景自动降频）")
     motion_hash_thresh: int = Field(4, ge=1, le=32, description="感知哈希汉明距离≤该值视为无异动")
     motion_force_s: float = Field(2.0, ge=0.5, description="无异动时强制上传间隔（秒）")
+    # 积压保护：服务端处理不过来时，WS 里会堆一串已经过期的帧。逐帧解码检测
+    # 只会让积压更严重（越处理越旧），所以**入口直接丢**，只留最新的。
+    # 真实事故：负载高时栈里积压 5 秒，决策拿 5 秒前的 A 框去按拾取键 = 盲按。
+    # 500ms ≈ 2fps 下 1 个采集间隔 + 传输抖动：只要排队超过"一帧半"，就说明
+    # 处理跟不上采集，此时把积压全丢掉比逐帧追更划算（追的时候每帧都更旧，
+    # 表现为"画面正常、动作全落在几秒前的世界"）。实测积压到 2.9s 时，
+    # 决策拿的是 5 秒前的 A 框 —— 那就是盲按。
+    max_frame_age_ms: int = Field(
+        500, ge=100, le=10000,
+        description="帧到达时已超过这个年龄就直接丢弃（毫秒），只处理新鲜帧")
 
 
 class VisionConfig(BaseModel):
@@ -87,18 +98,32 @@ class VisionConfig(BaseModel):
     )
 
     # 光柱颜色 HSV 阈值（OpenCV H: 0-179, S/V: 0-255）
+    #
+    # **这张表曾经是按模拟器调的，代价是把真光柱全漏掉。**
+    # `sim/scene.py` 画的光柱是 (36,190,255) BGR（S=218/V=255），于是阈值定成
+    # S≥120/V≥180；而真实游戏里光柱是**暗背景上半透明的淡金 + 白热芯**
+    # （实测 S≈70~120、V≈120~170），永远进不了候选 → 录像是"光柱 0 个"，
+    # 人就顺手把功能关了，还写下一句"这款游戏没有光柱"。错的是标定，不是游戏。
+    # 现在这组值来自真实帧（`assets/samples/real_darkmap_farm.png`）实测：
+    # 真图能检出竖直金柱，7 张无光柱真实帧 + 580 帧无光柱录像 0 误报。
+    # 换游戏/换画质必须重新量：`tools/calibrate_hsv.py` 取样，别照抄。
     hsv: dict[str, list[list[int]]] = Field(
         default_factory=lambda: {
-            # 金色光柱（高品质掉落）
-            "gold": [[18, 120, 180], [35, 255, 255]],
+            # 金色光柱（高品质掉落）：S/V 下界按真实画面放宽，白芯校验负责抗误报
+            "gold": [[15, 70, 120], [40, 255, 255]],
             # 粉色/紫色光柱（稀有掉落）
             "pink": [[140, 90, 160], [172, 255, 255]],
         }
     )
     pillar_min_area: int = Field(40, ge=5, description="光柱最小轮廓面积(px)")
+    #: 最小高度。光柱是"光柱"，不是亮点：真光柱在 720p 下 90~200px 高。
+    #: 少了这一条，19px 高的黄色 UI 碎片/掉落闪光也会被当成柱
+    #: （实测两张真实帧各误报 1 次，都是 19px / 44px 的小碎块）。
+    pillar_min_height: int = Field(
+        45, ge=8, description="光柱最小高度(px)；低于它的当碎片，不是柱")
     pillar_enabled: bool = Field(
-        True, description="是否检测光柱。火炬之光 PC 端的掉落不走光柱（走地面文字标签），"
-                          "开着只会产出散点误报并白烧 CPU —— 这类游戏在 profile 里关掉")
+        True, description="是否检测光柱。火炬之光 PC 端**有**掉落光柱（暗底淡金 + 白芯），"
+                          "但只有远距离看得见；近处会退化成地面文字标签，两条判据要同时开")
     pillar_min_width: int = Field(2, ge=1, description="光柱最小宽度px（真实 TLI 光柱 2-6px 细条）")
     pillar_max_width: int = Field(70, ge=10, description="光柱最大宽度px")
     pillar_min_aspect: float = Field(
@@ -107,7 +132,11 @@ class VisionConfig(BaseModel):
                     "低于 2.5 的是团光/地图节点/技能光斑，不是柱（真实录像验证："
                     "火炬之光『异界』关卡选择页的星图节点高宽比 1.4~2.0，曾全被当光柱）",
     )
-    pillar_max_aspect: float = Field(15.0, description="高/宽最大比例")
+    pillar_max_aspect: float = Field(
+        40.0,
+        description="高/宽最大比例。真光柱很细：3~6px 宽、60~200px 高，高宽比 20~40；"
+                    "原来卡 15 等于只认 14px 粗的模拟器光柱，真光柱全被丢。"
+                    "上限仍要留，否则 1px 的 UI 竖线（高宽比 100+）会进来")
 
     # A框（近距交互提示）检测
     aframe: "AFrameConfig" = Field(default_factory=lambda: AFrameConfig())
@@ -162,6 +191,11 @@ class VisionConfig(BaseModel):
     # 光柱白芯校验：掉落光柱有白热芯（近白像素），怪物特效是纯饱和色
     require_white_core: bool = Field(True, description="光柱必须含白热芯（抗 Boss/技能特效误报）")
     white_core_min_ratio: float = Field(0.04, ge=0.0, le=0.5)
+    #: 候选框里"彩色边"的占比下限。只用白芯判据挡不住纯白的东西（白字、白色技能线），
+    #: 所以反过来也要求有一条彩色边 —— 真光柱是"淡金边 + 白热芯"，两样都有。
+    white_core_color_min_ratio: float = Field(
+        0.10, ge=0.0, le=0.9,
+        description="光柱候选框内彩色像素占比下限（防纯白特效/文字被当成光柱）")
     white_core_s_max: int = Field(70, description="白芯饱和度上限（光柱白热芯 S=59-70；Boss触手 S≥144 被拒）")
     white_core_v_min: int = Field(225, description="白芯亮度下限")
 
@@ -625,24 +659,47 @@ class AutonomyConfig(BaseModel):
 
 
 class MousePathConfig(BaseModel):
-    """鼠标轨迹配置（WindMouse：重力吸附 + 风力扰动 + 端点减速）。
+    """鼠标轨迹配置 —— 默认走**运动学模型**（motion.human_path）。
 
-    为什么不用两点一线：直线匀速移动是自动化最容易被统计识别的特征之一。
-    人类鼠标轨迹有弧度、有加减速、落点差 1-3px、偶尔冲过头再拉回。
+    为什么不再默认 WindMouse：它是公开算法，反作弊侧有现成指纹（步长序列
+    自相关高、横向偏移与距离强线性、步长 clip 造成等幅平台）。真正难伪造的
+    是运动学不变量：Fitts 律时长、2/3 幂律（曲率大处减速）、亚运动多峰、
+    速度相关噪声。
+
+    `model="windmouse"` 保留旧实现（回归对照/排障用），行为与旧版一致。
 
     归属执行器（输出层）：这一层只决定"手怎么动"，不决定"往哪动"。
     """
 
     enabled: bool = Field(True, description="关闭后退化为单点移动（与旧版行为一致）")
+    model: Literal["kinematic", "windmouse"] = Field(
+        "kinematic", description="轨迹模型：kinematic=运动学（默认）/ windmouse=旧版")
+    # ---- 运动学模型（model=kinematic 时生效）----
+    target_width_px: float = Field(
+        24.0, ge=4.0, le=200.0, description="Fitts 律的目标有效宽度（越大越'容易'点）")
+    fitts_a: float = Field(0.09, ge=0.0, le=0.5, description="Fitts 截距（秒）")
+    fitts_b: float = Field(0.10, ge=0.01, le=0.5, description="Fitts 斜率（秒/比特）")
+    fitts_cv: float = Field(0.15, ge=0.0, le=0.6, description="个体差异（对数正态 σ）")
+    bow: float = Field(0.06, ge=0.0, le=0.3, description="弓形幅度系数（按 D^0.7 缩放）")
+    wobble_px: float = Field(
+        1.6, ge=0.0, le=12.0, description="低频横向漂移（1/f 平滑，不是白噪声）")
+    sample_hz: float = Field(
+        90.0, ge=20.0, le=500.0, description="轨迹采样率（决定点数，点数不写死）")
+    noise_px: float = Field(0.5, ge=0.0, le=6.0, description="基础手抖（px，白噪声底）")
+    speed_noise: float = Field(
+        0.10, ge=0.0, le=1.0, description="信号相关噪声：σ ∝ 速度（快的地方更抖）")
+    endpoint_sigma_px: float = Field(
+        1.2, ge=0.0, le=8.0, description="落点误差的高斯 σ（二维各向同性）")
+    # ---- WindMouse 参数（model=windmouse 时生效）----
     gravity: float = Field(9.0, ge=1.0, le=30.0, description="向目标的重力吸附强度")
     wind: float = Field(3.0, ge=0.0, le=20.0, description="风力扰动幅度（越大轨迹越飘）")
     max_step_px: float = Field(10.0, ge=2.0, le=60.0, description="单步最大位移（越小轨迹越细）")
     damping: float = Field(0.86, ge=0.3, le=1.0, description="速度阻尼，<1 防抖振")
-    speed_px_s: float = Field(900.0, ge=100.0, le=5000.0, description="名义移动速度")
+    speed_px_s: float = Field(900.0, ge=100.0, le=5000.0, description="名义移动速度（WindMouse）")
     min_duration_s: float = Field(0.06, ge=0.0, le=0.5, description="整段轨迹最短时长")
     max_duration_s: float = Field(0.45, ge=0.05, le=2.0, description="整段轨迹最长时长（防阻塞）")
-    max_points: int = Field(40, ge=2, le=200, description="轨迹点上限（USB HID/串口带宽预算）")
-    endpoint_jitter_px: int = Field(2, ge=0, le=12, description="落点偏差像素（真人不点数学中心）")
+    max_points: int = Field(64, ge=2, le=200, description="轨迹点上限（USB HID/串口带宽预算）")
+    endpoint_jitter_px: int = Field(2, ge=0, le=12, description="落点偏差像素（WindMouse）")
     overshoot_prob: float = Field(0.12, ge=0.0, le=0.5, description="冲过头再拉回的概率")
     overshoot_max_px: float = Field(10.0, ge=0.0, le=40.0, description="冲过头的最大像素")
     micro_pause_prob: float = Field(0.25, ge=0.0, le=1.0, description="中途微小停顿概率")
@@ -770,6 +827,35 @@ class MoodConfig(BaseModel):
     recent_halflife_s: float = Field(120.0, ge=5.0, description="新鲜感衰减半衰期（秒）")
 
 
+class RhythmConfig(BaseModel):
+    """动作节奏配置 —— 间隔不是"基准 ± 抖动"，是一层层叠出来的分布。
+
+    检测侧看的是**间隔序列的结构**，不是单个间隔的大小：
+      - 固定节拍 → ACF 在基频处有尖峰；
+      - 均匀抖动 → 分布盒状、方差收敛到常数；
+      - 硬下限   → 直方图有陡墙，所有动作贴墙；
+      - 帧率锁相 → 动作时刻对 1/fps 取模后聚成一簇。
+
+    对应四层：双态（专注/松散）、1/f 长程相关、对数正态、长尾打断；
+    下限由 `floor_jitter` 随机化（墙变坡）。
+    """
+
+    enabled: bool = True
+    cv: float = Field(0.22, ge=0.0, le=1.0, description="对数正态离差（越大越没准头）")
+    pink_strength: float = Field(0.22, ge=0.0, le=1.0, description="1/f 分量强度")
+    pink_octaves: int = Field(5, ge=1, le=8, description="1/f 层数（相关长度 ≈ 2^n 个样本）")
+    drift_strength: float = Field(
+        0.06, ge=0.0, le=0.4, description="基频慢漂移（打破与采集帧率的锁相）")
+    tail_prob: float = Field(0.05, ge=0.0, le=0.5, description="被打断的长尾概率")
+    tail_range: list[float] = Field([2.0, 5.0], description="长尾倍数区间 [lo, hi]")
+    focus_factor: list[float] = Field([0.90, 1.00], description="专注态间隔倍数")
+    loose_factor: list[float] = Field([1.30, 1.90], description="松散态间隔倍数")
+    p_focus_to_loose: float = Field(0.07, ge=0.0, le=1.0, description="专注→松散 每样本概率")
+    p_loose_to_focus: float = Field(0.30, ge=0.0, le=1.0, description="松散→专注 每样本概率")
+    floor_jitter: float = Field(
+        0.18, ge=0.0, le=1.0, description="物理下限自身的抖动比例（把硬墙变斜坡）")
+
+
 class HumanizeConfig(BaseModel):
     """拟人化行为总配置（决策层）。
 
@@ -784,6 +870,7 @@ class HumanizeConfig(BaseModel):
     drift: "DriftConfig" = Field(default_factory=lambda: DriftConfig())
     social: "SocialConfig" = Field(default_factory=lambda: SocialConfig())
     mood: "MoodConfig" = Field(default_factory=lambda: MoodConfig())
+    rhythm: "RhythmConfig" = Field(default_factory=lambda: RhythmConfig())
 
 
 class DecisionConfig(BaseModel):
@@ -792,11 +879,35 @@ class DecisionConfig(BaseModel):
     tick_hz: float = Field(1.0, ge=0.5, le=10, description="决策频率（对话定稿：1秒1次）")
 
     pickup_key: str = "a"
+    # 通用交互/选择键：进 Boss 房、开宝箱、触发任务点、打开关卡面板、选传送门。
+    # ⚠️ 它与 WASD 的**右移同键**：键位表（`explore_dirs` / `recovery`）里的 "d"
+    # 是右移。所以它和拾取键一样被 `_emit_move_keys` 拦下 —— 一旦当移动键发出去，
+    # 每次右移都会开面板/走传送门，比走错方向严重得多。
+    interact_key: str = Field(
+        "d", description="交互/确认键（进房、开箱、任务点、关卡面板、传送门）")
     # 拾取键复核冷却：按一次 A 后等游戏处理拾取动画再观察（防止连续按 A 捡垃圾）
     tap_recheck_ms: int = Field(500, ge=100, le=2000)
 
     # 走位方式：mouse_click=点地面寻路（推荐）; keys=方向键走位（纯键盘兜底）
+    # 这两档只是"操作方案"的**派生结果**。新配置请写 `input:` 段（见
+    # `autogame/input/scheme.py`），它会把这里覆盖成方案算出来的值。
     approach_mode: Literal["mouse_click", "keys"] = "mouse_click"
+
+    # 走位总闸：方案里 move.kind 是 none（还没教）或 stick（摇杆，后端不支持）时为 False。
+    # 关掉之后所有"主动走位"入口都不发起动作 —— 因为**点地面也可能是有意义的操作**
+    # （有的游戏左键是"选中目标"），没学会怎么走就别乱点。这不影响拾取/交互的闸门。
+    move_enabled: bool = True
+
+    # 点地面走位用哪个鼠标键。ARPG 多是左键；有的游戏左键是"选中"，
+    # 走位要给右键 —— 写死 left 的表现是"人物偶尔动一下"，很像识别问题。
+    # 注意 UI 点击（再次挑战按钮、技能图标）仍然固定用左键。
+    move_button: Literal["left", "right", "middle"] = "left"
+
+    # 方向键映射（键盘走位用）。默认 WASD，但键位可以改（AZERTY、自定义布局）。
+    # 方案里的 `move.keys` 会派生到这里；`_direction_keys` 从这儿读，不写死字母。
+    move_keys: dict[str, str] = Field(
+        default_factory=lambda: {"forward": "w", "back": "s", "left": "a", "right": "d"},
+        description="方向键映射 forward/back/left/right")
 
     # 点地面时，点击点 = 光柱底部中心 + 向下偏移（光柱悬空，点地面人物才会走过去）
     ground_click_offset_px: int = 28
@@ -807,6 +918,37 @@ class DecisionConfig(BaseModel):
     # 按拾取键前 A框至少连续出现几帧。人物还在走（画面在动）时，这一帧的 A框
     # 可能是几百毫秒前的旧信息 —— 边走边按最容易"按空"（模拟器里就是 blind_a_press）。
     aframe_confirm_frames: int = Field(2, ge=1, le=5, description="A框连续确认帧数（走位中防按空）")
+    # 停稳再按：A框是**过去某一帧**的证据，而点地面走位不会因为"看见 A框"而取消航点。
+    # 采集→编码→传输→检测这一圈要几百毫秒，这期间人物继续朝航点走，按键落下时
+    # 可能已经走出拾取半径 —— 2026-11-23 全量跑在负载下出现 blind_a_press=4 就是这个。
+    # 开启后：看到 A框先停步（点自己脚下，点地寻路游戏的通用停步手势），
+    # 只认停步之后新到的帧，让"按下的那一刻"和"证据那一帧"对齐。
+    stop_before_pick: bool = Field(
+        True, description="按拾取键前先停步并等停稳后的新帧（防走位超调导致的按空）")
+    # 帧时效（安全网）：帧年龄超过这个值就**什么都不做**。
+    # 入口（capture.max_frame_age_ms）已经会丢过期帧，这里是二道闸：
+    # 队列里又等了几秒、或者离线回放喂得慢，都还能兜住。
+    # 0 = 不检查（离线回放场景用）。真实事故：用 5 秒前的 A 框按了 A。
+    max_frame_age_ms: int = Field(
+        1500, ge=0, le=30000,
+        description="帧年龄超过该值（毫秒）时本帧不做任何决策，0=不检查")
+    # 按键比走位更挑时间：走位点偏了下一拍能修，按键按空了就是一次盲按。
+    # A 框出现只是"那一帧在范围内"，帧一旧，人就可能已经走过去了。
+    # 实测：按键时用的是 0.8 秒前的帧，而人物 0.8 秒能走 300+px（拾取半径只有 130）。
+    press_max_frame_age_ms: int = Field(
+        400, ge=0, le=5000,
+        description="按拾取键时帧年龄的上限（毫秒），更旧就等下一帧，0=不检查")
+
+    # ---- 亚帧打散（治"操作间隔高度标准化"的根）----
+    # 决策是**帧驱动**的：动作只能落在帧到达的时刻。capture.fps=2 时帧周期
+    # 500ms，于是"点击 → 再点击"的间隔永远是 500ms 的整数倍 —— 加多少随机
+    # 间隔都治不了，因为量化发生在最后一公里。
+    # 开了这个之后，点击/按键发出前先等 U(0, desync) 的相位偏移，动作时刻
+    # 与采集时钟解耦。代价：每次点击最多多占用决策线程这么久（走位期间本来
+    # 就在等人走过去，无感）。只在拟人化开启时生效。
+    action_desync_ms: int = Field(
+        400, ge=0, le=2000,
+        description="点击/按键前的随机相位延迟上限（应 ≥ 一个采集帧周期），0=关闭")
     # A框长期可见却按不下去（光柱丢失检测/够不到/属于旁边物品）→ 重新走位，别死等
     aframe_retry_frames: int = Field(8, ge=2, le=60, description="A框按不下去多少帧后重新走位")
 
@@ -881,6 +1023,53 @@ class LLMConfig(BaseModel):
         ["wait", "continue", "explore", "reset_stage"])
 
 
+class MashConfig(BaseModel):
+    """连按 / 连点配置 —— 「人会狂按，程序点完就去下一步」。
+
+    缺了这一层，整份日志里每个按键都是孤立的单次事件 —— 这本身就是特征：
+    真人打技能/抢怪时连按成簇（3-9 下），鼠标也会有双击、三连点。
+
+    关键不是"把间隔乘 0.3"，而是伪造连打的结构：
+      - **簇长重尾**（Gamma，均值≈lo+2，尾部到 hi），不是固定次数；
+      - **簇内先慢后快**：第一下之后要抬手再落（`first_ms` 最长），
+        之后有加速趋势（`ramp`），偶尔卡壳（`slip_prob`）；
+      - **连按时按压更短**（`hold_ms` < 单击的 `press_ms`）：手指不停留；
+      - **成簇出现**：兴奋度是均值回复的慢变量（`excite_*`），
+        独立同分布会让簇的出现变成泊松过程，而真实日志是过度离散的；
+      - **有预算**：窗口内连按总时长占比上限（`budget_ratio`），
+        真人不会一直狂按 —— 也不会因为狂按把刷图吞吐吃光。
+
+    ⚠️ 拾取键永不连按（由决策层运行时注入，见 `BaseExecutor.set_burst_forbid`）。
+    """
+
+    #: 默认跟随拟人化总开关（AUTOGAME_HUMANIZE）。测试套件把它关掉以保持确定性 ——
+    #: 连按会让"一次 execute = 一次按键"这类断言随机失败，而那不是 bug。
+    enabled: bool = Field(_HUMANIZE_ON, description="关闭后退化为每条命令只发一次（旧行为）")
+    keys: list[str] = Field(
+        default_factory=lambda: ["1", "2", "3", "4", "5", "6", "q", "e", "r", "f"],
+        description="允许连按的键（白名单）。拾取键/逃生键无论是否在此都会被排除")
+    prob_key: float = Field(0.42, ge=0.0, le=1.0, description="按技能键时进入连按的基准概率")
+    prob_click: float = Field(0.16, ge=0.0, le=1.0, description="鼠标连点（双击/三击）的基准概率")
+    click_interval_ms: list[int] = Field([70, 140], description="鼠标连点间隔区间 [lo, hi] 毫秒")
+    interval_ms: list[int] = Field([95, 165], description="连按簇内后续间隔基准区间 [lo, hi]")
+    interval_sigma: float = Field(0.16, ge=0.0, le=0.6, description="间隔的对数正态 σ（右偏）")
+    first_ms: list[int] = Field([150, 340], description="第一下→第二下的间隔（抬手再落，必然更慢）")
+    ramp: list[float] = Field([1.16, 0.90], description="加速趋势：首 gap 放大系数 → 末 gap 收缩系数")
+    slip_prob: float = Field(0.07, ge=0.0, le=0.4, description="卡壳概率（某一下明显慢了）")
+    slip_range: list[float] = Field([1.3, 2.1], description="卡壳时的间隔倍数区间")
+    count: list[int] = Field([3, 9], description="簇长区间 [lo, hi]（重尾分布，均值≈lo+2）")
+    hold_ms: list[int] = Field([28, 58], description="连按时的按压时长（比单次短）")
+    first_hold_ms: list[int] = Field([35, 75], description="连按第一下的按压时长")
+    tail_ms: list[int] = Field([220, 700], description="收尾停顿（看技能出来没有）")
+    excite_mean: float = Field(0.35, ge=0.0, le=1.0, description="兴奋度回复中心（长期连按倾向）")
+    excite_tau_s: float = Field(25.0, ge=1.0, le=600.0, description="兴奋度时间常数（连按成簇的时间尺度）")
+    excite_sigma: float = Field(0.30, ge=0.0, le=1.0, description="兴奋度随机游走强度")
+    excite_gain: float = Field(1.0, ge=0.0, le=3.0, description="兴奋度对连按概率的放大幅度")
+    budget_ratio: float = Field(0.30, ge=0.02, le=1.0, description="窗口内连按总时长占比上限")
+    budget_window_s: float = Field(45.0, ge=5.0, le=600.0, description="预算统计窗口（秒）")
+    max_burst_s: float = Field(1.6, ge=0.2, le=5.0, description="单次连按总时长上限（含收尾停顿）")
+
+
 class ExecutorConfig(BaseModel):
     """执行器配置。"""
 
@@ -912,9 +1101,16 @@ class ExecutorConfig(BaseModel):
     # 安全限速
     min_action_interval_ms: int = Field(25, ge=0, description="两次输出动作最小间隔")
     max_actions_per_sec: int = Field(20, ge=1, description="动作速率上限")
+    #: 最小间隔**本身**的抖动比例。限速器把 min_interval 当硬墙时，动作间隔
+    #: 直方图会出现一堵陡边（所有动作都贴着墙），这是很容易被抓的量化特征。
+    #: 每次发送后重新抽一个 (1±jitter) 的下界，墙就变成坡。
+    rate_floor_jitter: float = Field(
+        0.15, ge=0.0, le=0.5, description="最小间隔的抖动比例（0=旧行为：硬墙）")
 
-    # 鼠标轨迹人类化（WindMouse）—— 输出层：只决定"手怎么动"
+    # 鼠标轨迹人类化（默认运动学模型；windmouse 为旧版对照）
     mouse_path: "MousePathConfig" = Field(default_factory=lambda: MousePathConfig())
+    # 连按/连点（技能狂按、双击）—— 输出层手势，与轨迹同理
+    mash: "MashConfig" = Field(default_factory=lambda: MashConfig())
 
 
 class WatchdogConfig(BaseModel):
@@ -1061,12 +1257,38 @@ class LearnerConfig(BaseModel):
     use_model: bool = Field(True, description="自动学习时是否调模型起草规则；关掉则只编手册")
 
 
+class AgentConfig(BaseModel):
+    """游戏者（agent）：换游戏靠补知识，不靠改代码。
+
+    默认**关**。关着的时候决策仍走原来的 FSM，行为和以前一模一样 —— 这一层
+    是新加的能力，不该在没验证过的情况下改变已经在跑的流程。
+
+    开了之后，`autogame/agent/` 会按 `knowledge_dir` 里的目标/技能文件驱动，
+    FSM 退化成它脚下的一个"低层技能"。
+    """
+
+    enabled: bool = Field(False, description="总开关；开着才用知识文件驱动")
+    knowledge_dir: str = Field("agent", description="相对 profile 根目录的知识目录")
+    reach_px: int = Field(120, ge=20, le=600,
+                          description="走到多近算到了（只是'还要不要挪'，不是拾取半径）")
+    dead_after: int = Field(3, ge=2, le=50,
+                            description="同一动作在同一情境试几次都没效果，才算一条待验证假设")
+    max_frame_age_ms: float = Field(
+        400.0, ge=0, le=5000,
+        description="游戏者按键时帧年龄上限（毫秒）；0=不检查。与 decision.press_max_frame_age_ms 同一个闸")
+
+
 class AppConfig(BaseModel):
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
+    # 操作方案：这款游戏"哪个键是干什么的"。None = 没提供，沿用 decision.* 的扁平字段。
+    # 提供了就以它为准（load_config 会把结果派生回 decision/mash，见 apply_input_scheme）。
+    input: Optional[InputScheme] = None
+    # 游戏者：目标/技能形式的知识。见 autogame/agent/。
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     sim: "SimConfig" = Field(default_factory=lambda: SimConfig())
     ui_task: "UiTaskConfig" = Field(default_factory=lambda: UiTaskConfig())
     watchdog: "WatchdogConfig" = Field(default_factory=lambda: WatchdogConfig())
@@ -1145,6 +1367,36 @@ def runtime_overlay_path(path: str | os.PathLike | None) -> Path:
     return p.with_name(f"{p.stem}.runtime{p.suffix}")
 
 
+def apply_input_scheme(cfg: AppConfig, *, strict: bool = True) -> list[str]:
+    """把操作方案派生到决策/连按字段上，返回警告（不含已抛出的错误）。
+
+    单一事实来源是 `input:` 段；`decision.pickup_key` 这些扁平字段变成
+    **派生结果**。这样 FSM 不用一次性重写就能吃到方案，页面又能只在一处
+    显示"这个键是干什么的"，不会出现"页面写着 A，实际按的是 D"。
+
+    `strict=True` 时，方案内部有致死冲突就抛 `InputSchemeError` —— 宁可
+    起不来，也不要带着"按 A 其实在走位"这种错配跑一晚上。
+    """
+    scheme = cfg.input
+    if scheme is None:
+        return []
+    errs = scheme.errors()
+    if errs and strict:
+        raise InputSchemeError(errs)
+
+    patch = scheme.to_decision_patch()
+    for key, val in patch.items():
+        if hasattr(cfg.decision, key):
+            setattr(cfg.decision, key, val)
+
+    # 技能键白名单跟着方案走。空列表 = 方案里没技能，那就**不动**默认值：
+    # 清空会让"配了方案但没填技能"变成"连默认的连按也没有"，行为悄悄变差。
+    mk = scheme.to_mash_keys()
+    if mk:
+        cfg.executor.mash.keys = mk
+    return [c.message for c in scheme.conflicts() if c.severity == "warn"]
+
+
 def load_config(path: str | os.PathLike | None = None,
                 profile: "Profile | str | None" = None) -> AppConfig:
     """加载配置。
@@ -1196,6 +1448,23 @@ def load_config(path: str | os.PathLike | None = None,
                         rp = prof.root / "evolve" / gid / "rules.yaml"
                         if rp.exists():
                             arb["rules_path"] = str(rp)
+        # 操作方案单独一个文件：`profiles/<id>/scheme.yaml`。
+        # 为什么不让它只写在 profile.yaml 的 config 段里：键位是"这款游戏怎么玩"，
+        # 和视觉阈值/分辨率不是一回事，混在一起以后没人找得到"我到底改过哪个键"。
+        # 学习向导（tools/learn_input.py）也只写这一个文件，不会碰 profile.yaml。
+        sysp = prof.root / "scheme.yaml"
+        if sysp.exists():
+            # 解析失败**不许忽略**：其他段丢了只是"某个功能没开"，方案丢了是
+            # "键位退回默认"——换一款游戏就变成每个动作都按错键，而且日志全绿。
+            try:
+                raw_scheme = yaml.safe_load(sysp.read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError as exc:
+                raise ValueError(
+                    f"操作方案 {sysp} 不是合法 YAML：{exc}\n"
+                    f"（键位读不出来就会退回默认键位，所以这里直接拒绝启动）") from exc
+            if not isinstance(raw_scheme, dict):
+                raise ValueError(f"操作方案 {sysp} 必须是 mapping，实际是 {type(raw_scheme).__name__}")
+            data["input"] = _deep_merge(data.get("input") or {}, raw_scheme)
     if path:
         p = Path(path)
         overlay = runtime_overlay_path(p)
@@ -1209,6 +1478,9 @@ def load_config(path: str | os.PathLike | None = None,
                 logging.getLogger(__name__).warning(
                     "运行时覆盖文件解析失败（已忽略）：%s", overlay, exc_info=True)
     cfg = AppConfig.model_validate(data)
+    # 方案 → 扁平字段（pickup_key/interact_key/approach_mode/move_button/mash.keys）。
+    # 放在 token 处理之前：这一步可能抛 InputSchemeError，早抛比晚抛少一堆副作用。
+    apply_input_scheme(cfg)
 
     # token 解析优先级：环境变量 > 配置文件 > 自动生成持久化
     env_token = os.environ.get("AUTOGAME_TOKEN")

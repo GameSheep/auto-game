@@ -72,3 +72,6 @@ profiles/*/evolve/wanted.json
 # 回滚靠的就是这些目录 + active 指针；删了它们，设备上学坏之后无处可退。
 # 里的 knowledge/ 也要留：那一代的知识快照是行为的一部分，而 lessons/*.md
 # 已经改过了，事后无法重建出当时那份。
+# 运行时并发锁（PatchStore/世界状态写锁，重启即消，不是数据）
+profiles/*/evolve/*.json.lock
+profiles/*/groups/*.json.lock

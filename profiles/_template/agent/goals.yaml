@@ -1,0 +1,24 @@
+# 新游戏的目标骨架 —— 复制到 profiles/<你的游戏>/agent/ 里改
+#
+# 目标 = 什么情况下（when）+ 试哪些技能（skills，按顺序）+ 多久放弃（max_seconds）。
+# priority 大的先考虑。程序只会挑"现在适用、而且能力都教过"的目标；
+# 做不到的目标会在 `tools/agent_play.py --check` 和上机自检里写明缺什么。
+#
+# 目标写得越具体越好：「清一波怪」「捡光柱」「回城补给」是三个目标，
+# 不要写成一个「玩这个游戏」—— 拆开才能单独判断哪一步做不到。
+
+goals:
+  - id: recover
+    name: 回到战斗界面
+    when: out_of_game
+    priority: 100
+    skills: [back_out]
+    max_seconds: 30
+
+  - id: farm
+    name: 刷图
+    when: in_game
+    priority: 10
+    # 按顺序试：先放技能打，再捡，血低了喝药，什么都没就找路。
+    # 前一个做不到/失败会换下一个。
+    skills: [pop_skills, pick_one, drink_potion, look_around]

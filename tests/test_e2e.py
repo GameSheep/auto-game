@@ -41,7 +41,14 @@ def _free_port() -> int:
 
 
 class ServerFixture:
-    """独立线程运行真实 uvicorn 服务端。"""
+    """独立线程运行真实 uvicorn 服务端。
+
+    用完必须 stop：每个实例都是一个真在跑的 uvicorn + 决策循环 + 看门狗。
+    以前这里没有 stop，7 个 e2e 各留一个服务端在后台跑到进程结束 ——
+    后面的用例被前面的服务端抢 CPU，于是"偶发"超时、性能守卫莫名其红。
+    """
+
+    _live: list["ServerFixture"] = []
 
     def __init__(self) -> None:
         self.port = _free_port()
@@ -50,9 +57,13 @@ class ServerFixture:
         # 本地默认免鉴权；这些 e2e 专门验证"开鉴权时"的行为，所以显式打开
         self.cfg.server.require_token = True
         self.cfg.server.port = self.port
-        self.cfg.capture.fps = 6.0          # 加速闭环
+        # 2fps = 生产采集率（config.yaml 默认）。以前这里是 6fps"加速闭环"，
+        # 但一轮检测要 ~130ms（场景门 19 张模板占 65%），6fps 只有 166ms 预算，
+        # 一次尖峰就积压 —— 队列里全是 1~3 秒前的帧，按键必然按空。
+        # 测试要跑的是**能实时跟上的工况**，不是刻意造一个追不上的队列。
+        self.cfg.capture.fps = 2.0
         self.cfg.vision.max_detect_width = 1280
-        self.cfg.decision.tick_hz = 6.0
+        self.cfg.decision.tick_hz = 2.0
         self.cfg.decision.approach_timeout_s = 8.0
         self.executor = DryRunExecutor(self.cfg.executor)
         self.hub = Hub(self.cfg, self.executor, VisionPipeline(self.cfg.vision))
@@ -62,6 +73,17 @@ class ServerFixture:
                            log_level="error", access_log=False, ws="websockets")
         )
         self._thread = threading.Thread(target=self.server.run, daemon=True)
+        ServerFixture._live.append(self)
+
+    def stop(self) -> None:
+        """关掉服务端并等线程退出（不关就是留一个后台进程在抢 CPU）。"""
+        try:
+            self.server.should_exit = True
+        except Exception:  # noqa: BLE001
+            pass
+        self._thread.join(timeout=5)
+        if self in ServerFixture._live:
+            ServerFixture._live.remove(self)
 
     def start(self) -> None:
         self._thread.start()
@@ -74,6 +96,14 @@ class ServerFixture:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+
+@pytest.fixture(autouse=True)
+def _stop_servers_after_test():
+    """每个用例结束都关掉它开的服务端（见 ServerFixture 的说明）。"""
+    yield
+    for srv in list(ServerFixture._live):
+        srv.stop()
 
 
 def _run_bridge(executor, world, stop_event: threading.Event) -> None:
@@ -185,8 +215,9 @@ def test_farming_loop_full_stack():
     """
     srv = ServerFixture()
     srv.start()
-    srv.cfg.capture.fps = 6.0
-    srv.cfg.decision.tick_hz = 6.0
+    # 与生产一致：2fps 采集 + 2Hz 决策（见 ServerFixture 里的说明）
+    srv.cfg.capture.fps = 2.0
+    srv.cfg.decision.tick_hz = 2.0
 
     world = SimWorld(seed=33, picks_until_clear=3, walk_speed_px_s=420.0)
     agent_cfg = srv.cfg.model_copy(deep=True)

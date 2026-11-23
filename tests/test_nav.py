@@ -76,8 +76,13 @@ def test_nav_closed_loop_reaches_objective():
         eng.on_scene(state)
         # 注入导航按键到世界
         for j in eng.exec.journal:
+            # 回放**所有**移动命令，不只 key_tap：`d` 是交互键、不许当移动键发，
+            # 于是"往右走"会退化成点地面。只回放按键的话，退化后的点击被丢掉，
+            # 表现为"导航永远到不了"（其实已经走过去了，只是测试台没接）。
             if j["op"] == "key_tap" and j["key"] in ("w", "a", "s", "d"):
                 world.on_command("key_tap", key=j["key"], hold_ms=j["hold_ms"])
+            elif j["op"] == "mouse_click" and j.get("x") is not None:
+                world.on_command("mouse_click", x=j["x"], y=j["y"], button="left")
         eng.exec.journal.clear()
         world.tick()
         ts += 200
@@ -136,3 +141,31 @@ def test_nav_idle_only():
     assert eng.state == State.APPROACHING, "有光柱必须走拾取流程"
     assert not any(e["event"] == "nav_move" for e in eng.events), \
         "拾取优先，不得同时导航"
+
+
+def test_nav_never_presses_wasd_in_click_mode():
+    """点地寻路的游戏里，导航必须**只点地面**，一个方向键都不许发。
+
+    目标游戏是点地移动，WASD 不是移动键：`w`/`s` 轻则无反应，重则撞上别的热键；
+    `a`/`d` 更是拾取键/交互键（按 D 会开面板、走传送门）。所以导航在
+    `approach_mode=mouse_click` 时一律点击，不经过键盘路径。
+    """
+    world = SimWorld(seed=77, pillar_spawn_interval_s=999)
+    world.pillars.clear()
+    eng = _nav_cfg(approach_mode="mouse_click")
+    cfg = VisionConfig()
+    cfg.minimap.enabled = True
+    det = Detector(cfg)
+    ts = 1000
+    eng.start()
+    for _ in range(40):
+        state = det.process(world.render(), ts)
+        det.process(world.render(), ts + 50)
+        state = det.process(world.render(), ts + 100)
+        eng.on_scene(state)
+        ts += 200
+    keys = [j for j in eng.exec.journal
+            if j["op"] == "key_tap" and j.get("key") in ("w", "a", "s", "d")]
+    assert not keys, f"点地模式下导航不许按方向键，实际发了 {keys}"
+    clicks = [j for j in eng.exec.journal if j["op"] == "mouse_click"]
+    assert clicks, "导航必须点地面（否则不会移动）"

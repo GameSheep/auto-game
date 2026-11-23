@@ -49,6 +49,15 @@ def direction_vec(key: str) -> tuple[int, int]:
     return _DIR_VEC.get((key or "").lower(), (0, 0))
 
 
+def _move_btn(ctx: dict | None) -> str:
+    """走位用哪个鼠标键。恢复阶梯的探路/侧移属于走位，必须和主决策一致。
+
+    写死 `left` 的后果：走位键是右键的游戏里，恢复时每一下都点在"选中目标"上 ——
+    卡住之后不但没脱困，还顺手选中了别的东西。
+    """
+    return str((ctx or {}).get("move_button") or "left")
+
+
 @dataclass
 class StallSignals:
     """一帧的卡壳信号（全部单位=秒，基于帧时间戳）。"""
@@ -286,7 +295,8 @@ class RecoveryLadder:
         x = _clamp(int(ch[0]) + int(dx), 0, scene.w - 1)
         y = _clamp(int(ch[1]) + int(dy), 0, scene.h - 1)
         return RecoveryResult(
-            step="probe", commands=[Command(op="mouse_click", button="left", x=x, y=y)],
+            step="probe",
+            commands=[Command(op="mouse_click", button=_move_btn(ctx), x=x, y=y)],
             note=f"探路点击 ({x},{y})",
         )
 
@@ -327,7 +337,7 @@ class RecoveryLadder:
         return RecoveryResult(
             step="refocus",
             commands=[Command(op="mouse_move", x=x, y=y),
-                      Command(op="mouse_click", button="left", x=x, y=y)],
+                      Command(op="mouse_click", button=_move_btn(ctx), x=x, y=y)],
             note="点击角色重新聚焦窗口",
         )
 
@@ -345,7 +355,8 @@ class RecoveryLadder:
             x = _clamp(int(ch[0]) + dx * 180, 0, scene.w - 1)
             y = _clamp(int(ch[1]) + dy * 180, 0, scene.h - 1)
             return RecoveryResult(step="spin",
-                                  commands=[Command(op="mouse_click", button="left", x=x, y=y)],
+                                  commands=[Command(op="mouse_click", button=_move_btn(ctx),
+                                                    x=x, y=y)],
                                   note=f"八向脱困点击 ({x},{y})")
         hold = _clamp(int(self.cfg.explore_step_ms * 0.6), 120, 900)
         cmds = [Command(op="key_tap", key=k, hold_ms=hold) for k in keys]
@@ -398,7 +409,7 @@ class RecoveryLadder:
         action = advice.get("action")
         if action == "walk_to":
             x, y = advice.get("target", [scene.w // 2, scene.h // 2])
-            return [Command(op="mouse_click", button="left", x=int(x), y=int(y))]
+            return [Command(op="mouse_click", button=_move_btn(ctx), x=int(x), y=int(y))]
         if action == "key":
             return [Command(op="key_tap", key=str(advice.get("key", "space")), hold_ms=120)]
         if action == "esc":

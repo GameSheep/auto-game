@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import struct
+import time
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -26,6 +27,24 @@ _HEADER = struct.Struct("<BIHH")  # type, ts_ms, w, h
 
 def pack_jpeg_frame(jpeg: bytes, width: int, height: int, ts_ms: int) -> bytes:
     return _HEADER.pack(MSG_JPEG, ts_ms & 0xFFFFFFFF, width, height) + jpeg
+
+
+def frame_age_ms(ts_ms: int, now_ms: float | None = None) -> float:
+    """这一帧从拍下到现在过了多久（毫秒）。`ts_ms` 是**32 位**回卷过的墙钟。
+
+    帧头只有 4 字节放时间戳，所以代理发的是 `int(time.time()*1000) & 0xFFFFFFFF`。
+    直接 `time.time()*1000 - ts_ms` 会得到 ~1.8e12（≈56 年）这种数 —— 那不是"帧很旧"，
+    是漏了把高位补回来。先按现在的高位补，再判一次跨 2^32 回卷。
+
+    这个数是"绝不盲按"的**时效依据**：A 框是过去某一帧的证据，帧越旧，
+    按下去越可能落空（真实事故：按键时用的帧已经 5 秒前，人早走出拾取半径）。
+    """
+    now = time.time() * 1000.0 if now_ms is None else float(now_ms)
+    base = int(now // 2**32) * 2**32
+    full = base + int(ts_ms)
+    if full > now + 1000.0:      # 补完比"现在"还晚 → 说明跨了回卷边界
+        full -= 2**32
+    return now - full
 
 
 def unpack_message(raw: bytes | str) -> tuple[str, dict[str, Any]]:
@@ -191,6 +210,10 @@ class SceneState(BaseModel):
     loading: bool = False  # 加载/黑屏过场（FSM 保持不动）
     frame_delta: float = 0.0  # 与上一帧的变化像素占比（防撞墙用）
     ocr_used: bool = False
+    # 这一帧"拍下到现在"已经过了多久（毫秒）。由采集侧算 —— 只有它知道 ts 的时钟基准：
+    # 代理发的 ts 是 `int(time.time()*1000) & 0xFFFFFFFF`（32 位，省 4 字节），
+    # 决策侧直接跟墙钟相减会得到 ~56 年。默认 0 = 未知/离线回放，不做时效判断。
+    age_ms: float = 0.0
 
 
 # ---------------- 决策 → 执行器命令 ----------------

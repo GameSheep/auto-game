@@ -362,6 +362,10 @@ def _engine(humanize: HumanizeConfig, seed=7):
     cfg = DecisionConfig(tick_hz=10.0, approach_mode="mouse_click")
     cfg.autonomy.enabled = False
     cfg.humanize = humanize
+    # 亚帧打散默认 400ms：真实环境下这是防帧锁相的关键，但在测试里每点一次
+    # 就多睡最多 400ms，50 多个用例会拖到分钟级。这里关掉，单独用
+    # test_desync_* 验证接线（那两条用例把值调小到可测的量级）。
+    cfg.action_desync_ms = 0
     ex = DryRunExecutor(ExecutorConfig(min_action_interval_ms=0, max_actions_per_sec=1000))
     eng = DecisionEngine(cfg, ex)
     # 固定 seed：FSM 自己 new 的 Humanizer 无 seed，这里替换成可复现的
@@ -548,7 +552,9 @@ def test_aframe_during_walk_ends_wait_and_taps():
     assert any(e["event"] == "walk_end" and e.get("reason") == "aframe"
                for e in eng.events)
 
+    # 2000 那一帧是"看见 A框"→先停步（停步本身不算确认帧），所以要多等一帧
     eng.on_scene(_scene(3000, [_pillar_d(dist=120)], aframe=af, delta=40.0))
+    eng.on_scene(_scene(4000, [_pillar_d(dist=120)], aframe=af, delta=40.0))
     taps = [j for j in ex.journal if j["op"] == "key_tap" and j["key"] == "a"]
     assert taps, "到位后必须按拾取键"
 
@@ -776,7 +782,9 @@ def test_tap_requires_aframe_confirmation_frames():
         eng.on_scene(_scene(1000 + i * 1000, [_pillar_d(dist=120)], aframe=af, delta=0.5))
     assert not _taps(ex), "确认帧数不够时不得按 A"
 
+    # 第 2 帧是停步帧（看见 A框先停步），确认帧从它之后重新数 → 需要再一帧
     eng.on_scene(_scene(4000, [_pillar_d(dist=120)], aframe=af, delta=0.5))
+    eng.on_scene(_scene(5000, [_pillar_d(dist=120)], aframe=af, delta=0.5))
     assert _taps(ex), "确认够帧数后必须按（不能永远等下去）"
 
 
@@ -795,6 +803,7 @@ def test_tap_when_approaching_and_confirmed():
     """在靠近 + 确认够帧数 → 正常按。"""
     eng, ex = _aframe_engine(confirm_frames=2)
     af = AFrame(x=900, y=250, w=32, h=32, score=0.8)
-    for i, d in enumerate([120, 118, 112]):
+    # 112 那一帧是停步帧，确认帧从它之后重新数，所以补一帧 110
+    for i, d in enumerate([120, 118, 112, 110]):
         eng.on_scene(_scene(1000 + i * 1000, [_pillar_d(dist=d)], aframe=af, delta=40.0))
     assert _taps(ex), "在靠近且确认够帧数时必须按"

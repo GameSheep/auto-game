@@ -119,11 +119,19 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 # 写错归属会让核对永远报"配置里没写"，看起来像手册写错了，其实是查错了地方。
 _KEY_ACTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "pickup": ("pickup_key", ("拾取", "捡", "捡东西", "拾起", "pickup")),
+    # 通用交互键（D）：进 Boss 房、开宝箱、任务点、关卡面板、传送门。
+    # 它和 `pickup_key` 一样必须能核对 —— 键位猜错会让所有"进图/开箱"全错。
+    "interact": ("interact_key",
+                 ("交互", "确认", "选择", "进房", "开宝箱", "传送", "interact")),
     "escape": ("autonomy.escape_key",
                ("返回", "关闭", "退出", "关掉", "关弹窗", "escape", "esc")),
     "dodge": ("autonomy.dodge_key", ("闪避", "翻滚", "位移", "脱困", "dodge")),
-    "attack": ("", ("攻击", "普攻", "打", "attack")),
-    "map": ("", ("地图", "打开地图", "map")),
+    # `@xxx` = 从操作方案里取（不是 decision 的扁平字段）。主攻与地图以前只能报
+    # "没有配置项"，现在方案里有 primary / bindings.map 了，能真核对。
+    "attack": ("@primary", ("攻击", "普攻", "打", "attack")),
+    "map": ("@map", ("地图", "打开地图", "map")),
+    # 技能同理，但不是"一个键"而是一组，走 `_check_skill_keys` 单独比集合。
+    "skill": ("@skill", ("技能", "技能键", "放技能", "skill", "skills")),
 }
 
 _POSITIVE_WORDS = ("正例", "正面", "战斗", "是战斗", "in_game", "游戏中", "对")
@@ -628,6 +636,68 @@ def _decision_attr(cfg: Any, path: str) -> str:
     return str(obj or "")
 
 
+def _check_scheme_cap(cap: str, key: str, cfg: Any, row: dict) -> dict:
+    """『- 攻击: 鼠标右键』这类 —— 和操作方案里的对应能力比对。"""
+    from .input import normalize_key
+
+    scheme = getattr(cfg, "input", None)
+    if scheme is None:
+        row["status"] = "gap"
+        row["evidence"] = f"动作={cap} 配置字段=（无 input 方案）"
+        row["detail"] = ("程序还没有操作方案 → 这个动作没有地方放键位。"
+                         "跑 tools/learn_input.py --ask 填一份 scheme.yaml")
+        return row
+    b = scheme.binding(cap)
+    row["evidence"] = f"input.{cap}: 配置={b.key if b else '（空）'} 手册={normalize_key(key)}"
+    if b is None:
+        row["status"] = "gap"
+        row["detail"] = f"方案里没填 {cap}，按手册补 scheme.yaml"
+        return row
+    if normalize_key(key) == b.key:
+        row["status"] = "ok"
+        row["detail"] = f"键位一致（{b.key}）"
+    else:
+        row["status"] = "fail"
+        row["detail"] = (f"冲突：手册说 {normalize_key(key)}，方案配置是 {b.key}。"
+                         f"哪个对？以游戏实际为准，改 scheme.yaml")
+    return row
+
+
+def _check_skill_keys(key: str, cfg: Any, row: dict) -> dict:
+    """一条『- 技能: Q / W / E / R / 鼠标右键』—— 和操作方案里的技能栏比对。
+
+    技能不是一个键，库里原来因此**故意留空**（"配置里没有技能字段"），每次
+    `teach --check` 都报一条缺口。现在方案里有 `skills` + `primary`，可以真比对了：
+    比的是集合（顺序是人的习惯，不是游戏约束），缺一个就报冲突。
+    """
+    from .input import normalize_key
+
+    scheme = getattr(cfg, "input", None)
+    if scheme is None:
+        row["status"] = "gap"
+        row["evidence"] = "动作=skill 配置字段=（无 input 方案）"
+        row["detail"] = ("手册里写了技能键，但程序没有操作方案 → 没有地方放它们。"
+                         "跑 tools/learn_input.py --ask 填一份 scheme.yaml")
+        return row
+
+    have = {normalize_key(s.key) for s in scheme.all_skills() if s.key}
+    want = {normalize_key(x) for x in re.split(r"[/、,，\s]+", key or "") if x.strip()}
+    row["evidence"] = (f"input.skills: 配置={'/'.join(sorted(have)) or '（空）'} "
+                       f"手册={'/'.join(sorted(want))}")
+    missing = want - have
+    if not have:
+        row["status"] = "gap"
+        row["detail"] = "方案里没填技能键，按手册补 input.skills / input.primary"
+    elif missing:
+        row["status"] = "fail"
+        row["detail"] = (f"手册里有 {'/'.join(sorted(missing))}，方案里没有。"
+                         f"哪个对？以游戏实际为准，改 scheme.yaml")
+    else:
+        row["status"] = "ok"
+        row["detail"] = f"技能键一致（{len(want)} 个）"
+    return row
+
+
 def _check_key(action: str, key: str, cfg: Any, row: dict) -> dict:
     """一条『- 拾取: A』。cfg 是完整 AppConfig（键位分散在 decision 与 autonomy）。"""
     attr = ""
@@ -641,6 +711,17 @@ def _check_key(action: str, key: str, cfg: Any, row: dict) -> dict:
         row["status"] = "skip"
         row["detail"] = "不是键位（自由文本），已写进 game.md"
         return row
+    # 手册里写「待补充」：这是"人还没给答案"，不是"配置错了"。
+    # 不先拦掉的话，配了方案之后它会变成"冲突：手册说待补充，配置是 mouse_right"
+    # —— 把一条待办伪装成一个矛盾，比漏报更容易带错人。
+    if str(key or "").strip() in ("", "-", "待补充", "待定", "todo", "TODO", "tbd"):
+        row["status"] = "gap"
+        row["detail"] = "手册里还是『待补充』：先在游戏里按一下确认，再把这个键填上"
+        return row
+    if matched == "skill":
+        return _check_skill_keys(key, cfg, row)
+    if attr.startswith("@"):
+        return _check_scheme_cap(attr[1:], key, cfg, row)
     if not attr or getattr(cfg, "decision", None) is None:
         row["status"] = "gap"
         row["evidence"] = f"动作={matched} 配置字段=（无）"

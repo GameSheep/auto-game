@@ -32,8 +32,10 @@ from .config import (
     HumanizeConfig,
     MoodConfig,
     MousePathConfig,
+    RhythmConfig,
     SocialConfig,
 )
+from .motion import Rhythm, human_path
 from .protocol import Command
 
 log = logging.getLogger(__name__)
@@ -178,17 +180,57 @@ def _assign_timing(
     return out
 
 
+def _kinematic_path(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    cfg: MousePathConfig,
+    rng: Any,
+) -> list[PathPoint]:
+    """运动学轨迹（`motion.human_path`）→ PathPoint 列表。
+
+    与 WindMouse 的区别在于"伪造的是什么"：WindMouse 伪造的是**抖动形状**，
+    这里伪造的是**运动学不变量**（Fitts 律时长 / 2/3 幂律 / 亚运动多峰 /
+    速度相关噪声）。后者是人的神经-肌肉特性，不是随机数能凑出来的。
+    """
+    if abs(start[0] - end[0]) < 2 and abs(start[1] - end[1]) < 2:
+        return [PathPoint(int(end[0]), int(end[1]), 0.0)]
+    j = max(0, int(cfg.endpoint_jitter_px))
+    pts = human_path(
+        start, end,
+        bow=cfg.bow, wobble_px=cfg.wobble_px, sample_hz=cfg.sample_hz,
+        noise_px=cfg.noise_px, speed_noise=cfg.speed_noise,
+        target_width_px=cfg.target_width_px,
+        fitts_a=cfg.fitts_a, fitts_b=cfg.fitts_b, fitts_cv=cfg.fitts_cv,
+        min_duration_s=cfg.min_duration_s, max_duration_s=cfg.max_duration_s,
+        max_points=cfg.max_points,
+        endpoint_sigma_px=cfg.endpoint_sigma_px,
+        # 落点偏差按 endpoint_jitter_px 兜底钳制：偏得太远真人会重试，
+        # 不会"硬着头皮点下去"，这里保持同一个语义。
+        endpoint_clip_px=float(j) if j else 0.0,
+        rng=rng,
+    )
+    return [PathPoint(x, y, dt) for x, y, dt in pts]
+
+
 def build_mouse_path(
     start: tuple[int, int],
     end: tuple[int, int],
     cfg: MousePathConfig,
     rng: Any = None,
 ) -> list[PathPoint]:
-    """起点 → 终点的人类化轨迹（关闭时退化为单点，行为与旧版完全一致）。"""
+    """起点 → 终点的人类化轨迹（关闭时退化为单点，行为与旧版完全一致）。
+
+    默认走 `motion.human_path()`（Fitts 律 + 2/3 幂律 + 亚运动 + 速度相关噪声），
+    因为它伪造的是**运动学不变量**而不是"随机弯一下"；`cfg.model="windmouse"`
+    保留旧实现，用于回归对照。
+    """
     rng = _rng_or_default(rng, None)
     ex, ey = int(end[0]), int(end[1])
     if not cfg.enabled:
         return [PathPoint(ex, ey, 0.0)]
+
+    if getattr(cfg, "model", "kinematic") == "kinematic":
+        return _kinematic_path(start, (ex, ey), cfg, rng)
 
     # 落点偏差：真人不点"数学中心"，差 1-3px 很正常
     j = max(0, int(cfg.endpoint_jitter_px))
@@ -441,6 +483,8 @@ class Humanizer:
         self.fatigue = FatigueModel(cfg.fatigue, self._rng)
         # 情绪/偏好：影响"选哪个目标"，与疲劳共用随机源
         self.mood = MoodModel(cfg.mood, self.fatigue, self._rng)
+        # 节奏：双态 + 1/f + 长尾。base 由调用方按任务节拍设定（rhythm.base）。
+        self.rhythm = Rhythm(1.0, cfg.rhythm, rng=self._rng)
 
         self._break_until = 0.0
         self._break_started = 0.0
@@ -494,6 +538,24 @@ class Humanizer:
 
     def error_prob(self, now: float, base: float = 0.0) -> float:
         return self.fatigue.error_prob(base) if self.cfg.enabled else base
+
+    def interval_s(self, base_s: float, scale: float = 1.0) -> float:
+        """按人类节奏给出一个间隔（秒）。
+
+        `base_s` 是任务决定的节拍（例如 1/tick_hz），`scale` 叠加疲劳/监督降速。
+        关闭拟人化时退化为 `base_s * scale`（确定性优先，和 `reaction_ms`
+        返回 0 的契约一致）。
+
+        为什么不能沿用"base × uniform(0.9,1.1)"：那个分布的支撑集是固定盒子，
+        样本一多方差收敛、ACF 在 lag>1 直接掉到 0；而真人的节奏序列有长程
+        相关（1/f）和长尾打断。见 `motion.Rhythm` 的分层说明。
+        """
+        if not self.cfg.enabled or not self.cfg.rhythm.enabled:
+            return max(0.0, float(base_s) * max(0.0, float(scale)))
+        return self.rhythm.next(max(0.0, float(scale)), float(base_s))
+
+    def interval_ms(self, base_ms: float, scale: float = 1.0) -> int:
+        return int(round(self.interval_s(base_ms / 1000.0, scale) * 1000.0))
 
     def reaction_ms(self) -> int:
         """看到 A框 → 按下拾取键的反应时间（对数正态，右偏长尾）。
@@ -665,6 +727,7 @@ class Humanizer:
             "breaks": self.break_count,
             "breaking": self._breaking,
             "drifts": self.drift_count,
+            "rhythm": self.rhythm.snapshot(),
             "mood": self.mood.snapshot() if self.mood_active else {"enabled": False},
             "social": {
                 "enabled": self.cfg.social.enabled,

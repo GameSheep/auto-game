@@ -1,0 +1,79 @@
+# 火炬之光：无限（PC）—— 技能（怎么干）
+#
+# 这里只写「分几步、每步做到什么算完」，**不写按哪个键**。
+# 键在哪是 scheme.yaml 的事（左键走、右键主攻、QWER 技能、A 捡、D 交互）。
+# 两者分开，才能做到"换个游戏只换文件"：
+#   - 换游戏 → 改 scheme.yaml（键位）+ 这两个文件（玩法）
+#   - 改代码 → 只在动词/证据本身需要扩展时（比如新增"释放范围技"这种原语）
+#
+# 每条技能都带 when（适用条件）：看到光柱才捡、有怪才打、没目标才找路。
+# 不写 when 也能跑，但会先白等一轮超时再换技能 —— 表现是"反应慢半拍"。
+
+skills:
+  - id: pick_nearest
+    name: 捡最近的东西
+    when: target
+    steps:
+      - verb: move_to
+        target: nearest_pillar
+        until: near_target
+        max_seconds: 12
+        every_s: 0.35
+        note: 点光柱底部的地面点，角色自己走过去
+      - verb: pickup
+        until: target_gone
+        max_seconds: 4
+        every_s: 0.4
+        note: 到 A 框出现才按 A；按完等那个目标消失
+    success: target_gone
+    max_seconds: 20
+
+  - id: fight_group
+    name: 打掉最近的怪，再捡掉落
+    when: monsters
+    steps:
+      - verb: move_to
+        target: nearest_monster
+        until: near_target
+        max_seconds: 10
+        every_s: 0.35
+      - verb: attack
+        target: nearest_monster
+        until: no_monsters
+        max_seconds: 25
+        every_s: 0.25
+        note: 右键按住连发；怪清完就进下一步
+      - verb: move_to
+        target: nearest_pillar
+        until: near_target
+        when: target
+        max_seconds: 12
+      - verb: pickup
+        until: target_gone
+        when: target
+        max_seconds: 4
+    success: no_monsters
+    max_seconds: 50
+
+  - id: roam_and_look
+    name: 没有目标就找路
+    when: no_targets
+    steps:
+      - verb: roam
+        until: target
+        max_seconds: 12
+        every_s: 0.9
+        note: 点屏幕边缘走；四个方向轮换，不要在一个角上打转
+    success: target
+    max_seconds: 15
+
+  - id: back_out
+    name: 关掉面板/异常界面
+    when: out_of_game
+    steps:
+      - verb: cancel
+        until: in_game
+        max_seconds: 3
+        every_s: 0.6
+    success: in_game
+    max_seconds: 5

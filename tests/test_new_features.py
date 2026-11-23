@@ -135,3 +135,16 @@ def test_loading_flag_from_dark_frame():
     bright = np.full((720, 1280, 3), (28, 24, 22), dtype=np.uint8)
     st2 = det.process(bright, 1001)
     assert st2.loading is False
+
+
+def test_pca9685_right_click_uses_the_right_servo_channel():
+    """技能槽第 5 格 = 鼠标右键 → 舵机必须打 `mouse_right`（ch9），不是左键 ch8。
+
+    三套执行器里，右键这条路以前一次都没被发过（左键是唯一调用方）。
+    舵机后端按 `mouse_{button}` 查通道，通道名写错就是 KeyError —— 真机上表现为
+    "一放技能程序就崩"，而在测试里完全看不出来。
+    """
+    ex = _mk_pca()
+    ex.execute(Command(op="mouse_click", button="right", x=100, y=100))
+    chans = [ch for ch, _ in ex._bus.pulses]
+    assert chans == [9, 9], f"右键应打 ch9（按下+抬起），实际 {chans}"

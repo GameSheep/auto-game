@@ -57,9 +57,28 @@ class RP2040Executor(BaseExecutor):
 
     def __init__(self, cfg: ExecutorConfig) -> None:
         super().__init__(cfg)
-        import serial  # pyserial
+        # 缺包/串口号错都不要只抛一句 `No module named 'serial'` 或
+        # `could not open port COM5` —— 真机上这两种故障看起来都像"程序坏了"，
+        # 实际分别是"装错环境"和"配对了一半"，修法完全不同。
+        try:
+            import serial  # pyserial
+        except ImportError as e:
+            raise RuntimeError(
+                f"rp2040 后端需要 pyserial，但当前 Python 环境里没有（{e}）。"
+                "装：pip install pyserial（或 pip install -r requirements.txt）。"
+                "装完再看串口号：Windows 设备管理器 →「端口 (COM 和 LPT)」，"
+                "别选成另一个 CDC 设备。"
+            ) from e
 
-        self._ser = serial.Serial(cfg.serial_port, cfg.serial_baud, timeout=0.5)
+        try:
+            self._ser = serial.Serial(cfg.serial_port, cfg.serial_baud, timeout=0.5)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"打不开串口 {cfg.serial_port!r}：{type(e).__name__}: {e}。"
+                "查三件事：① 设备管理器里板子到底是哪个 COM；"
+                "② 有没有被串口助手/Arduino IDE/另一个服务占用；"
+                "③ 驱动装没装（RP2040 应出现「USB 串行设备」）。"
+            ) from e
         #: 固件回过 {"ok":false} 的次数。**必须能被看见**：
         #: 其中 `watchdog_release` 的意思是"主机卡了 5 秒，按键是固件自己松的" ——
         #: 这种事故如果只进 debug 日志，表现就是"偶尔莫名其妙少走一步"。

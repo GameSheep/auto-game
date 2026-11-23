@@ -21,6 +21,11 @@ def _rig():
     det = Detector(VisionConfig())
 
     dcfg = DecisionConfig(tick_hz=2.0, approach_mode="mouse_click")
+    # 关掉两个模型层：它们按**真实墙钟**判断节拍，而这个用例用的是"每帧 +1 秒"的
+    # 假时间轴——两者一对不上就会误判 throttle。本机没跑 Ollama 时还会每帧撞一次
+    # 连接拒绝，和别的用例一起跑时表现为"偶发 picked=0"（其实是时序，不是逻辑）。
+    dcfg.supervisor.mode = "off"
+    dcfg.arbiter.mode = "off"
     dcfg.autonomy.frozen_window_s = 3.0
     dcfg.autonomy.idle_window_s = 999.0
     dcfg.autonomy.stall_window_s = 999.0

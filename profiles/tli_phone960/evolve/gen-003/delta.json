@@ -1,0 +1,25 @@
+{
+  "tracked": true,
+  "added": [],
+  "changed": [
+    "labels.json",
+    "lessons/tli.md"
+  ],
+  "removed": [],
+  "newest": 1795425646,
+  "n_files": 8,
+  "empty": false,
+  "vs": "gen-002",
+  "knowledge": {
+    "added": [
+      "- 不要把技能栏第 5 格的 `A` 当成键盘 A：那一格是鼠标右键，键盘 A 只有拾取一个用途，`decision.pickup_key=a` 是对的，别看到技能栏上的 A 就去改它（真实截图底部是 `Q W E R A` 五格，第 5 格标的 A 指右键；混起来会变成「放技能时原地捡空气」或「拾取时按出一个技能」）",
+      "- 不要盲按 D：D 是交互/选择键，能进 Boss 房、开宝箱、开**关卡面板**、选传送门。按错地方会直接离开当前地图，比走错方向难查得多（`interact_key=d` 与右移同键，键盘模式下\"向右走\"必须点地面）",
+      "- 交互：D",
+      "- 技能：Q / W / E / R / 鼠标右键"
+    ],
+    "removed": [],
+    "n_added": 4,
+    "n_removed": 0
+  },
+  "blind": false
+}

@@ -242,6 +242,7 @@ details.limsafe summary{cursor:pointer;font-size:12px;color:var(--muted);outline
 .badge{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:4px;
   background:var(--soft);color:var(--muted);margin-right:6px;vertical-align:1px}
 .badge.ok{background:rgba(22,163,74,.12);color:#15803d}
+.badge.warn{background:rgba(180,83,9,.12);color:#b45309}
 .badge.bad{background:rgba(220,38,38,.12);color:var(--bad)}
 .sub{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.6}
 .sub.fix{color:var(--accent)}
@@ -414,6 +415,19 @@ details.limsafe summary{cursor:pointer;font-size:12px;color:var(--muted);outline
 <main>
 <!-- ============ 参数 ============ -->
 <section class="page on" id="page-params">
+  <div class="card" id="schemeCard" style="display:none">
+    <div class="sec-hd">操作方案<span id="schemeSrc"></span></div>
+    <div id="schemeDesc" class="muted"></div>
+    <div id="schemeTable" style="margin-top:10px"></div>
+    <div id="schemeNotes" style="margin-top:8px"></div>
+    <p class="hint" style="margin:8px 0 0">
+      这里只列「哪个键是干什么的」和「引擎做不做得到」。什么时候允许按不在方案里 ——
+      拾取永远要过场景门 + A框 + 目标存在三道闸，改键位放宽不了任何一条。
+      <b>未学</b>的能力不会去按（宁可不做），要补跑
+      <code>py -3.12 tools/learn_input.py --profile &lt;id&gt; --ask</code>。
+    </p>
+  </div>
+
   <div class="card">
     <div class="sec-hd">上真机前自检<span id="pfWhen">会去问一次硬件；服务在跑时自动跳过串口探活</span></div>
     <div id="pfBox" class="muted">还没检查 —— 点下面的按钮跑一次</div>
@@ -992,7 +1006,7 @@ function saveKnob(k,v){
 }
 
 /* ============ 更多设置 ============ */
-/* 全部在 LIVE_FIELDS 内（decision.* / executor.mouse_path.*），改完立即生效。 */
+/* 全部在 LIVE_FIELDS 内（decision.* / executor.mouse_path.* / executor.rate_floor_jitter），改完立即生效。 */
 const GROUPS=[
   {key:"humanize", title:"拟人度细节",
    desc:"上面预设已配好一套，这里只做微调",
@@ -1016,11 +1030,47 @@ const GROUPS=[
     ]},
     {title:"鼠标轨迹", fields:[
       {p:"executor.mouse_path.enabled", label:"拟人轨迹", type:"bool", help:"走弧线，不是直线瞬移"},
-      {p:"executor.mouse_path.wind", label:"轨迹弯曲度", type:"num", min:0,max:20,step:0.5, help:"0 为直线"},
+      {p:"executor.mouse_path.model", label:"轨迹模型", type:"select",
+       options:[["kinematic","运动学（推荐）"],["windmouse","WindMouse（旧版）"]],
+       help:"运动学伪造 Fitts 律 / 2-3 幂律 / 亚运动；WindMouse 是公开算法，反作弊有现成指纹"},
+      {p:"executor.mouse_path.bow", label:"轨迹弯曲度", type:"num", min:0,max:0.3,step:0.01,
+       help:"运动学模型的弓形幅度，0 为直线（真人 0.04~0.12）"},
+      {p:"executor.mouse_path.wobble_px", label:"手抖幅度", type:"num", min:0,max:12,step:0.2, unit:"px",
+       help:"低频横向漂移（1/f 平滑），不是白噪声"},
       {p:"executor.mouse_path.endpoint_jitter_px", label:"落点偏差", type:"num", min:0,max:12,step:1, unit:"px",
-       help:"点击位置随机偏移像素"},
+       help:"点击位置随机偏移像素（高斯，不是整数均匀）"},
       {p:"executor.mouse_path.overshoot_prob", label:"过冲概率", type:"num", min:0,max:0.5,step:0.01,
        help:"先冲过头再回拉的比例，最大 0.5"},
+    ]},
+    {title:"动作节奏", fields:[
+      {p:"decision.action_desync_ms", label:"相位打散", type:"num", min:0,max:2000,step:50, unit:"ms",
+       help:"点击/按键前随机等这么久，把动作时刻从采集帧边界挪开。关掉后 fps=2 时间隔只剩 500/1000ms 两个值"},
+      {p:"executor.rate_floor_jitter", label:"间隔下界抖动", type:"num", min:0,max:0.5,step:0.01,
+       help:"限速器的最小间隔每次重抽，避免所有动作贴着同一个下界"},
+      {p:"decision.humanize.rhythm.enabled", label:"节奏随机游走", type:"bool",
+       help:"双态（专注/松散）+ 1/f 长程相关 + 长尾打断，替掉固定节拍"},
+      {p:"decision.humanize.rhythm.cv", label:"节奏离散度", type:"num", min:0,max:1,step:0.02,
+       help:"越大越没准头（真人 0.35~0.9）"},
+      {p:"decision.humanize.rhythm.tail_prob", label:"被打断概率", type:"num", min:0,max:0.5,step:0.005,
+       help:"偶尔停一下（喝水/走神），制造右偏长尾"},
+    ]},
+    {title:"连按 / 连点", fields:[
+      {p:"executor.mash.enabled", label:"允许连按", type:"bool",
+       help:"打技能时狂按、鼠标双击/三连点。关掉后每个动作都是孤立的单次事件（旧行为）"},
+      {p:"executor.mash.prob_key", label:"技能键连按率", type:"num", min:0,max:1,step:0.02,
+       help:"按 1/2/3/Q/E 这类键时进入连按的基准概率（兴奋时会翻倍）"},
+      {p:"executor.mash.prob_click", label:"鼠标连点率", type:"num", min:0,max:1,step:0.02,
+       help:"左键连点（双击/三击）的概率"},
+      {p:"executor.mash.count", label:"连按次数", type:"pair", min:1, unit:"下",
+       help:"一簇按几下（左=最少 右=最多）。重尾分布，多数在低位、偶尔到上限"},
+      {p:"executor.mash.interval_ms", label:"连按间隔", type:"pair", min:40, unit:"ms",
+       help:"簇内后续间隔（左=快 右=慢）。真人 95~165ms（约 6~10 次/秒），低于 70ms 物理上做不到"},
+      {p:"executor.mash.first_ms", label:"第一下间隔", type:"pair", min:60, unit:"ms",
+       help:"抬手下一次按键总要慢一点，比后续间隔长才有「按一下→再按」的层次"},
+      {p:"executor.mash.budget_ratio", label:"连按时间占比", type:"num", min:0.02,max:1,step:0.02,
+       help:"窗口内最多有多少时间花在连按上。没有上限会变成「一直狂按同一个键」，比不连按更假"},
+      {p:"executor.mash.tail_ms", label:"按完停顿", type:"pair", min:0, unit:"ms",
+       help:"收尾停一下看技能出来没有，不是按完立刻下一个操作"},
     ]},
    ]},
 
@@ -2258,8 +2308,34 @@ $("saveAlert").onclick=()=>{saveState("busy","保存中…");
 $("testAlert").onclick=()=>post("/api/alerts/test").then(()=>{toast("测试告警已发送");refreshAlerts();}).catch(e=>toast("发送失败："+e.message,true));
 $("token").addEventListener("change",()=>{localStorage.setItem("ag_token",$("token").value.trim());startStream();loadConfig();});
 
+function renderScheme(){
+  // 操作方案：这款游戏"哪个键是干什么的" + "引擎做不做得到"。
+  // 数据来自 /api/config 的 input_report（服务端算好的能力表），前端只负责显示 ——
+  // 支持度判断依赖引擎能力，不能让前端凭键名猜"应该能用"。
+  const card=$("schemeCard"), r=CFG&&CFG.input_report;
+  if(!r){ if(card)card.style.display="none"; return; }
+  card.style.display="";
+  $("schemeSrc").textContent = r.source==="legacy" ? "（从旧配置推断，建议用向导过一遍）"
+    : r.source==="preset" ? "（内置预设）" : r.source==="learned" ? "（向导学过）" : "";
+  $("schemeDesc").textContent = r.describe||"";
+  const mk={ready:["OK","ok"],unknown:["未学","warn"],partial:["部分","warn"],
+            unsupported:["不支持","warn"],blocked:["冲突","bad"]};
+  const esc=s=>String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  $("schemeTable").innerHTML = "<table><tr><th>能力</th><th style=\"width:64px\">状态</th>"+
+    "<th style=\"width:110px\">按键</th><th>说明</th></tr>"+
+    r.capabilities.map(c=>{const [t,k]=mk[c.state]||[c.state,""];
+      return "<tr><td>"+esc(c.name)+"</td><td><span class=\"badge "+k+"\">"+t+"</span></td>"+
+        "<td>"+esc(c.binding||"-")+"</td><td class=\"muted\">"+esc(c.consequence||"")+"</td></tr>";
+    }).join("")+"</table>";
+  const notes=(r.conflicts||[]).map(c=>
+    "<div class=\"sub"+(c.severity==="error"?" fix":"")+"\">"+
+    (c.severity==="error"?"必须改：":"注意：")+esc(c.message)+
+    (c.fix?" —— "+esc(c.fix):"")+"</div>").join("");
+  $("schemeNotes").innerHTML=notes;
+}
+
 function loadConfig(){return api("/api/config").then(d=>{
-  CFG=d; renderKnobs(); renderPresets(); renderAdv(); saveAlertUI();
+  CFG=d; renderKnobs(); renderPresets(); renderAdv(); saveAlertUI(); renderScheme();
 }).catch(e=>{ if(!NO_BACKEND) toast("配置读取失败："+e.message,true); });}
 $("retryBtn").onclick=()=>{ clearBackend(); saveState("busy","重连中…"); loadConfig(); refreshAlerts(); };
 $("goBtn").onclick=openAddr;

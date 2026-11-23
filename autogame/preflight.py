@@ -280,14 +280,163 @@ def _check_capture_cfg(cfg) -> Check:
     return _c("采集配置", "ok", f"采集 {fps:g}fps / 决策 {hz:g}Hz")
 
 
-# ---------------------------------------------------------------- 汇总
+def _can_import(name: str) -> bool:
+    """模块能不能 import。用 import_module 而不是 find_spec：
+    测试里会往 sys.modules 塞假模块（假串口），find_spec 对没有 __spec__ 的模块会抛。"""
+    import importlib
 
+    try:
+        importlib.import_module(name)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: 后端 → 缺了它**一构造就抛异常**的包（(import 名, 安装名)）。
+#: 不写进这张表的后端：dryrun 不要依赖；rpi5_hidg 依赖的是 /dev/hidg* 设备节点。
+_BACKEND_DEPS: dict[str, tuple[str, str]] = {
+    "rp2040": ("serial", "pyserial"),
+    "pca9685": ("smbus2", "smbus2"),
+}
+
+
+def _check_deps(cfg) -> Check:
+    """后端/采集要的 Python 包在不在。
+
+    这一项刻意**离线也跑**：上真机前最该先查的就是它，而它不需要碰硬件。
+    缺包的表现是 `ModuleNotFoundError: No module named 'serial'` —— 一句没有
+    上下文的话，看不出是"没装"还是"装错了解释器"（真机上两种情况都常见）。
+    """
+    backend = str(getattr(getattr(cfg, "executor", None), "backend", "dryrun"))
+    need = _BACKEND_DEPS.get(backend)
+    if need:
+        mod, pkg = need
+        if not _can_import(mod):
+            return _c(
+                "后端依赖", "fail",
+                f"backend={backend} 需要 {pkg}，当前解释器里没有（import {mod} 失败）",
+                f"pip install {pkg}；装完确认用的是同一个解释器"
+                "（python -c \"import sys;print(sys.executable)\"）")
+    else:
+        need = None
+
+    # 采集：auto 时有 dxcam/mss 任一即可；指定了哪个就要求哪个
+    cap = str(getattr(getattr(cfg, "capture", None), "backend", "auto") or "auto")
+    if cap == "dxcam":
+        ok, detail = _can_import("dxcam"), "指定 dxcam"
+    elif cap == "mss":
+        ok, detail = _can_import("mss"), "指定 mss"
+    else:
+        ok, detail = (_can_import("dxcam") or _can_import("mss")), "backend=auto"
+    if not ok:
+        return _c("采集依赖", "warn",
+                  f"{detail}，但 dxcam / mss 都没装 —— 一帧也采不到（真机上等于瞎子）",
+                  "pip install dxcam（Windows 推荐）或 pip install mss")
+    if need:
+        return _c("后端依赖", "ok", f"backend={backend} 的 {need[1]} 已装")
+    return _c("后端依赖", "ok", f"backend={backend} 不需要额外依赖")
+
+
+def _check_input_scheme(cfg) -> Check:
+    """操作方案自检 —— "程序以为的键位"和"这个游戏实际的键位"是不是一回事。
+
+    为什么这条要放进上机自检：换游戏时最容易发生的不是崩溃，是**静默错位**。
+    程序照旧按 `a` 拾取、按 `d` 交互，而那款游戏里 `a` 是左移 —— 表现是
+    "能动，但一直没捡到东西"，看日志一切正常。这条检查把实际会按的键
+    逐项打出来，对不上时在这里就能看见，不用等一晚上。
+    """
+    scheme = getattr(cfg, "input", None)
+    if scheme is None:
+        return _c("操作方案", "skip",
+                  "没有 input 段，沿用 decision.pickup_key 等扁平字段",
+                  "换游戏时建议写 scheme.yaml（tools/learn_input.py 生成）")
+
+    errs = scheme.errors()
+    if errs:
+        # 正常情况下 load_config 已经抛过了。能走到这里 = 配置是热改的，
+        # 那更要拦住：运行中的进程不会重新加载，界面却可能已经显示新键位。
+        return _c("操作方案", "fail", f"{len(errs)} 处致死冲突：{errs[0].message}",
+                  "改 scheme.yaml 后重启；这类冲突的表现是「每个动作都错但日志全绿」")
+
+    unknown = [r["name"] for r in scheme.capability_table()
+               if r["state"] in ("unknown", "unsupported", "partial", "blocked")]
+    detail = scheme.describe()
+    if unknown:
+        return _c("操作方案", "warn", f"{detail}；未就绪：{'、'.join(unknown)}",
+                  "未就绪的能力不会乱按（宁可不做），但对应玩法也跑不了："
+                  "用 tools/learn_input.py --ask 补齐")
+    return _c("操作方案", "ok", detail)
+
+
+def _check_agent(cfg, pid: str) -> Check:
+    """游戏者知识自检 —— 目标/技能写得对不对、这个游戏现在能不能玩到。
+
+    换游戏时最贵的故障不是报错，是"知识写错了但程序照常跑"：动词名打错一个字、
+    引用了不存在的技能、拾取步骤的完成条件写成"没有 A 框"（人还没走到就算做完了）。
+    这些都不抛异常，表现是"跑了一晚上一件没捡"。所以知识要在上机前编译一遍。
+
+    分档按 `agent.enabled` 决定：知识写错在关着的时候只是提示（它本来就不会跑），
+    开着就是硬伤 —— 开启一个会空转的行为，比不开启更糟。
+    """
+    from .agent import AgentKnowledge, resolve_knowledge_dir
+    from .profile import load_profile
+
+    acfg = getattr(cfg, "agent", None)
+    root = None
+    if pid:
+        try:
+            root = load_profile(pid).root
+        except Exception:  # noqa: BLE001
+            root = None
+    d = resolve_knowledge_dir(acfg, root)
+    try:
+        kn = AgentKnowledge.load(d)
+    except Exception as e:  # noqa: BLE001
+        level = "fail" if getattr(acfg, "enabled", False) else "warn"
+        return _c("游戏者知识", level, f"解析失败：{type(e).__name__}: {e}",
+                  "按报错里指出的字段改；skills.yaml / goals.yaml 都是可手写的 YAML")
+
+    if not kn:
+        return _c("游戏者知识", "skip", f"{d} 里还没有目标/技能",
+                  "加 goals.yaml 与 skills.yaml 就能教它玩；"
+                  "模板见 profiles/_template/agent/")
+
+    from .input import InputScheme
+
+    scheme = getattr(cfg, "input", None)
+    # 没有方案也要查结构性错误（未知动词/条件/引用）—— 那些跟键位无关。
+    # 用一个空方案兜底：它只会把"能力未教"报成缺口，不会掩盖写法错误。
+    issues = kn.lint(scheme if scheme is not None else InputScheme())
+    errs = [i for i in issues if i.level == "error"]
+    blocked = [i for i in issues if i.level == "blocked"]
+
+    if errs:
+        level = "fail" if getattr(acfg, "enabled", False) else "warn"
+        return _c("游戏者知识", level, f"{len(errs)} 处写错：{errs[0].line()}",
+                  "这些错误不会抛异常，只会让它一步都不动（或一直等）—— 先改完再开")
+    if scheme is None:
+        return _c("游戏者知识", "warn",
+                  f"有 {len(kn.skills)} 条技能 / {len(kn.goals)} 个目标，但没有操作方案",
+                  "知识里的动词要靠方案才知道按哪个键 —— 先写 scheme.yaml")
+    if blocked:
+        return _c("游戏者知识", "warn",
+                  f"{kn.summary(scheme)}；缺口：{blocked[0].message}",
+                  "缺的是键位/能力，不是知识写法：用 tools/learn_input.py 补")
+    return _c("游戏者知识", "ok", kn.summary(scheme))
+
+
+# ---------------------------------------------------------------- 汇总
 def run(cfg=None, hub=None, executor=None, profile: str = "", *,
-        allow_io: bool = True, timeout_s: float = 1.5) -> dict:
+        allow_io: bool = True, timeout_s: float = 1.5,
+        build_error: str = "") -> dict:
     """跑全套上机自检。
 
     `cfg` 不传时按运行时同样的方式加载（带 profile）。`hub` 不传就只能查配置侧，
     帧/模式相关的项会报 skip —— 这对应"服务还没启动，先看看配的对不对"。
+
+    `build_error`：命令行路径里 `build_executor` 抛的异常原文。传进来才会被当成
+    **硬伤**报出来 —— 不传的话它会退化成"没有运行中的执行器"，一条 fail 变成一句
+    无害的 skip，而这恰恰是"后端起不来"最容易被看漏的地方。
     """
     from . import doctor
 
@@ -305,6 +454,12 @@ def run(cfg=None, hub=None, executor=None, profile: str = "", *,
 
     cli_ok = False
     if cfg is not None:
+        checks.append(_check_deps(cfg))
+        checks.append(_check_input_scheme(cfg))
+        checks.append(_check_agent(cfg, pid))
+        if build_error:
+            checks.append(_c("执行器构造", "fail", build_error,
+                             "后端起不来，后面的探活/松手都会是空的 —— 先把这条修掉"))
         ex_check, probe = _check_executor(cfg, executor, allow_io=allow_io,
                                           timeout_s=timeout_s)
         checks.append(ex_check)
@@ -401,13 +556,16 @@ def main(argv: list[str] | None = None) -> int:
         path = doctor._config_path()
         cfg = load_config(str(path) if path else None, profile=pid or None)
         ex = None
+        build_error = ""
         try:
             ex = build_executor(cfg.executor)
         except Exception as e:  # noqa: BLE001
-            ex = None
-            cfg_note = e  # noqa: F841
+            # 不吞掉：后端起不来（缺包/串口号错）必须变成一条 fail，
+            # 否则会退化成"没有运行中的执行器，跳过"——看着像"还没启动"。
+            build_error = f"{type(e).__name__}: {e}"
         try:
-            res = run(cfg=cfg, executor=ex, profile=pid, timeout_s=args.timeout)
+            res = run(cfg=cfg, executor=ex, profile=pid, timeout_s=args.timeout,
+                      build_error=build_error)
         finally:
             if ex is not None:
                 try:

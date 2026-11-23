@@ -41,7 +41,13 @@ class _Pca9685Bus:
     """smbus2 直写 PCA9685（50Hz PWM，脉冲=angle/180*（max-min)+min）。"""
 
     def __init__(self, bus_id: int, addr: int, freq_hz: float = 50.0) -> None:
-        from smbus2 import SMBus  # 延迟导入
+        try:
+            from smbus2 import SMBus  # 延迟导入
+        except ImportError as e:
+            raise RuntimeError(
+                f"pca9685 后端需要 smbus2，但当前环境没装（{e}）。"
+                "装：pip install smbus2；并在目标机上确认 /dev/i2c-* 存在且当前用户在 i2c 组。"
+            ) from e
 
         self._bus = SMBus(bus_id)
         self._addr = addr
@@ -85,6 +91,8 @@ class Pca9685Executor(BaseExecutor):
 
     backend_name = "pca9685"
     supports_mouse_move = False  # 机械结构无绝对定位 → 走神/轨迹层自动跳过鼠标噪音
+    # 舵机单次行程 100ms+，吃不下 60ms 级的连按（会变成按住不放 + 磨损）
+    supports_burst = False
 
     def __init__(self, cfg: Any) -> None:
         super().__init__(cfg)

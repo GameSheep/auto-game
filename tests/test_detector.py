@@ -506,3 +506,62 @@ def test_character_track_can_be_disabled():
         frame = rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8)
         st = det.process(frame, 1000 + i * 120)
     assert st.character == (640, 360), "关掉 character_track 后必须回到屏幕中心"
+
+
+# ---------------------------------------------------------------- 真光柱（不是模拟器那种）
+
+def _draw_ingame_pillar(frame, sx, sy, w=4, h=120, core=1,
+                        hue=25, sat=95, val=150):
+    """按**真实游戏**的样子画光柱：暗背景上半透明的淡金 + 白热芯。
+
+    参数取真实帧实测值（S≈70~120 / V≈120~170），而不是模拟器的 (36,190,255)
+    —— 后者 S=218/V=255，是当初阈值被调错的原因。
+    """
+    import cv2
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    y0 = sy - h
+    hsv[y0:sy, sx - w // 2 : sx - w // 2 + w] = (hue, sat, val)
+    if core:
+        hsv[y0:sy, sx - core // 2 : sx - core // 2 + core] = (hue, 30, 235)
+    frame[:] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+
+def test_ingame_thin_pillar_is_detected():
+    """3~6px 宽的真光柱必须能检出。
+
+    这是曾经"真光柱一根都看不见"的根因：只按饱和度取金边 → 白芯（S 很低）
+    把 4px 的光柱劈成左右各 1px 的两条碎边 → 被 min_width / 高宽比逐个筛掉。
+    结果只有 14px 粗的模拟器光柱能过。
+    """
+    for w, core in ((3, 1), (4, 1), (6, 2), (8, 3)):
+        cfg = VisionConfig()
+        det = Detector(cfg)
+        frame = _empty_frame()
+        _draw_ingame_pillar(frame, 640, 500, w=w, h=120, core=core)
+        state = process2(det, frame)
+        assert len(state.pillars) == 1, f"{w}px 宽的真光柱漏检了"
+        assert state.pillars[0].color == "gold"
+
+
+def test_pure_white_streak_is_not_a_pillar():
+    """纯白竖条不是光柱 —— 真光柱是"淡金边 + 白热芯"，必须有彩色成分。
+
+    （技能特效、白色文字、UI 分隔线都长这样，只靠白芯判据挡不住。）
+    """
+    cfg = VisionConfig()
+    det = Detector(cfg)
+    frame = _empty_frame()
+    _draw_ingame_pillar(frame, 640, 500, w=6, h=120, core=6, hue=0, sat=10, val=235)
+    state = process2(det, frame)
+    assert state.pillars == []
+
+
+def test_short_gold_fragment_is_not_a_pillar():
+    """19px 高的黄色碎片不是光柱（真实帧上实测会误报两次）。"""
+    cfg = VisionConfig()
+    det = Detector(cfg)
+    frame = _empty_frame()
+    _draw_ingame_pillar(frame, 640, 500, w=5, h=19, core=1)
+    state = process2(det, frame)
+    assert state.pillars == []

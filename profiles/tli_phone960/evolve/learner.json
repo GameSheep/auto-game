@@ -1,9 +1,16 @@
 {
   "enabled": null,
-  "last_ts": 1795062781.60819,
-  "last_digest": "69fffb8e1c13",
-  "last_result": "promoted",
-  "last_message": "通过 3 → 3（持平）",
+  "last_ts": 1795431153.7533877,
+  "last_digest": "9eddf87f6e43",
+  "last_result": "rejected",
+  "last_message": "通过数从 3 跌到 1，不上线",
   "last_source": "auto",
-  "tries": {}
+  "tries": {
+    "9eddf87f6e43": {
+      "ts": 1795431153.7533877,
+      "result": "rejected",
+      "n": 1,
+      "message": "通过数从 3 跌到 1，不上线"
+    }
+  }
 }

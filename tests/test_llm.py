@@ -104,7 +104,10 @@ def test_fsm_triggers_llm_after_consecutive_abandons():
         eng._blacklist.clear()
         eng.on_scene(_scene(45000))
         eng.on_scene(_scene(75000))   # 超时 → 放弃2 → 触发咨询
-        deadline = time.monotonic() + 5
+        # 等待上限必须**大于**客户端超时：`LLMConfig.timeout_s` 默认 8s，
+        # 原来这里硬等 5s —— 全量测试把 CPU 压降频时，咨询还没回来就被判死，
+        # 于是这条用例"偶尔"红。测的是"会不会触发咨询"，不是"多快触发"。
+        deadline = time.monotonic() + llm.timeout_s + 5
         while time.monotonic() < deadline:
             if any(e["event"] == "llm_advice" for e in eng.events):
                 break
@@ -127,7 +130,10 @@ def test_fsm_wait_advice_extends_cooldown():
         eng.start()
         eng.on_scene(_scene(1000))
         eng.on_scene(_scene(11000))   # 一次放弃即触发
-        deadline = time.monotonic() + 5
+        # 等待上限必须**大于**客户端超时：`LLMConfig.timeout_s` 默认 8s，
+        # 原来这里硬等 5s —— 全量测试把 CPU 压降频时，咨询还没回来就被判死，
+        # 于是这条用例"偶尔"红。测的是"会不会触发咨询"，不是"多快触发"。
+        deadline = time.monotonic() + llm.timeout_s + 5
         while time.monotonic() < deadline:
             if eng.advisor.last_advice:
                 break

@@ -312,3 +312,49 @@ def test_rp2040_abs_scale_covers_the_whole_screen(monkeypatch):
     # （32767/2 * w/(w-1)），差几十个单位在 1920 宽上只有零点几个像素。
     cx, cy = ex._to_abs(960, 540)
     assert abs(cx - 16384) <= 16 and abs(cy - 16384) <= 16
+
+
+# ---------------- 右键：技能槽第 5 格就是它（以前从没被走过） ----------------
+
+def test_hidg_right_click_presses_the_right_button_bit(monkeypatch, tmp_path):
+    """技能槽第 5 格标的是 `A`，但它是**鼠标右键**（用户确认的原始绑定）。
+
+    右键这条路以前一次都没被发过 —— 左键一直是唯一的调用方。
+    真机上第一次按右键就会暴露这条路径，所以先在报文层面钉住：
+    右键 = `0x02`，且抬起必须是 `0x00`（否则右键会"卡住不松"，进游戏就是
+    镜头的持续右键行为，比按键错误更难查）。
+    """
+    kb, ms = _FakeHidg(), _FakeHidg()
+
+    def fake_open(path, *a, **k):  # noqa: ARG001
+        return kb if "hidg0" in str(path) else ms
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    cfg = ExecutorConfig(backend="rpi5_hidg", hidg_keyboard=str(tmp_path / "hidg0"),
+                         hidg_mouse=str(tmp_path / "hidg1"))
+    ex = RPi5HidgExecutor(cfg)
+
+    ex.execute(Command(op="mouse_click", button="right", x=960, y=540))
+    assert len(ms.written) == 3, "点击 = 移动 + 按下 + 抬起"
+    down, up = ms.written[1], ms.written[2]
+    assert down[0] == 0x02, f"右键按下应是 0x02，实际 {down[0]:#04x}"
+    assert up[0] == 0x00, "抬起必须清掉按键位（否则右键卡住）"
+    ex.close()
+
+
+def test_rp2040_forwards_button_field_verbatim(fake_serial_module):  # noqa: ARG001
+    """串口帧里 `button` 必须原样带上 —— 固件按 `"right"` 决定 0x02。
+
+    丢了这个字段，固件会走默认分支按左键：技能放不出来，而日志里一切正常。
+    """
+    from autogame.executor import RP2040Executor
+
+    cfg = ExecutorConfig(backend="rp2040", serial_port="FAKE", serial_baud=115200,
+                         min_action_interval_ms=0, max_actions_per_sec=1000)
+    ex = RP2040Executor(cfg)
+    ex.execute(Command(op="mouse_click", button="right", x=640, y=360))
+
+    clicks = [json.loads(ln) for ln in ex._ser.lines if "mouse_click" in ln]
+    assert clicks, f"没有发出点击帧：{ex._ser.lines}"
+    assert clicks[0]["button"] == "right"
+    ex.close()

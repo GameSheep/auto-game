@@ -1,0 +1,15 @@
+id: gen-003
+status: rejected
+parent: gen-002
+created: 1795431153.0009384
+digest: 9eddf87f6e43
+score:
+  strict_pass: 1
+  strict_total: 3
+  ratio: 0.3333
+  fail:
+  - refs/tli_combat_01.jpg
+  - refs/tli_combat_02.jpg
+rules_source: none
+note: 手册 11 条声明 / 1 份文件；模型不可用或输出不是 JSON：[WinError 10061] 由于目标计算机积极拒绝，无法连接。；通过数从 3
+  跌到 1，不上线

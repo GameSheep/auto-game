@@ -665,10 +665,26 @@ class Detector:
     ) -> list[Pillar]:
         out: list[Pillar] = []
         acfg = self.cfg.aframe
+        # 白芯掩码与颜色无关，整帧算一次（下面每种颜色复用它做合成 + 成分校验）
+        core_mask: np.ndarray | None = None
+        if self.cfg.require_white_core:
+            core_mask = (((hsv[:, :, 1] <= self.cfg.white_core_s_max)
+                          & (hsv[:, :, 2] >= self.cfg.white_core_v_min))
+                         .astype(np.uint8) * 255)
         for color_name, (lo, hi) in self.cfg.hsv.items():
             lo_a = np.array(lo, dtype=np.uint8)
             hi_a = np.array(hi, dtype=np.uint8)
-            mask = cv2.inRange(hsv, lo_a, hi_a)
+            color_mask = cv2.inRange(hsv, lo_a, hi_a)
+            # **金边和白芯必须合成一条再找轮廓。**
+            # 以前只按饱和度取金边，白芯（S 很低）就被挖掉了：一根 4px 宽的真光柱
+            # 会裂成左右各 1px 的两条碎边，然后被 min_width / 高宽比逐个筛掉。
+            # 结果是"只有 ≥14px 粗的光柱能检出"—— 而那是模拟器画的，
+            # 真游戏的光柱只有 3~6px。合成之后再用下面的"成分校验"防误报：
+            # 必须有白芯（否则是纯色特效/UI），也必须有彩色边（否则是纯白特效/文字）。
+            if core_mask is not None:
+                mask = cv2.bitwise_or(color_mask, core_mask)
+            else:
+                mask = color_mask
             # 形态学去噪：开运算去掉孤立噪点，闭运算连接光柱断条
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -682,19 +698,23 @@ class Detector:
                 x, y, w, h = cv2.boundingRect(c)
                 if w <= 0:
                     continue
+                # 高度过滤：光柱是"柱"。19~44px 高的黄色碎片在真实帧上实测会误报
+                if h < self.cfg.pillar_min_height:
+                    continue
                 # 宽度过滤：光柱是窄条；排除 A框边缘细条与大面积色块
                 if w < self.cfg.pillar_min_width or w > self.cfg.pillar_max_width:
                     continue
                 aspect = h / w
                 if aspect < self.cfg.pillar_min_aspect or aspect > self.cfg.pillar_max_aspect:
                     continue
-                # 白芯校验：真实掉落光柱有白热芯（低饱和高亮），Boss/技能特效是纯饱和色
-                if self.cfg.require_white_core:
-                    roi = work[y : y + h, x : x + w]
-                    hsv_roi = hsv[y : y + h, x : x + w]
-                    core = ((hsv_roi[:, :, 1] <= self.cfg.white_core_s_max)
-                            & (hsv_roi[:, :, 2] >= self.cfg.white_core_v_min))
-                    if float(core.mean()) < self.cfg.white_core_min_ratio:
+                # 成分校验：白芯（抗纯色特效）+ 彩色边（抗纯白特效/文字）
+                if core_mask is not None:
+                    y2, x2 = min(y + h, hsv.shape[0]), min(x + w, hsv.shape[1])
+                    core = core_mask[y:y2, x:x2]
+                    if float(core.mean()) / 255.0 < self.cfg.white_core_min_ratio:
+                        continue
+                    tint = color_mask[y:y2, x:x2] > 0
+                    if float(tint.mean()) < self.cfg.white_core_color_min_ratio:
                         continue
                 cx, cy = x + w // 2, y + h // 2
                 bx = int((x + w / 2) / scale)

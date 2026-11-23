@@ -399,3 +399,59 @@ def test_real_profile_tutorial_matches_program():
     assert not res.failures, "\n".join(
         f"{c['title']}: {c['detail']}（{c['evidence']}）" for c in res.failures)
     assert res.glossary, "术语表不能是空的"
+
+
+
+# ---------------- 键位：技能栏那个 A 是鼠标右键 ----------------
+
+_KEYS_MD = """# 键位
+
+## 键位
+
+- 拾取: A
+- 交互: D
+- 技能: Q / W / E / R / 鼠标右键
+"""
+
+
+def test_pickup_a_is_keyboard_a_not_the_skill_slot(tmp_path, prof):
+    """`拾取: A` 必须核成**一致** —— 技能栏第 5 格那个 `A` 是鼠标右键，不是键盘 A。
+
+    这条以前错过：看到真实截图技能栏标着 `A`，就怀疑"pickup_key 定错了，
+    每次拾取都在放技能"。实际那一格是**鼠标右键**，键盘 A 只用于拾取。
+    钉住它，是为了别有人再"顺手改对"成错的。
+    """
+    p = tmp_path / "keys.md"
+    p.write_text(_KEYS_MD, encoding="utf-8")
+    rows = check_claims([parse_lessons(p)], prof, AppConfig(), probe=_probe_stub({}))
+    by = {r["title"]: r for r in rows if r["kind"] == KIND_KEY}
+
+    assert by["拾取"]["status"] == "ok", by["拾取"]
+    assert by["交互"]["status"] == "ok", by["交互"]
+
+
+def test_skills_are_checked_against_input_scheme(tmp_path, prof):
+    """手册的技能键现在能真核对（以前只能报「没有配置项」）。
+
+    方案的 `all_skills()` = 主攻 + 技能栏，正好对应手册里
+    「Q / W / E / R / 鼠标右键」这 5 个 —— 集合相等才算一致。
+    """
+    from autogame.input import preset
+
+    p = tmp_path / "keys.md"
+    p.write_text(_KEYS_MD, encoding="utf-8")
+    cfg = AppConfig(input=preset("tli_pc"))
+    rows = check_claims([parse_lessons(p)], prof, cfg, probe=_probe_stub({}))
+    by = {r["title"]: r for r in rows if r["kind"] == KIND_KEY}
+    assert by["技能"]["status"] == "ok", by["技能"]
+    assert "5 个" in by["技能"]["detail"]
+
+
+def test_skills_gap_when_no_scheme(tmp_path, prof):
+    """没有方案时：手册写了技能键，但程序没地方放 —— 仍然报缺料，不许假装已实现。"""
+    p = tmp_path / "keys.md"
+    p.write_text(_KEYS_MD, encoding="utf-8")
+    rows = check_claims([parse_lessons(p)], prof, AppConfig(), probe=_probe_stub({}))
+    by = {r["title"]: r for r in rows if r["kind"] == KIND_KEY}
+    assert by["技能"]["status"] == "gap", by["技能"]
+    assert "操作方案" in by["技能"]["detail"]

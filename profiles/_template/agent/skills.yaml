@@ -1,0 +1,88 @@
+# 新游戏的技能骨架 —— 复制到 profiles/<你的游戏>/agent/ 里改
+#
+# 一条技能 = 几步 + 每步做到什么算完。动作（verb）只有这八个：
+#
+#   move_to     走到目标         需要：有目标（选择器见下）
+#   roam        没目标时走一段（探索）
+#   attack      主攻打（鼠标点目标 / 键连按）
+#   pickup      捡 A 框指的东西  需要：目标 + A 框（三道闸写死在动词里，改不了）
+#   interact    对目标交互（开箱/进门/NPC）  需要：目标
+#   open_panel  打开面板（关卡/背包）—— 无目标按键，必须写 when
+#   use_skill   放技能           需要：slot（技能 id 或键名）
+#   cancel      返回/关面板
+#   wait        等（不按键）
+#
+# 目标选择器：nearest_pillar / nearest_monster / item / label / aframe / point
+# 完成条件（until）：
+#   after_action（做一次就完，默认）/ near_target / target_gone / no_monsters /
+#   in_game / out_of_game / aframe / no_targets / ...
+#
+# 两个最容易写错的地方（lint 会报）：
+#   1. 拾取的 until 写 `not_aframe` —— 人还没走到时"没有 A 框"也成立，这步会被直接跳过
+#      → 用 target_gone：那个目标消失了才算捡到
+#   2. pickup 前面没有 move_to —— 站在远处按 A 什么也捡不到，而日志一切正常
+
+skills:
+  - id: pick_one
+    name: 捡一个东西
+    when: target
+    steps:
+      - verb: move_to
+        target: nearest_pillar
+        until: near_target
+        max_seconds: 12
+      - verb: pickup
+        until: target_gone
+        max_seconds: 4
+    success: target_gone
+    max_seconds: 20
+
+  - id: pop_skills
+    name: 蓝够就把技能倒出来（边打边放）
+    when: monsters
+    # repeat = 整套步骤最多来几轮；until = 满足就提前收手。
+    # 两个都要写：只写 repeat 会把轮数跑满（怪早清完了还在放），
+    # 只写 until 就没上限（技能一直没效果时会按一整晚）。
+    repeat: 3
+    until: no_monsters
+    steps:
+      - verb: use_skill
+        slot: q            # 换成 scheme.yaml 里这个技能的 id
+        when: cue
+        cue: mana_ok       # ← cues.yaml 里那条「蓝够不够」
+        every_s: 0.4
+        note: 判据不成立就跳过这一步，不会按空 —— 这就是「什么时候放」被教出来的样子
+    success: no_monsters
+    max_seconds: 30
+
+  - id: drink_potion
+    name: 血低了喝药
+    when: monsters
+    steps:
+      - verb: use_skill
+        slot: potion       # 换成方案里药水那个键
+        when: cue
+        cue: hp_low        # ← cues.yaml 里那条「血低于三成」
+        every_s: 1.0
+    success: always
+    max_seconds: 5
+
+  - id: look_around
+    name: 没有目标就找路
+    when: no_targets
+    steps:
+      - verb: roam
+        until: target
+        max_seconds: 12
+    success: target
+    max_seconds: 15
+
+  - id: back_out
+    name: 关掉面板/异常界面
+    when: out_of_game
+    steps:
+      - verb: cancel
+        until: in_game
+        max_seconds: 3
+    success: in_game
+    max_seconds: 5

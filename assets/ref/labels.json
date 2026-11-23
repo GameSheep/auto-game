@@ -1,76 +1,105 @@
 {
-  "version": 1,
-  "updated": "2026-11-17",
-  "howto": [
-    "这张表是『人工标定过的正确答案』，用来验证检测器/FSM，而不是检测器自己生成的答案。",
-    "加一帧：把截图放进 assets/ref/，在 items 里加一条，file 写仓库相对路径，expect 只写你能确定的字段（其余用 null 表示不检查）。",
-    "strict=true 表示这一条必须完全对上（回归门槛，CI 会跑 tools/ref_check.py）；strict=false 表示这是已知缺口，先记下来、打印差异但不拦。",
-    "字段含义：in_game=是否战斗界面；pillars=掉落光柱个数；aframe=是否有拾取 A 框；ground_labels=地面掉落文字标签数；monsters=可打怪数；commands=两个决策节拍内产生的指令条数。"
-  ],
-  "items": [
-    {
-      "file": "assets/ref/tli_nether_map_01.jpg",
-      "game": "火炬之光：无限（手机端录屏）",
-      "scene": "异界 · 关卡选择（星图）",
-      "resolution": [960, 432],
-      "strict": true,
-      "expect": {
-        "in_game": false,
-        "pillars": 0,
-        "aframe": false,
-        "ground_labels": 0,
-        "monsters": 0,
-        "commands": 0
-      },
-      "note": "整屏关卡选择界面：左上『‹ 异界』返回箭头 + 标题，画面上是 7 个带名字的发光地图节点（蛮荒之焰/钢铁炼境/雷鸣废土/混沌终末/伟大虚空/冰封寒渊/幽冥暗域），**没有任何掉落光柱**。用户实测曾把它判成战斗，还给出『向右下移动接近 auto2 掉落光柱（距离 237px）』——错到离谱。现在由反例模板 templates/neg_tli_nether_map.png 拦下。"
-    },
-    {
-      "file": "assets/samples/real_hud_boss.png",
-      "game": "暗黑类 ARPG（PC 端，带完整 HUD）",
-      "scene": "主线 Boss 战",
-      "resolution": [1280, 720],
-      "strict": true,
-      "expect": {
-        "in_game": true,
-        "pillars": 0,
-        "aframe": false,
-        "monsters": 0
-      },
-      "note": "技能栏模板命中 + 红血球锚点。战斗但当前没有掉落物，所以光柱必须是 0（光照特效/Boss 触手不许算成光柱）。"
-    },
-    {
-      "file": "assets/ref/d4_charpanel_01.jpg",
-      "game": "暗黑4（PC 端录屏）",
-      "scene": "战斗画面中打开角色/装备面板（右半屏被面板挡住）",
-      "resolution": [960, 540],
-      "strict": true,
-      "expect": {
-        "in_game": false,
-        "commands": 0
-      },
-      "note": "最危险的一类：左下血球、底部技能栏都还在，但右半屏已经是面板——此时点击会打在面板上（换装/洗点/卖装备）。由反例模板 templates/neg_d4_charpanel.png（面板顶部标签条，命中 0.96、普通战斗帧 ≤0.38）拦下。"
-    },
-    {
-      "file": "assets/ref/tli_combat_01.jpg",
-      "game": "火炬之光：无限（手机端录屏）",
-      "scene": "战斗 · 异界深处（技能轮盘 + 摇杆）",
-      "resolution": [960, 432],
-      "strict": false,
-      "expect": {
-        "in_game": true
-      },
-      "note": "已知缺口：手机端 960x432 的 HUD 没有任何随仓库分发的正向模板能命中（暗黑4 的技能栏模板在这个分辨率只有 0.25）。场景门 fail-closed 会把它拦下。要放行必须用 tools/make_template.py 从这块画面裁一个 skillbar_tli_*.png（建议裁右下技能轮盘外圈这类位置固定、不受技能特效影响的部件）。"
-    },
-    {
-      "file": "assets/ref/tli_combat_02.jpg",
-      "game": "火炬之光：无限（手机端录屏）",
-      "scene": "战斗 · Boss 光环 + 满屏技能特效",
-      "resolution": [960, 432],
-      "strict": false,
-      "expect": {
-        "in_game": true
-      },
-      "note": "同上（未标定）。另外这一帧是『技能特效当光柱』的压力样本：粉色环形光环如果被确认为光柱，就是误报。"
-    }
-  ]
+ "version": 1,
+ "updated": "2026-11-23",
+ "howto": [
+  "这张表是『人工标定过的正确答案』，用来验证检测器/FSM，而不是检测器自己生成的答案。",
+  "加一帧：把截图放进 assets/ref/，在 items 里加一条，file 写仓库相对路径，expect 只写你能确定的字段（其余用 null 表示不检查）。",
+  "strict=true 表示这一条必须完全对上（回归门槛，CI 会跑 tools/ref_check.py）；strict=false 表示这是已知缺口，先记下来、打印差异但不拦。",
+  "字段含义：in_game=是否战斗界面；pillars=掉落光柱个数；aframe=是否有拾取 A 框；ground_labels=地面掉落文字标签数；monsters=可打怪数；commands=两个决策节拍内产生的指令条数。"
+ ],
+ "items": [
+  {
+   "file": "assets/ref/tli_nether_map_01.jpg",
+   "game": "火炬之光：无限（手机端录屏）",
+   "scene": "异界 · 关卡选择（星图）",
+   "resolution": [
+    960,
+    432
+   ],
+   "strict": true,
+   "expect": {
+    "in_game": false,
+    "pillars": 0,
+    "aframe": false,
+    "ground_labels": 0,
+    "monsters": 0,
+    "commands": 0
+   },
+   "note": "整屏关卡选择界面：左上『‹ 异界』返回箭头 + 标题，画面上是 7 个带名字的发光地图节点（蛮荒之焰/钢铁炼境/雷鸣废土/混沌终末/伟大虚空/冰封寒渊/幽冥暗域），**没有任何掉落光柱**。用户实测曾把它判成战斗，还给出『向右下移动接近 auto2 掉落光柱（距离 237px）』——错到离谱。现在由反例模板 templates/neg_tli_nether_map.png 拦下。"
+  },
+  {
+   "file": "assets/samples/real_hud_boss.png",
+   "game": "暗黑类 ARPG（PC 端，带完整 HUD）",
+   "scene": "主线 Boss 战",
+   "resolution": [
+    1280,
+    720
+   ],
+   "strict": true,
+   "expect": {
+    "in_game": true,
+    "pillars": 0,
+    "aframe": false,
+    "monsters": 0
+   },
+   "note": "技能栏模板命中 + 红血球锚点。战斗但当前没有掉落物，所以光柱必须是 0（光照特效/Boss 触手不许算成光柱）。"
+  },
+  {
+   "file": "assets/ref/d4_charpanel_01.jpg",
+   "game": "暗黑4（PC 端录屏）",
+   "scene": "战斗画面中打开角色/装备面板（右半屏被面板挡住）",
+   "resolution": [
+    960,
+    540
+   ],
+   "strict": true,
+   "expect": {
+    "in_game": false,
+    "commands": 0
+   },
+   "note": "最危险的一类：左下血球、底部技能栏都还在，但右半屏已经是面板——此时点击会打在面板上（换装/洗点/卖装备）。由反例模板 templates/neg_d4_charpanel.png（面板顶部标签条，命中 0.96、普通战斗帧 ≤0.38）拦下。"
+  },
+  {
+   "file": "assets/ref/tli_combat_01.jpg",
+   "game": "火炬之光：无限（手机端录屏）",
+   "scene": "战斗 · 异界深处（技能轮盘 + 摇杆）",
+   "resolution": [
+    960,
+    432
+   ],
+   "strict": false,
+   "expect": {
+    "in_game": true
+   },
+   "note": "已知缺口：手机端 960x432 的 HUD 没有任何随仓库分发的正向模板能命中（暗黑4 的技能栏模板在这个分辨率只有 0.25）。场景门 fail-closed 会把它拦下。要放行必须用 tools/make_template.py 从这块画面裁一个 skillbar_tli_*.png（建议裁右下技能轮盘外圈这类位置固定、不受技能特效影响的部件）。"
+  },
+  {
+   "file": "assets/ref/tli_combat_02.jpg",
+   "game": "火炬之光：无限（手机端录屏）",
+   "scene": "战斗 · Boss 光环 + 满屏技能特效",
+   "resolution": [
+    960,
+    432
+   ],
+   "strict": false,
+   "expect": {
+    "in_game": true
+   },
+   "note": "同上（未标定）。另外这一帧是『技能特效当光柱』的压力样本：粉色环形光环如果被确认为光柱，就是误报。"
+  },
+  {
+   "file": "assets/samples/real_darkmap_farm.png",
+   "game": "火炬之光：无限（PC 端实录）",
+   "scene": "暗色地图 · 地面掉落光柱（真光柱标定样本）",
+   "resolution": [
+    1280,
+    720
+   ],
+   "strict": true,
+   "expect": {
+    "pillars": 2
+   },
+   "note": "**这张图是『真光柱』的标定基准，别再拿模拟器当基准。** 画面里两根竖直金色光柱（本帧检出的 48x172 和 26x97）都是真的掉落光柱；满地黄色伤害数字、绿色血条、白色技能线都是干扰。原来阈值按模拟器调（S>=120/V>=180，模拟器画的是 S=218 实心条），这张图检出 0 —— 于是『游戏没有光柱』的结论被写进了配置。现在阈值来自本图实测（S>=70/V>=120），并且细柱要先与白芯合成再找轮廓（否则 3~6px 的真柱会被白芯劈成两条碎边筛掉）。"
+  }
+ ]
 }

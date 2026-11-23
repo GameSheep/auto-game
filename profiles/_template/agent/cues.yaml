@@ -1,0 +1,79 @@
+# 判据（cues）—— 画面里「现在该按吗」的证据
+#
+# 为什么单独一个文件：`SceneState` 里只有光柱/怪/A 框这些「引擎认识的」东西，
+# 而「蓝够不够」「技能好了没」「脚下有没有可交互的东西」每款游戏都不一样。
+# 把这些做成协议字段，协议就变成某一款游戏的形状；做成判据，就变成可教的知识。
+#
+# 一条判据 = 一块区域 + 一种读法 + 一个阈值
+#
+#   region   归一化 [x1,y1,x2,y2]，0..1（和坐标归一化同一条规矩，换分辨率不用重标）
+#   kind     ratio     区域里「像这个颜色」的像素占比（血条/蓝条/光柱/按钮）
+#            bright    区域平均亮度（黑屏/加载遮罩/面板变暗）
+#            template  模板匹配最高分（图标/按钮/提示位）—— 阈值就是 min_score
+#   above    读数 ≥ 它 → 成立
+#   below    读数 ≤ 它 → 成立（两个都写 = 落在区间里才算成立）
+#
+# 阈值不要手填。手填的数字没人验证得动，而且过两周就忘了当时凭什么填的：
+#
+#   # 不知道颜色：先把区域里的主要颜色列出来
+#   py tools/learn_cue.py --profile <游戏> --image 截图.png --region 0.03,0.88,0.19,0.906
+#
+#   # 给「成立 / 不成立」两张截图，它取中间值并写进 cues.yaml
+#   py tools/learn_cue.py --profile <游戏> --id mana_ok --name "蓝量够" \
+#       --region 0.03,0.88,0.19,0.906 --color "#2a6bd4" \
+#       --on-img 蓝满.png --off-img 蓝空.png --write
+#
+#   # 模板类：直接从截图裁一块当模板
+#   py tools/learn_cue.py --profile <游戏> --id chest_hint --kind template \
+#       --region 0.35,0.55,0.65,0.80 --crop 520,430,620,470 --write
+#
+# 怎么用（写在 skills.yaml 的步骤上）：
+#
+#   - verb: use_skill
+#     slot: fireball
+#     when: cue
+#     cue: mana_ok          # ← 指向下面某一条的 id
+#
+# 三条经验：
+#   1. 区域别框太大。整屏算占比，任何一个特效都会把读数带跑。
+#   2. 只框确定属于这个状态的部分（蓝条的填充段，别把空槽和边框框进去）。
+#   3. 阈值宁可偏保守：判据说「不够」只是少按一次；判据说「够」会在没蓝时按下去，
+#      而那正是「看起来在打、实际没伤害」的来源。
+
+cues:
+  - id: mana_ok
+    name: 蓝量够放技能
+    kind: ratio
+    region: [0.03, 0.88, 0.12, 0.906]
+    color: "#2a6bd4"
+    above: 0.5
+    note: 只量左半条 —— 整条含空槽时，蓝空了也还剩三成读数
+
+  - id: hp_low
+    name: 血低于三成
+    kind: ratio
+    region: [0.03, 0.848, 0.19, 0.874]
+    color: "#d03a2a"
+    below: 0.3
+    note: 掉了才喝药；写成 above 就变成「血多才喝」，方向别反
+
+# 光柱类也常用（`looting`），但这一条和「有没有目标」容易被混着用 —— 光柱是
+# 「地上有东西」，目标存在是「引擎认出它是可拾取的」。要写就用 it 自己的阈值：
+#
+#  - id: looting
+#    name: 地上有光柱
+#    kind: ratio
+#    region: [0.05, 0.30, 0.95, 0.92]
+#    color: "#24beff"
+#    above: 0.004
+#    note: 光柱很细，阈值在千分位；别拿它当「有没有怪」用
+
+# 模板类示例（要先把模板图裁出来，否则这条判据读不出来 —— lint 会报错）：
+#
+#  - id: chest_hint
+#    name: 交互提示（可开箱）
+#    kind: template
+#    region: [0.35, 0.55, 0.65, 0.80]
+#    template: tpl_chest_hint.png
+#    min_score: 0.72
+#    note: 模板用 --crop 从截图裁；阈值就是 min_score，不用再写 above

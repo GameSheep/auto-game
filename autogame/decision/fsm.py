@@ -130,6 +130,12 @@ class DecisionEngine:
         self.monitor = ProgressMonitor(cfg.autonomy)
         # 拟人化：疲劳/反应时间/走神/社交（只调时序与噪音，不改动作语义）
         self.human = Humanizer(cfg.humanize, pickup_key=cfg.pickup_key)
+        # 连按白名单之外还必须排掉功能键：拾取键连按 = 多次盲按的机会，
+        # 交互键连按 = 多次开面板/走传送门的机会（更糟，会离开当前地图）。
+        # 由运行时注入而不是写进配置，是因为配置会被"临时加个键"改掉。
+        set_forbid = getattr(self.exec, "set_burst_forbid", None)
+        if callable(set_forbid):
+            set_forbid([cfg.pickup_key, cfg.interact_key, cfg.autonomy.escape_key])
         self.vlm = vlm or VisionAdvisor(cfg.vlm)
         self.frame_source: Callable[[], bytes | None] | None = None
         self.vlm.frame_source = self._current_frame
@@ -146,7 +152,9 @@ class DecisionEngine:
         self._arbiter_paused_until = 0.0
         self.recovery = RecoveryLadder(
             cfg.autonomy, self.vlm, self.advisor,
-            forbidden_keys={cfg.pickup_key},  # 铁律：恢复动作永不按拾取键
+            # 铁律：恢复动作永不按功能键。脱困时按 D 可能直接开出路关卡面板/传送门，
+            # 那时人还在原地卡着，画面却已经换了地图 —— 比卡住更难查。
+            forbidden_keys={cfg.pickup_key, cfg.interact_key},
         )
         self._recovery_reason = ""
         self._recovery_picks = 0
@@ -180,6 +188,8 @@ class DecisionEngine:
         self.last_intent: str = ""
         self._explore_i: int = 0
         self._last_explore_ms: int = 0
+        #: 下一次探索的最小间隔（毫秒）。每抽一次就重算，避免固定节拍。
+        self._next_explore_ms: int = 0
         # 探索扇区计数（8 × 45°）：优先去"去得最少"的扇区，落点带角度/距离抖动。
         # 之前是 4 个方向 × 固定 220px —— 真实回放 232 条命令里 154 条就是
         # 那 4 个固定坐标，一眼能看出是脚本。
@@ -189,10 +199,17 @@ class DecisionEngine:
         self._target: Pillar | None = None
         self._target_started: float = 0.0
         self._last_click_ts: float = 0.0
+        #: 上一次动作因亚帧打散而延后的秒数（顺延到下一拍，避免间隔被压短）
+        self._desync_debt: float = 0.0
         self._aframe_first_seen_ms: int | None = None
         self._reaction_ms: int = AFRAME_CONFIRM_MS  # 本目标的反应时间（看到A框→按下）
         self._aframe_seen_frames: int = 0           # 本目标 A框连续出现帧数（防按空）
         self._aframe_dist0: float = 0.0             # A框首次出现时的距离（判断"在靠近还是远离"）
+        # 停步标记：发停步指令那一帧的时间戳。只有**晚于它**的帧才算"已停稳"的证据 ——
+        # 帧是过去的信息，用发停步之前拍的帧去按键，等于拿旧位置当新位置。
+        self._stop_sent_ms: int | None = None
+        # 上一次决策用的帧时间戳：同一帧被重复喂进来时不能再决策一次
+        self._last_scene_ts: int | None = None
         self._taps_this_target: int = 0
         self._stuck_ticks: int = 0
         self._alt_direction_tried: bool = False
@@ -269,6 +286,29 @@ class DecisionEngine:
         """
         if self.state in (State.PAUSED, State.PANIC):
             return
+
+        # ① 同一帧只决策一次。重复决策不会带来任何新信息，却会把"连续确认帧"
+        # 刷成 seen=2,3,4 —— 于是几秒前那一帧的 A 框被当成"现在还在提示"，
+        # 按下去就是盲按（真实事故：按键时帧年龄 4.6~5.2s）。
+        ts = int(scene.ts_ms)
+        if ts == self._last_scene_ts:
+            self.stats["duplicate_frames"] = self.stats.get("duplicate_frames", 0) + 1
+            return
+        self._last_scene_ts = ts
+
+        # ② 帧时效闸门：这是"绝不盲按"的时间维度。A 框是**过去某一帧**的证据，
+        # 帧越旧，按下去越可能已经走出拾取半径。机器被抢占/队列积压时，
+        # 画面看起来一切正常，实际是几秒前的世界。
+        max_age = int(getattr(self.cfg, "max_frame_age_ms", 0) or 0)
+        age_ms = float(getattr(scene, "age_ms", 0.0) or 0.0)
+        if max_age and age_ms > max_age:
+            self.stats["stale_frames"] = self.stats.get("stale_frames", 0) + 1
+            if self._target is not None:
+                self._drop_target("stale_frame")
+            self._intent(f"帧已过期（{age_ms / 1000:.1f}s > {max_age / 1000:.1f}s）"
+                         f"—— 这一帧不做任何决定")
+            return
+
         now = self._frame_time(scene.ts_ms)
         self._now = now
         self._scene = scene
@@ -702,6 +742,8 @@ class DecisionEngine:
         ctx = {
             "character": scene.character,
             "approach_mode": self.cfg.approach_mode,
+            # 走位用哪个鼠标键：恢复阶梯的探路/侧移也是走位，键要一致
+            "move_button": getattr(self.cfg, "move_button", "left"),
             "state": self.state.value,
             "signals": signals.as_dict(),
             "stats": dict(self.stats),
@@ -715,12 +757,22 @@ class DecisionEngine:
             self._blacklist.clear()
             self._explore_i = 0
             self._last_explore_ms = 0
+            self._next_explore_ms = 0
 
         # 门禁闸门：非战斗界面（星图/背包/过场）只允许"脱困键"，不许点击走位。
         # 真实事故：星图界面上恢复阶梯的探路点击 (1494,580)/(1516,594) 直接点在
         # 了关卡节点上 —— 门禁判"这不是战斗"，恢复阶梯却照样点，等于绕过门禁。
         gate_ok = bool(getattr(scene, "in_game", True))
+        move_ok = bool(getattr(self.cfg, "move_enabled", True))
         for cmd in res.commands:
+            # 走位总闸：还没学会怎么走（方案里 move.kind=none/stick）时，
+            # 恢复阶梯的"探路点击/侧移脱困"也不能发 —— 它们本质是走位，
+            # 而在这些游戏里点地面可能是选中目标/取消，比不动更容易误导人。
+            if not move_ok and cmd.op == "mouse_click":
+                self.stats["move_disabled_blocks"] = \
+                    self.stats.get("move_disabled_blocks", 0) + 1
+                self._emit_event("recovery_cmd_gated", op=cmd.op, why="move_disabled")
+                continue
             if not gate_ok and not self._recovery_cmd_allowed(cmd):
                 self.stats["gate_blocked_recovery"] = \
                     self.stats.get("gate_blocked_recovery", 0) + 1
@@ -783,6 +835,7 @@ class DecisionEngine:
         self._last_click_ts = 0.0
         self._aframe_first_seen_ms = None
         self._aframe_seen_frames = 0
+        self._stop_sent_ms = None
         self._taps_this_target = 0
         self._stuck_ticks = 0
         self._alt_direction_tried = False
@@ -1006,7 +1059,8 @@ class DecisionEngine:
         m = min(scene.monsters,
                 key=lambda mo: (mo.x - ch[0]) ** 2 + (mo.y - ch[1]) ** 2)
         dx, dy = m.x - ch[0], m.y - ch[1]
-        self._act(Command(op="mouse_click", button="left", x=m.x, y=m.y))
+        # 点怪物 = "走过去 + 打"，属走位类，用方案里的走位键（ARPG 常是左键）。
+        self._act(Command(op="mouse_click", button=self.cfg.move_button, x=m.x, y=m.y))
         self._intent(f"攻击怪物（点击 {m.x},{m.y}，方向{_dir_text(dx, dy)}）")
         self._emit_event("attack_monster", x=m.x, y=m.y)
         self._cooldown_until = now + random.uniform(0.6, 1.0)
@@ -1062,25 +1116,34 @@ class DecisionEngine:
         自主模式（autonomy.auto_explore）默认开启：没有掉落/怪物时自己去找，
         而不是站在原地等刷新 —— 这是"更高自主性"最直接的体现。
         """
+        if not getattr(self.cfg, "move_enabled", True):
+            return False      # 还没学会怎么走位 → 不发起任何"走"的动作
         auto = self.cfg.autonomy
         if not (self.cfg.explore_enabled or (auto.enabled and auto.auto_explore)
                 or now < self._auto_explore_until):
             return False
-        nav_interval_ms = int(1000 / max(0.5, self.cfg.tick_hz))
+        nav_interval_ms = self._next_explore_ms or int(1000 / max(0.5, self.cfg.tick_hz))
         now_ms = int(now * 1000)
         if self._last_explore_ms and now_ms - self._last_explore_ms < nav_interval_ms:
             return False
         self._last_explore_ms = now_ms
+        # 下一次的间隔现在就抽：固定节拍会让"点地面"的时刻与采集帧率锁相
+        self._next_explore_ms = self.human.interval_ms(
+            1000.0 / max(0.5, self.cfg.tick_hz))
         dirs = self.cfg.explore_dirs or auto.explore_dirs or ["w", "d", "s", "a"]
         key = dirs[self._explore_i % len(dirs)]
         self._explore_i += 1
         step_ms = self.cfg.explore_step_ms if self.cfg.explore_enabled else auto.explore_step_ms
         hold = _jitter_ms(step_ms, self.cfg.jitter_ratio)
-        if self.cfg.approach_mode == "mouse_click" or key.lower() == self.cfg.pickup_key.lower():
-            # 点地面探索：既能走，又不会把拾取键当移动键（铁律）。
+        if (self.cfg.approach_mode == "mouse_click"
+                or key.lower() in (self.cfg.pickup_key.lower(),
+                                   self.cfg.interact_key.lower())):
+            # 点地面探索：既能走，又不会把功能键当移动键（铁律）。
+            # 交互键 `d` 与右移同键 —— 键盘模式下"向右探索"必须退化成点地面，
+            # 否则 1/4 的探索方向会变成一路开面板/走传送门。
             # 落点由 _pick_explore_point 选（扇区轮转 + 抖动），不是固定四点。
             px, py = self._pick_explore_point(scene)
-            self._act(Command(op="mouse_click", button="left", x=px, y=py))
+            self._act(Command(op="mouse_click", button=self.cfg.move_button, x=px, y=py))
             self._intent(f"点地面探索（{px},{py}，寻找怪物/掉落）")
             self._emit_event("explore_move", x=px, y=py, mode="click")
             self._begin_walk(now, None)   # 点完等人物走过去，别每秒重发
@@ -1151,7 +1214,7 @@ class DecisionEngine:
                      f"（近距 {d:.0f}px + 连续确认）")
         self._act(Command(op="key_tap", key=self.cfg.pickup_key, hold_ms=hold))
         self._last_tap_ts = now
-        self._tap_block_until_ms = now * 1000.0 + self.cfg.tap_recheck_ms
+        self._tap_block_until_ms = int(now * 1000.0 + self._cooldown_ms(self.cfg.tap_recheck_ms))
         self._emit_event("pickup_tap", tap=self._label_pick_taps, source="ground_label")
         return True
 
@@ -1160,6 +1223,8 @@ class DecisionEngine:
 
         标签需连续 ≥400ms 可见（防伤害数字/聊天闪烁误点）。
         """
+        if not getattr(self.cfg, "move_enabled", True):
+            return False
         labels = scene.ground_labels
         if not labels:
             self._label_first_seen_ms = None
@@ -1173,7 +1238,7 @@ class DecisionEngine:
         e = labels[0]
         self._intent("走向地面掉落物标签（点击标签下方地面）")
         self.stats["label_walks"] = self.stats.get("label_walks", 0) + 1
-        self._act(Command(op="mouse_click", button="left", x=e.x, y=e.y))
+        self._act(Command(op="mouse_click", button=self.cfg.move_button, x=e.x, y=e.y))
         self._emit_event("label_walk", x=e.x, y=e.y, labels=len(labels))
         self._cooldown_until = now + random.uniform(0.8, 1.3)
         self.state = State.COOLDOWN
@@ -1207,6 +1272,8 @@ class DecisionEngine:
         标记在到达圈内 → 不动（等游戏逻辑推进）；未启用 → 跳过。
         节流：每个决策间隔最多发一次导航步（按帧时间，状态机无关）。
         """
+        if not getattr(self.cfg, "move_enabled", True):
+            return
         if not self.cfg.nav_enabled or scene.minimap is None:
             return
         mm = scene.minimap
@@ -1226,9 +1293,15 @@ class DecisionEngine:
         self._last_nav_ms = now_ms
         self.stats["nav_moves"] = self.stats.get("nav_moves", 0) + 1
         hold = _jitter_ms(self.cfg.nav_step_ms, self.cfg.jitter_ratio)
-        sent = self._emit_move_keys(keys, hold)
-        if sent == 0:
-            # 方向键全部被铁律拦下（该方向键=拾取键）→ 改用点地面，绝不按拾取键
+        if self.cfg.approach_mode == "mouse_click":
+            # 点地寻路的游戏（本项目目标游戏就是）根本不把 WASD 当移动键：
+            # 按 w/s 轻则无反应、重则触发别的热键。导航一律点地面。
+            self._click_direction(scene, "".join(keys), 200)
+            sent = 0
+        else:
+            sent = self._emit_move_keys(keys, hold)
+        if sent == 0 and self.cfg.approach_mode != "mouse_click":
+            # 方向键全部被铁律拦下（该方向键=拾取键/交互键）→ 改用点地面
             self._click_direction(scene, "".join(keys), 200)
         self._emit_event("nav_move", angle=mm.angle_deg, keys="".join(keys),
                          distance_ratio=mm.distance_ratio)
@@ -1240,13 +1313,34 @@ class DecisionEngine:
 
         所有命令的唯一出口 —— 监督层的 hold 闸门就架在这里。它只能否决，
         不会改写命令：被拦下就是这帧不动，而不是"改成去别处"。
+
+        **亚帧打散**（`action_desync_ms`）：决策是帧驱动的，动作只能落在帧
+        到达的时刻。fps=2 时帧周期 500ms，"点击 → 再点击"的间隔就永远是
+        500ms 的整数倍 —— 这是"操作间隔高度标准化"真正的源头，光给间隔
+        加随机数治不了（量化发生在最后一公里）。发出前等一个 U(0, desync)
+        的相位偏移，动作时刻就和采集时钟解耦了。
+        只对 click/tap 加：走位点击 1-3 秒才一次，延迟无感；连续轨迹点不能
+        逐点延迟（那会把轨迹拉成慢动作）。
         """
         if not self.supervisor.gate(cmd, self._now):
             self.stats["supervisor_blocks"] += 1
             log.debug("监督层拦下命令: %s", cmd.op)
             return False
+        d = self._desync_s()
+        if d > 0 and cmd.op in ("mouse_click", "key_tap"):
+            dl = random.uniform(0.0, d)
+            time.sleep(dl)
+            self._desync_debt = dl
         ok = self.exec.execute(cmd)
         if ok and cmd.op != "stop_all":
+            # 连按占用了 0.5~1.6s（同步阻塞）。这期间世界一直在动，
+            # burst 之前累积的"A框连续确认帧数"已经过期 —— 不清掉的话，
+            # 一次技能连按就能把 seen 从 1 直接凑到阈值，等于用旧证据按 A。
+            if getattr(self.exec, "last_burst_count", 1) > 1:
+                if self._aframe_seen_frames:
+                    self.stats["burst_breaks_confirm"] = \
+                        self.stats.get("burst_breaks_confirm", 0) + 1
+                self._aframe_seen_frames = 0
             self.monitor.note_action(self._now)
             self.human.note_action(self._now)
             self.supervisor.note_command(self._now)
@@ -1255,17 +1349,29 @@ class DecisionEngine:
         return ok
 
     def _emit_move_keys(self, keys: list[str], hold_ms: int) -> int:
-        """发出移动按键，**拦截拾取键**（铁律：拾取键只能由 A框裁决触发）。
+        """发出移动按键，**拦截功能键**（拾取键 A / 交互键 D）。
 
-        现实里很多游戏拾取键与左移同键（本项目默认 pickup_key=a），
-        自主探索/导航一旦直接用方向键就会变成"盲捡"。这里做最后一道闸门，
-        被拦下的次数记入 blind_tap_violations（监控可见，恒应为 0 才健康）。
+        现实里功能键与方向键同键是常态：本项目拾取键 `a` = WASD 左移，
+        交互键 `d` = 右移。自主探索/导航一旦直接用方向键就会变成"盲捡/盲开"：
+        按 A 是捡空气，按 D 可能开出关卡面板或走进传送门 —— 后者更糟，
+        因为它会离开当前地图，而日志里只是一次普通移动。
+
+        这里做最后一道闸门，被拦下的次数记入 `blind_tap_violations`
+        （监控可见，恒应为 0 才健康）。
         """
+        if not getattr(self.cfg, "move_enabled", True):
+            return 0
         sent = 0
-        for k in keys:
-            if (k or "").lower() == self.cfg.pickup_key.lower():
+        functional = {self.cfg.pickup_key.lower(): "拾取键",
+                      self.cfg.interact_key.lower(): "交互键"}
+        # 先映射成方案里配的实际方向键，再比对功能键 —— 顺序反了会漏拦：
+        # 用户把前进改成 `a` 时，`w` 不在禁止表里，于是"按 W 走位"实际发出 `a`，
+        # 而那正好是拾取键。
+        for k in self._map_dirs(keys):
+            why = functional.get((k or "").lower())
+            if why:
                 self.stats["blind_tap_violations"] += 1
-                log.error("拦截：禁止把拾取键 %s 当移动键使用", k)
+                log.error("拦截：禁止把%s %s 当移动键使用", why, k)
                 continue
             if self._act(Command(op="key_tap", key=k, hold_ms=hold_ms)):
                 sent += 1
@@ -1273,6 +1379,8 @@ class DecisionEngine:
 
     def _click_direction(self, scene: SceneState, keys: str, dist: int = 200) -> None:
         """方向 → 点击角色该方向的地面（不依赖键盘，天然避开拾取键冲突）。"""
+        if not getattr(self.cfg, "move_enabled", True):
+            return
         from ..decision.recovery import direction_vec
 
         dx, dy = direction_vec(keys)
@@ -1280,7 +1388,23 @@ class DecisionEngine:
             return
         x = max(0, min(scene.w - 1, int(scene.character[0]) + dx * dist))
         y = max(0, min(scene.h - 1, int(scene.character[1]) + dy * dist))
-        self._act(Command(op="mouse_click", button="left", x=x, y=y))
+        self._act(Command(op="mouse_click", button=self.cfg.move_button, x=x, y=y))
+
+    # -- 方向键映射：内部一律用 wasd 表示"屏幕方向"，只在真的按键时换成实际键 --
+    #
+    # 为什么内部不直接用实际键：碰撞/回放/小地图扇区都按"屏幕上/下/左/右"推理，
+    # 那是几何事实；用户改成 IJKL 或 AZERTY 只影响"发哪个码"，不该影响这套推理。
+    _DIR_ALIAS = {"w": "forward", "s": "back", "a": "left", "d": "right"}
+
+    def _map_dirs(self, keys: list[str]) -> list[str]:
+        """wasd → 方案里配的实际方向键（配了 wasd 之外的键就原样透传）。"""
+        mk = getattr(self.cfg, "move_keys", None) or {}
+        out: list[str] = []
+        for k in keys:
+            slot = self._DIR_ALIAS.get((k or "").lower())
+            mapped = mk.get(slot) if slot else None
+            out.append(str(mapped or k))
+        return out
 
     # ------------- APPROACHING -------------
 
@@ -1316,6 +1440,9 @@ class DecisionEngine:
             self._halt_movement()
             # 走到位了：结束走位等待（A框出现本身就是"到了"的证据）
             self._end_walk(now, reason="aframe", gained=self._walk_dist0 - dist_now)
+            # 停稳再按：A框这一帧的位置不能代表按键那一刻的位置
+            if self._settle_before_pick(scene):
+                return
             # 防"按空"（铁律：绝不盲按拾取键）。帧是"过去"的信息，
             # 采集→编码→传输→检测往往几百毫秒，这一帧的 A框可能早已失效。
             # 两个硬判据，任一不满足就再等一帧：
@@ -1329,9 +1456,21 @@ class DecisionEngine:
             if not approaching:
                 self._intent("A框出现但人物在远离（路过/走过头）—— 不按，避免按空")
                 return
+            # 按键的时效闸门：比走位严得多。A 框只在"那一帧"证明目标在范围内，
+            # 帧旧了就说明人物可能已经走过（0.8s × 420px/s ≈ 340px，而半径只有 130）。
+            # 宁可这一拍不按、等下一帧，也不拿过期证据按键 —— 那就是盲按。
+            press_age = float(getattr(scene, "age_ms", 0.0) or 0.0)
+            if self.cfg.press_max_frame_age_ms \
+                    and press_age > self.cfg.press_max_frame_age_ms:
+                self.stats["stale_press_skips"] = self.stats.get("stale_press_skips", 0) + 1
+                self._intent(f"画面已 {press_age / 1000:.2f}s 旧 —— 这一拍不按，等新帧")
+                return
             # 拾取复核冷却：上次按键后等游戏处理拾取动画（防连续按 A 捡垃圾）
             if scene.ts_ms >= self._tap_block_until_ms \
                     and scene.ts_ms - self._aframe_first_seen_ms >= self._reaction_ms:
+                log.debug("按拾取键：帧年龄 %.0fms，确认 %d 帧，目标距离 %.0fpx",
+                          float(getattr(scene, "age_ms", 0.0)),
+                          self._aframe_seen_frames, dist_now)
                 self._tap_pickup(now)
                 self._check_pick_result(scene, now, aframe_present=True)
                 return
@@ -1403,7 +1542,10 @@ class DecisionEngine:
             return
 
         # 6) 继续走位（按节流间隔重复点击/按键）
-        if now - self._last_click_ts >= self._move_interval_s(now):
+        # 上一次动作的亚帧延迟要顺延到这一拍：否则两拍可能挨得只有一帧，
+        # 真人不会在 166ms 内连续两次点地面。
+        if now - self._last_click_ts >= self._move_interval_s(now) + self._desync_debt:
+            self._desync_debt = 0.0
             self._move_toward(scene, tracked, now, first=False)
 
     # ------------- 走位等待（点一下 ≠ 走到位） -------------
@@ -1492,16 +1634,38 @@ class DecisionEngine:
     # ------------- 走位动作 -------------
 
     def _move_interval_s(self, now: float) -> float:
-        """两次走位动作的间隔：基准节拍 × 抖动 × 疲劳倍数 × 监督层降速。
+        """两次走位动作的间隔：任务节拍 × 人类节奏 × 疲劳倍数 × 监督层降速。
+
+        **不是** `base × uniform(0.9,1.1)`：对称抖动的支撑集是个固定盒子，
+        样本一多样本就收敛，间隔 ACF 在 lag>1 直接掉到 0 —— 而真人的节奏
+        有长程相关（1/f）和长尾打断。详见 `motion.Rhythm`。
 
         监督层判 throttle 时这里会变慢——降速是它能做的三种干预里最轻的一种，
         好处是即使判错也只是慢一点，不会让机器人做错事。
         """
         base = 1.0 / max(0.5, self.cfg.tick_hz)
-        return (base * random.uniform(0.9, 1.1) * self.human.latency_scale(now)
-                * self.supervisor.pace_factor(now))
+        scale = self.human.latency_scale(now) * self.supervisor.pace_factor(now)
+        return self.human.interval_s(base, scale)
+
+    def _desync_s(self) -> float:
+        """亚帧打散的延迟上限（秒）。拟人化关闭时恒为 0（测试/回归要确定性）。"""
+        if not self.human.cfg.enabled:
+            return 0.0
+        return max(0, int(getattr(self.cfg, "action_desync_ms", 0))) / 1000.0
+
+    def _cooldown_ms(self, base_ms: float) -> float:
+        """冷却/复核等待的毫秒数（右偏 + 长尾，不许卡在固定值上）。
+
+        固定冷却（每次都正好 500ms）会把"按键 → 再按键"的间隔序列钉成
+        常数，这比单个间隔太长更可疑：真人等得久不久取决于当时在看什么。
+        """
+        v = max(50.0, float(self.human.interval_ms(base_ms))) + self._desync_debt * 1000.0
+        self._desync_debt = 0.0
+        return v
 
     def _move_toward(self, scene: SceneState, target: Pillar, now: float, first: bool) -> None:
+        if not getattr(self.cfg, "move_enabled", True):
+            return
         self._last_click_ts = now
         dx, dy = target.cx - scene.character[0], target.y - scene.character[1]
         self._intent(f"向{_dir_text(dx, dy)}移动接近{target.color}掉落光柱（距离{round(target.distance)}px）")
@@ -1517,7 +1681,7 @@ class DecisionEngine:
                 gx = max(0, min(scene.w - 1, gx + off))
                 self.stats["misclicks"] = self.stats.get("misclicks", 0) + 1
                 self._emit_event("human_misclick", x=gx, y=gy)
-            self._act(Command(op="mouse_click", button="left", x=gx, y=gy))
+            self._act(Command(op="mouse_click", button=self.cfg.move_button, x=gx, y=gy))
             if first:
                 self._emit_event("move_click", x=gx, y=gy)
         else:
@@ -1525,12 +1689,27 @@ class DecisionEngine:
             if not keys:
                 return
             hold = _jitter_ms(self.cfg.key_step_ms, self.cfg.jitter_ratio)
-            if self._emit_move_keys(keys, hold) == 0:
+            pressable = self._pressable(keys)
+            # 需要往"功能键方向"走（如 D=右移=交互）时一个键都不能按：
+            # 键盘模式下宁可改点地面，也不能按 D 开出关卡面板/走进传送门。
+            if not pressable or self._emit_move_keys(pressable, hold) == 0:
                 self._click_direction(scene, "".join(keys), 200)
             if first:
                 self._emit_event("move_keys", keys="".join(keys))
         # 发起移动 → 进入"等人物走过去"（点一下不等于走到位）
         self._begin_walk(now, target)
+
+    def _pressable(self, keys: list[str]) -> list[str]:
+        """从方向键里剔掉功能键（拾取 A / 交互 D / 返回 ESC）。
+
+        方向表是按"游戏用 WASD 走"写的，但这游戏是点地面走、`A`/`D` 各有别的用途。
+        键盘兜底模式下必须先剔掉它们；剔完为空说明这个方向只能点地面。
+        `_emit_move_keys` 里的拦截是最后一道（会记账），这里是不让它被触发。
+        """
+        blocked = {self.cfg.pickup_key.lower(), self.cfg.interact_key.lower(),
+                   self.cfg.autonomy.escape_key.lower()}
+        # 映射后再过滤：被剔的必须是真的会被按下去的那个键
+        return [k for k in self._map_dirs(keys) if (k or "").lower() not in blocked]
 
     def _direction_keys(self, scene: SceneState, target: Pillar) -> list[str]:
         """按屏幕象限给出方向键（纯键盘走位兜底方案）。"""
@@ -1552,6 +1731,8 @@ class DecisionEngine:
 
     def _jiggle_alternate(self, scene: SceneState, target: Pillar) -> None:
         """撞墙后的侧向脱困：垂直于目标方向轻移一步。"""
+        if not getattr(self.cfg, "move_enabled", True):
+            return      # 侧移也是走位：不会走位时连"挪一步"都不做
         if self.cfg.approach_mode == "mouse_click":
             # 垂直方向点击一个偏移点
             dx = target.cx - scene.character[0]
@@ -1561,7 +1742,7 @@ class DecisionEngine:
             norm = max(1.0, (px * px + py * py) ** 0.5)
             gx = int(scene.character[0] + px / norm * 160)
             gy = int(scene.character[1] + py / norm * 160)
-            self._act(Command(op="mouse_click", button="left", x=gx, y=gy))
+            self._act(Command(op="mouse_click", button=self.cfg.move_button, x=gx, y=gy))
         else:
             dx = target.cx - scene.character[0]
             dy = target.y - scene.character[1]
@@ -1572,10 +1753,61 @@ class DecisionEngine:
 
     def _halt_movement(self) -> None:
         if self.cfg.approach_mode == "keys":
-            for k in ("w", "a", "s", "d"):
+            # 松开的是**实际按下的那些键**。按老写死的 wasd 去松，用户改成 IJKL 后
+            # 等于一个都没松开 —— 人物会一直朝最后方向走，而日志显示"已停步"。
+            for k in dict.fromkeys(self._map_dirs(["w", "a", "s", "d"])):
                 self._act(Command(op="key_up", key=k))
 
     # ------------- 拾取 -------------
+
+    def _request_stop(self, scene: SceneState) -> None:
+        """停步：键盘模式松方向键；点地模式点自己脚下。
+
+        「点自己脚下」是点地寻路游戏里通用的停步手势 —— 它把航点设成人物当前位置，
+        比"松开方向键"更能取消一次已经发出去的寻路指令（点地的航点不会被松键取消）。
+        """
+        self._halt_movement()
+        if self.cfg.approach_mode == "mouse_click":
+            # 点**屏幕中心**，不用 scene.character：后者是"帧差估计出来"的角色位置，
+            # 估偏几十像素就等于把航点设到旁边去了 —— 人会朝那个错点走，
+            # 反而离目标更远（实测 A框一直在、距离却越来越大，永远按不下去）。
+            # 点地寻路的游戏角色恒在屏幕中心，这是比检测估计更硬的事实。
+            self._act(Command(op="mouse_click", button=self.cfg.move_button,
+                              x=int(scene.w) // 2, y=int(scene.h) // 2))
+        self._stop_sent_ms = int(scene.ts_ms)
+        self.stats["pick_stops"] = self.stats.get("pick_stops", 0) + 1
+        self._emit_event("pick_stop", mode=self.cfg.approach_mode)
+
+    def _settle_before_pick(self, scene: SceneState) -> bool:
+        """返回 True = 还没停稳，本 tick **不许**按拾取键（调用方直接 return）。
+
+        为什么需要它：A框是**过去某一帧**的证据。看见 A框并不取消点地面的航点，
+        采集→编码→传输→检测这一圈要几百毫秒，人物在这期间继续朝航点走 ——
+        A键落下时可能已经走出拾取半径，这就是"看见 A框却按空"的成因
+        （2026-11-23 全量在负载下出现 blind_a_press=4）。
+
+        两条判据：
+          ① 看到 A框时人物还在走 → 立刻停步，并把连续确认帧数清零：
+             停步之前攒的帧不能算"停稳后"的证据；
+          ② 只认时间戳**晚于停步那一刻**的帧。早于停步的帧描述的是停步前的位置。
+        """
+        if not self.cfg.stop_before_pick:
+            return False
+        if self._stop_sent_ms is None:
+            # **无条件停一次**，不只在"决策侧以为在走"时停：航点有没有走完是游戏
+            # 侧的事。FSM 以为停了、实际还在滑行，A 框照样会被拖出拾取半径
+            # （实测残留的最后一次盲按就是这样：A 框 0.41s 前还在 25px 处）。
+            self._request_stop(scene)
+            self._aframe_seen_frames = 0
+            self._intent("A框出现 → 先停步，等停稳后的新帧再按拾取键（防走位超调）")
+            return True
+        # 没在走（已经停稳/本来就在跟前）：仍要保证这一帧是停步之后拍的
+        if self._stop_sent_ms is not None and scene.ts_ms <= self._stop_sent_ms:
+            # 停步前拍的帧不能累计成"连续确认" —— 否则停步前那一帧 + 停步后一帧
+            # 就凑够 2 帧了，等于绕开这条闸门。
+            self._aframe_seen_frames = 0
+            return True
+        return False
 
     def _tap_pickup(self, now: float) -> None:
         if self._taps_this_target >= 2:
@@ -1595,7 +1827,7 @@ class DecisionEngine:
             "pick", "按拾取键后 A框应消失", base=float(self.stats["picks"]),
             now=now, horizon_s=max(1.0, self.cfg.tap_recheck_ms / 1000.0 + 1.0))
         # 复核冷却：给游戏拾取动画+视觉确认留时间，期间不得再按
-        self._tap_block_until_ms = now * 1000.0 + self.cfg.tap_recheck_ms
+        self._tap_block_until_ms = int(now * 1000.0 + self._cooldown_ms(self.cfg.tap_recheck_ms))
         self._emit_event("pickup_tap", tap=self._taps_this_target)
 
     def _check_pick_result(self, scene: SceneState, now: float, aframe_present: bool) -> None:
@@ -1702,6 +1934,7 @@ class DecisionEngine:
         self._target = None
         self._aframe_first_seen_ms = None
         self._aframe_seen_frames = 0
+        self._stop_sent_ms = None
         self._aframe_dist0 = 0.0
         self._taps_this_target = 0
         self._tap_block_until_ms = 0
@@ -1776,7 +2009,16 @@ def _dir_text(dx: float, dy: float) -> str:
 
 
 def _jitter_ms(value_ms: int, ratio: float) -> int:
+    """按时长比例抖动（**对数正态**，右偏、均值保持）。
+
+    为什么不是 `value + randint(-delta, delta)`：对称抖动的"长按/短按"
+    概率相等，而真人按键"松得快"更常见；更关键的是 uniform 的支撑集固定，
+    样本一多方差就收敛到常数 —— 而这正是"操作间隔高度标准化"的来源。
+    """
     if ratio <= 0:
         return value_ms
-    delta = max(1, int(value_ms * ratio))
-    return max(10, value_ms + random.randint(-delta, delta))
+    sigma = max(0.0, min(1.0, float(ratio)))
+    if sigma <= 0:
+        return value_ms
+    mu = math.log(max(1.0, float(value_ms))) - 0.5 * sigma * sigma
+    return max(10, int(round(math.exp(random.gauss(mu, sigma)))))

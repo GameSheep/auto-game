@@ -55,14 +55,17 @@ capture:
 vision:
   max_detect_width: 1280
   # 光柱 HSV（OpenCV H:0-179 / S,V:0-255），按现场画面标定
+  # 别照抄模拟器的值：模拟器画的是 S=218/V=255 的实心亮条，真游戏是暗背景上半透明
+  # 淡金 + 白热芯（实测 S≈70~120、V≈120~170）。之前照模拟器调（S≥120/V≥180），
+  # 结果真光柱一根都检不出，还被误判成"这款游戏没有光柱"把功能关了。
   hsv:
-    gold: [[18, 120, 180], [35, 255, 255]]     # 金色光柱
-    pink: [[140, 90, 160], [172, 255, 255]]    # 粉色光柱
+    gold: [[15, 70, 120], [40, 255, 255]]     # 金色光柱（远距离可见）
+    pink: [[140, 90, 160], [172, 255, 255]]   # 粉色光柱
   pillar_min_area: 40
   pillar_min_aspect: 2.5   # 光柱高宽比下限：低于 2.5 是团光/地图节点，不是柱
-  # 火炬之光 PC 端的掉落不走光柱（走地面文字标签，见 decision.label_pickup_when_near）。
-  # 实测 334 秒录像里光柱帧 1 个、全是散点误报，按 A 次数 0 —— 直接关掉省 CPU。
-  pillar_enabled: false
+  # 光柱和地面标签是**同一次掉落的两端**：远处只有光柱，走到跟前退化成文字标签。
+  # 只开标签等于放弃"远远看见就能提前过去"；只开光柱则近处会丢目标。两条都要。
+  pillar_enabled: true
   # 场景门：反例优先 → 技能栏模板 → 红血球 → 兜底拦下（未标定就不动手）
   # 反向样本（关卡选择/背包/结算这类整屏 UI）放 templates/neg_*.png，命中即拦；
   # 正向样本放 templates/skillbar*.png，命中即放行。裁模板用 tools/make_template.py。
@@ -112,10 +115,33 @@ vision:
     max_jump_px: 400
     jump_confirm: 2
 
+# 游戏者（agent）：按“目标 + 技能”这类知识玩，而不是走 FSM 里那条固定刷图路径。
+# 默认关 —— 没在真机上验证过的行为，不许改变已经在跑的流程。
+# 开之前先做两件事（否则它不会按你想的动，而且不会报错）：
+#   1) profiles/<id>/agent/skills.yaml + goals.yaml 写好
+#   2) py -3.12 tools/agent_play.py --profile <id> --check   全绿
+# 开关只认这里；页面/预检都读它。改完要重启（知识在启动时编译一次）。
+agent:
+  enabled: false
+  knowledge_dir: agent          # 相对 profiles/<id>/
+  reach_px: 120                 # 走到多近算“到了”（只是还要不要挪，不是拾取半径）
+  dead_after: 3                 # 同一动作同一情境几次没效果 → 出一条待验证假设
+  max_frame_age_ms: 400         # 按键用的帧最多多旧（与 decision.press_max_frame_age_ms 同一个闸）
+
 decision:
   tick_hz: 1.0          # 1秒1次决策（对话定稿）
+  # ⚠️ 下面四个键位字段是**派生值**：profile 里有 scheme.yaml 时，
+  # 加载时会被方案覆盖（拾取/交互/走位方式/走位鼠标键 + 连按白名单）。
+  # 换游戏不要在这里改，改 profiles/<id>/scheme.yaml（tools/learn_input.py 生成）。
+  # 拾取键 = **键盘 A**（已确认，不是鼠标右键）。
+  # 技能栏第 5 格标的 `A` 是鼠标右键（原始绑定），跟这个键没关系；
+  # 别因为看到技能栏上的 A 就把这里改掉或挪走 —— 那会让拾取改成放技能。
   pickup_key: a
+  # 交互/选择键（D）：进 Boss 房、开宝箱、任务点、打开关卡面板、选传送门。
+  # 注意它和 WASD 的右移同键 —— 程序内部已拦下"把 D 当移动键"（键盘模式改点地面）。
+  interact_key: d
   approach_mode: mouse_click   # mouse_click=点地面寻路(推荐) / keys=方向键走位
+  move_button: left            # 点地面用哪个鼠标键（有的游戏走位是右键，左键留给选中）
   ground_click_offset_px: 28   # 光柱悬空 → 点击其下方地面
   far_distance_px: 420
   approach_timeout_s: 8.0      # 走位超时 → 放弃 + 拉黑
@@ -303,21 +329,42 @@ executor:
   #   screen_h: 1080
   min_action_interval_ms: 25
   max_actions_per_sec: 20
-  # ---------------- 鼠标轨迹人类化（WindMouse：重力吸附 + 风力扰动 + 端点减速） ----------------
+  # ---------------- 鼠标轨迹人类化（运动学模型） ----------------
   # 只决定"手怎么动"，不决定"往哪动"。enabled: false 时退化为单点移动（旧行为）。
+  # 为什么不用 WindMouse：那是公开算法，反作弊有现成指纹。这里伪造的是
+  # Fitts 律 / 2、3 幂律 / 亚运动 / 信号相关噪声这些**运动学不变量**。
+  # 想对照旧版：model: windmouse（此时 gravity/wind 等字段才生效）。
   mouse_path:
     enabled: true
-    gravity: 9.0             # 向目标的重力吸附强度
-    wind: 3.0                # 风力扰动（越大轨迹越飘）
-    max_step_px: 10.0        # 单步最大位移（越小轨迹越细）
-    speed_px_s: 900.0        # 名义移动速度
+    model: kinematic         # kinematic（默认）/ windmouse（旧版对照）
+    target_width_px: 24      # Fitts 律的有效目标宽度
+    bow: 0.06                # 弓形幅度（按 D^0.7 缩放，长距离相对更直）
+    wobble_px: 1.6           # 低频横向漂移（1/f 平滑，不是白噪声）
+    sample_hz: 90            # 采样率（点数由时长推出，不写死）
+    noise_px: 0.5            # 基础手抖
+    speed_noise: 0.10        # 信号相关噪声：σ ∝ 速度
+    endpoint_sigma_px: 1.2   # 落点误差的高斯 σ（二维各向同性）
     max_duration_s: 0.45     # 整段轨迹最长时长（防阻塞决策循环）
-    max_points: 40           # 轨迹点上限（USB HID / 串口带宽预算）
-    endpoint_jitter_px: 2    # 落点偏差（真人不点数学中心）
+    max_points: 64           # 轨迹点上限（USB HID / 串口带宽预算）
     overshoot_prob: 0.12     # 冲过头再拉回的概率
-    micro_pause_prob: 0.25   # 中途微小停顿概率
     hover_ms: [30, 110]      # 到位后悬停多久再按下（先看清再点）
     press_ms: [55, 135]      # 左键按下保持时长（固件 delay 由主机下发）
+
+  # ---------------- 连按 / 连点（人会狂按，程序不会） ----------------
+  # 缺了这一层，日志里每个按键都是孤立单次事件 —— 这本身就是特征。
+  # 拾取键/逃生键永不连按（由代码注入，不在这个白名单里配）。
+  mash:
+    enabled: true
+    keys: ["1", "2", "3", "4", "5", "6", "q", "e", "r", "f"]
+    prob_key: 0.42           # 按技能键时进入连按的基准概率（兴奋时翻倍）
+    prob_click: 0.16         # 鼠标连点（双击/三连点）概率
+    count: [3, 9]            # 一簇按几下（重尾，均值≈4.9）
+    interval_ms: [95, 165]   # 簇内间隔（约 6-10 次/秒）
+    first_ms: [150, 340]     # 第一下之后要抬手，必然更慢
+    hold_ms: [28, 58]        # 连按时按压更短（手指不停留）
+    tail_ms: [220, 700]      # 按完停一下看结果，不是按完就走
+    budget_ratio: 0.30       # 窗口内连按时长占比上限（狂按也要有度）
+    max_burst_s: 1.6         # 单次连按总时长上限（阻塞决策线程的代价）
 
 sim:
   width: 1280

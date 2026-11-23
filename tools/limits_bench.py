@@ -43,6 +43,10 @@ def _cfg_for(tier: str, base: AppConfig) -> AppConfig:
     cfg.decision.llm.enabled = False
     cfg.decision.vlm.enabled = False
     cfg.executor.backend = "dryrun"
+    # 场景门必须关：模拟器画面里没有真实游戏的 HUD，19 张锚点模板一张都匹配不上，
+    # fail_closed=true 会把每一帧都判成"不在游戏里"→ 整个闭环空转，三档都是 0 拾取。
+    # 这不是"放宽限制换成绩"：三档同样关掉，对比较结果没有偏向。
+    cfg.vision.scene_gate.enabled = False
     return cfg
 
 

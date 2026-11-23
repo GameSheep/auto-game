@@ -441,3 +441,73 @@ def test_capture_fps_lower_than_tick_hz_is_a_warning():
     res = preflight.run(cfg=cfg, hub=None, executor=None)
     c = _by(res, "采集配置")
     assert c["level"] == "warn" and "同一个画面" in c["detail"]
+
+
+# ---------------------------------------------------------------- 依赖 / 构造失败
+
+def test_missing_pyserial_is_a_blocker_not_a_silent_skip(monkeypatch):
+    """缺 pyserial 的原文是 `No module named 'serial'`。
+
+    这句在真机上分不清"没装"还是"装错解释器"，而且以前会退化成
+    "没有运行中的执行器，跳过" —— 一条 fail 变成一句无害的 skip。
+    """
+    cfg = _cfg()
+    cfg.executor.backend = "rp2040"
+    monkeypatch.setattr(preflight, "_can_import",
+                        lambda name: name not in ("serial",))
+    res = preflight.run(cfg=cfg, hub=None, executor=None, allow_io=False)
+    c = _by(res, "后端依赖")
+    assert c["level"] == "fail"
+    assert "pyserial" in c["detail"]
+    assert "pip install pyserial" in c["hint"]
+    assert res["verdict"] == "blocked"
+
+
+def test_deps_check_also_runs_offline(monkeypatch):
+    """离线（不碰硬件）时最该先查的就是依赖 —— 那时还没有执行器实例。"""
+    cfg = _cfg()
+    cfg.executor.backend = "rp2040"
+    monkeypatch.setattr(preflight, "_can_import", lambda name: True)
+    res = preflight.run(cfg=cfg, hub=None, executor=None, allow_io=False)
+    assert _by(res, "后端依赖")["level"] == "ok"
+
+
+def test_no_capture_backend_at_all_is_a_warning(monkeypatch):
+    """dxcam/mss 都没有 = 一帧也采不到。真机上是瞎子，但不该冒充"配置错"。"""
+    cfg = _cfg()
+    cfg.capture.backend = "auto"
+    monkeypatch.setattr(preflight, "_can_import",
+                        lambda name: name not in ("dxcam", "mss"))
+    res = preflight.run(cfg=cfg, hub=None, executor=None, allow_io=False)
+    c = _by(res, "采集依赖")
+    assert c["level"] == "warn" and "瞎子" in c["detail"]
+
+
+def test_build_failure_is_reported_instead_of_looking_like_not_started():
+    """build_executor 抛异常时，以前只说"没有运行中的执行器"——
+    用户会以为"服务还没起"，实际是后端起不来。现在必须是 fail。"""
+    cfg = _cfg()
+    res = preflight.run(cfg=cfg, hub=None, executor=None, allow_io=False,
+                        build_error="RuntimeError: 打不开串口 'COM5'：PermissionError")
+    c = _by(res, "执行器构造")
+    assert c["level"] == "fail" and "COM5" in c["detail"]
+    assert res["verdict"] == "blocked"
+
+
+def test_rp2040_without_pyserial_says_what_to_install():
+    """构造时的报错要带修法，不能只有一句 ModuleNotFoundError。"""
+    import pytest
+
+    from autogame.executor import RP2040Executor
+
+    cfg = _cfg()
+    cfg.executor.backend = "rp2040"
+    cfg.executor.serial_port = "COM_TEST_MISSING"
+    try:
+        import serial  # noqa: F401
+        pytest.skip("这台机器装了 pyserial，跳过缺包路径")
+    except ImportError:
+        pass
+    with pytest.raises(RuntimeError) as ei:
+        RP2040Executor(cfg.executor)
+    assert "pip install pyserial" in str(ei.value)
