@@ -6,7 +6,9 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
-.pytest_tmp/
+# 每次跑测试用**新的**临时目录（复用会被环境的批量删除守卫拦下，
+# 表现为几百个 "ERROR at setup ... SystemExit: 1"，看着像代码炸了）
+.pytest_tmp*/
 
 # 敏感信息
 .token
